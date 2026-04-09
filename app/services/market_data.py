@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -61,11 +62,51 @@ class AlpacaMarketDataService:
             timeout=10.0,
         )
 
+    def _compute_historical_window(self, timeframe: str, limit: int) -> tuple[str, str]:
+        """
+        Compute start and end dates for historical bar retrieval.
+        
+        For daily bars, use 2.5x lookback to account for non-trading days.
+        For intraday, estimate business hours in the lookback.
+        
+        Returns: (start_iso, end_iso) as ISO format strings.
+        """
+        end_date = datetime.utcnow()
+        
+        if timeframe == "1D":
+            # For daily bars, assume ~250 trading days/year, or ~5 trading days/week
+            # Use 2.5x lookback to ensure we get enough trading days
+            calendar_days = int(limit * 2.5) + 10
+            start_date = end_date - timedelta(days=calendar_days)
+        elif timeframe in ("1H", "4H"):
+            # For hourly bars, assume ~8 hours/trading day, add 50% buffer
+            trading_days = int((limit / 8) * 1.5) + 5
+            start_date = end_date - timedelta(days=trading_days)
+        else:
+            # For minute-level bars, assume ~390 minutes/trading day
+            trading_days = int((limit / 390) * 1.5) + 5
+            start_date = end_date - timedelta(days=trading_days)
+        
+        # ISO format with 'T' separator and 'Z' (UTC)
+        start_iso = start_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        return start_iso, end_iso
+
     def _request(self, symbol: str, timeframe: str, limit: int = 1) -> dict[str, Any]:
+        """Fetch bars from Alpaca with proper historical window."""
+        start_iso, end_iso = self._compute_historical_window(timeframe, limit)
+        
         try:
             response = self.client.get(
                 f"/v2/stocks/{symbol}/bars",
-                params={"timeframe": timeframe, "limit": limit},
+                params={
+                    "timeframe": timeframe,
+                    "start": start_iso,
+                    "end": end_iso,
+                    "limit": limit,
+                    "sort": "asc",
+                },
             )
             response.raise_for_status()
             return response.json()
