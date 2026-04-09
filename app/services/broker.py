@@ -9,6 +9,26 @@ import httpx
 from app.config.settings import Settings, get_settings
 
 
+class BrokerError(Exception):
+    """Base exception for broker-related errors."""
+    pass
+
+
+class BrokerAuthError(BrokerError):
+    """Raised when authentication fails with the broker."""
+    pass
+
+
+class BrokerUpstreamError(BrokerError):
+    """Raised when the broker API returns an error."""
+    pass
+
+
+class BrokerConnectionError(BrokerError):
+    """Raised when there are network or connection issues."""
+    pass
+
+
 @dataclass
 class OrderRequest:
     symbol: str
@@ -163,18 +183,30 @@ class AlpacaBroker(BrokerInterface):
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as exc:
-            raise RuntimeError(
-                f"Alpaca API returned {exc.response.status_code}: {exc.response.text}"
-            ) from exc
+            if exc.response.status_code in (401, 403):
+                raise BrokerAuthError(
+                    f"Alpaca authentication failed. Check ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL. "
+                    f"Response: {exc.response.text}"
+                ) from exc
+            else:
+                raise BrokerUpstreamError(
+                    f"Alpaca API returned {exc.response.status_code}: {exc.response.text}"
+                ) from exc
         except httpx.RequestError as exc:
-            raise RuntimeError(f"Alpaca request failed: {exc}") from exc
+            raise BrokerConnectionError(f"Failed to connect to Alpaca API: {exc}") from exc
 
     def get_account(self) -> BrokerAccount:
         data = self._request("GET", "/v2/account")
+        try:
+            positions_data = self._request("GET", "/v2/positions")
+            positions_count = len(positions_data) if isinstance(positions_data, list) else 0
+        except BrokerError:
+            # If positions fetch fails, degrade gracefully
+            positions_count = 0
         return BrokerAccount(
             cash=float(data.get("cash", 0.0)),
             equity=float(data.get("equity", 0.0)),
-            positions=len(data.get("positions", [])),
+            positions=positions_count,
             buying_power=float(data.get("buying_power", 0.0)),
             mode=self.settings.broker_mode,
             trading_enabled=self.settings.trading_enabled,

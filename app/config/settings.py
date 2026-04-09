@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import List
 
-from pydantic import AnyHttpUrl, BaseModel, Field, validator
+from pydantic import AnyHttpUrl, BaseModel, Field, model_validator, validator
 from pydantic_settings import BaseSettings
 
 
@@ -27,12 +28,6 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         case_sensitive = False
 
-    @validator("default_symbols", pre=True)
-    def parse_default_symbols(cls, value: str | List[str]) -> List[str]:
-        if isinstance(value, str):
-            return [item.strip().upper() for item in value.split(",") if item.strip()]
-        return value
-
     @property
     def is_paper_mode(self) -> bool:
         return self.broker_mode.lower() in {"paper", "mock"}
@@ -49,7 +44,20 @@ class Settings(BaseSettings):
     def is_live_enabled(self) -> bool:
         return self.trading_enabled and self.is_alpaca_mode
 
-    def validate_settings(self) -> None:
+    @validator("default_symbols", pre=True)
+    def parse_default_symbols(cls, value: str | List[str]) -> List[str]:
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if not isinstance(parsed, list):
+                    raise ValueError("DEFAULT_SYMBOLS must be a JSON array.")
+                return [str(item).strip().upper() for item in parsed if item.strip()]
+            except json.JSONDecodeError as e:
+                raise ValueError(f"DEFAULT_SYMBOLS must be valid JSON: {e}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> "Settings":
         mode = self.broker_mode.lower()
         supported_modes = {"paper", "mock", "alpaca"}
         if mode not in supported_modes:
@@ -57,10 +65,11 @@ class Settings(BaseSettings):
                 f"BROKER_MODE must be one of {sorted(supported_modes)}; got '{self.broker_mode}'."
             )
 
-        if self.is_alpaca_mode and not self.has_alpaca_credentials:
+        if mode == "alpaca" and not self.has_alpaca_credentials:
             raise ValueError(
                 "BROKER_MODE=alpaca requires ALPACA_API_KEY and ALPACA_SECRET_KEY to be set."
             )
+        return self
 
 
 _settings: Settings | None = None
@@ -70,5 +79,4 @@ def get_settings() -> Settings:
     global _settings
     if _settings is None:
         _settings = Settings()
-        _settings.validate_settings()
     return _settings

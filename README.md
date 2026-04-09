@@ -54,7 +54,7 @@ Required environment variables:
 - `MAX_DRAWDOWN_PCT` - drawdown limit as a decimal
 - `MAX_POSITIONS` - maximum concurrent positions
 - `DEFAULT_TIMEFRAME` - example value `1D`
-- `DEFAULT_SYMBOLS` - comma-separated symbol list
+- `DEFAULT_SYMBOLS` - JSON array of default symbols, e.g., `["AAPL","SPY"]`
 
 Optional Alpaca variables for future use:
 
@@ -79,6 +79,7 @@ TRADING_ENABLED=false
 ALPACA_API_KEY=your-paper-key
 ALPACA_SECRET_KEY=your-paper-secret
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
+DEFAULT_SYMBOLS=["AAPL","SPY"]
 ```
 
 ### Testing Alpaca integration safely
@@ -106,12 +107,38 @@ API endpoints:
 
 - `GET /health`
 - `GET /config`
+- `GET /broker/status`
+- `GET /broker/account`
 - `GET /positions`
 - `GET /orders`
 - `GET /trades`
 - `GET /risk`
 - `POST /run-once`
 - `POST /backtest`
+
+## Local Development and Verification
+
+After starting the API with `uvicorn main:app --reload`, verify the setup:
+
+```bash
+# Check health
+curl http://127.0.0.1:8000/health
+
+# Check config (note DEFAULT_SYMBOLS is JSON)
+curl http://127.0.0.1:8000/config
+
+# Check broker status
+curl http://127.0.0.1:8000/broker/status
+
+# Check broker account (in paper mode, should return mock data)
+curl http://127.0.0.1:8000/broker/account
+```
+
+### Environment Variable Notes
+
+- `DEFAULT_SYMBOLS` must be a valid JSON array, e.g., `["AAPL","SPY"]`. Comma-separated strings are not supported.
+- For Alpaca mode, ensure `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are set. If authentication fails, `/broker/account` will return a 401 error with details.
+- VS Code's integrated terminal may not automatically load `.env` files; ensure your environment variables are set or source the `.env` manually if needed.
 
 ## Run tests
 

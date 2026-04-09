@@ -19,7 +19,7 @@ from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskManager
 from app.services.backtest import run_backtest
-from app.services.broker import create_broker
+from app.services.broker import BrokerAuthError, BrokerConnectionError, BrokerUpstreamError, create_broker
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
 from app.strategies.ema_crossover import EMACrossoverStrategy
 
@@ -64,9 +64,15 @@ def broker_account() -> AccountSummary:
     settings = get_settings()
     try:
         broker = create_broker(settings)
+        return broker.get_account()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    return broker.get_account()
+    except BrokerAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except BrokerUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except BrokerConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @router.get("/positions")

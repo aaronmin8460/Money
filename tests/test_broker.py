@@ -12,3 +12,14 @@ def test_paper_broker_submits_dry_run_order() -> None:
 def test_paper_broker_calculates_equity() -> None:
     broker = PaperBroker()
     assert broker.get_account().equity == 100_000.0
+
+
+def test_paper_broker_get_account() -> None:
+    broker = PaperBroker()
+    account = broker.get_account()
+    assert account.cash == 100_000.0
+    assert account.equity == 100_000.0
+    assert account.positions == 0
+    assert account.buying_power == 100_000.0
+    assert account.mode == "paper"
+    assert account.trading_enabled is False
