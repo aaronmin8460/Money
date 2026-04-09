@@ -1,0 +1,55 @@
+from __future__ import annotations
+
+import pandas as pd
+
+from app.strategies.base import BaseStrategy, Signal, TradeSignal
+
+
+class EMACrossoverStrategy(BaseStrategy):
+    def __init__(self, short_window: int = 12, long_window: int = 26, atr_multiplier: float = 1.5):
+        self.short_window = short_window
+        self.long_window = long_window
+        self.atr_multiplier = atr_multiplier
+
+    def generate_signals(self, symbol: str, data: pd.DataFrame) -> list[TradeSignal]:
+        if data.empty:
+            return []
+
+        df = data.copy()
+        df["ema_short"] = df["Close"].ewm(span=self.short_window, adjust=False).mean()
+        df["ema_long"] = df["Close"].ewm(span=self.long_window, adjust=False).mean()
+        df["high_low"] = df["High"] - df["Low"]
+        df["high_close"] = (df["High"] - df["Close"].shift()).abs()
+        df["low_close"] = (df["Low"] - df["Close"].shift()).abs()
+        df["true_range"] = df[["high_low", "high_close", "low_close"]].max(axis=1)
+        df["atr"] = df["true_range"].rolling(window=14, min_periods=1).mean()
+
+        signals: list[TradeSignal] = []
+        for index, row in df.iterrows():
+            if pd.isna(row["ema_short"]) or pd.isna(row["ema_long"]):
+                continue
+
+            direction = Signal.HOLD
+            reason = "No crossover"
+            if row["ema_short"] > row["ema_long"]:
+                direction = Signal.BUY
+                reason = "Bullish EMA crossover"
+            elif row["ema_short"] < row["ema_long"]:
+                direction = Signal.SELL
+                reason = "Bearish EMA crossover"
+
+            stop_loss = row["Close"] - row["atr"] * self.atr_multiplier
+            signals.append(
+                TradeSignal(
+                    symbol=symbol,
+                    signal=direction,
+                    strength=abs(row["ema_short"] - row["ema_long"]),
+                    price=float(row["Close"]),
+                    reason=f"{reason}. ATR stop {stop_loss:.2f}",
+                    timestamp=str(index),
+                )
+            )
+
+        if not signals:
+            return [TradeSignal(symbol=symbol, signal=Signal.HOLD, reason="Insufficient data")]
+        return [signals[-1]]

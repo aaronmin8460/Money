@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.trading.db
+*.db
+*.sqlite
+.env
+.env.*
+.DS_Store

@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - LOG_LEVEL=INFO
+      - DATABASE_URL=sqlite:///./trading.db
+      - BROKER_MODE=paper
+      - TRADING_ENABLED=false
+    volumes:
+      - .:/app
