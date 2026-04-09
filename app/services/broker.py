@@ -69,6 +69,9 @@ class BrokerInterface:
     def get_latest_price(self, symbol: str) -> float:
         raise NotImplementedError
 
+    def is_market_open(self) -> bool:
+        raise NotImplementedError
+
 
 class PaperBroker(BrokerInterface):
     """Simple in-memory broker for paper trading and testing."""
@@ -115,6 +118,9 @@ class PaperBroker(BrokerInterface):
             self.apply_trade(order.symbol, order.side, filled_qty, price)
 
         return self.orders[-1]
+
+    def is_market_open(self) -> bool:
+        return True
 
     def apply_trade(self, symbol: str, side: str, quantity: float, price: float) -> None:
         if side.upper() == "BUY":
@@ -170,6 +176,14 @@ class AlpacaBroker(BrokerInterface):
         self.base_url = str(self.settings.alpaca_base_url).rstrip("/")
         self.client = httpx.Client(
             base_url=self.base_url,
+            headers={
+                "APCA-API-KEY-ID": self.settings.alpaca_api_key,
+                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
+            },
+            timeout=10.0,
+        )
+        self.market_data_client = httpx.Client(
+            base_url=str(self.settings.alpaca_data_base_url).rstrip("/"),
             headers={
                 "APCA-API-KEY-ID": self.settings.alpaca_api_key,
                 "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
@@ -259,16 +273,23 @@ class AlpacaBroker(BrokerInterface):
         return response
 
     def get_latest_price(self, symbol: str) -> float:
-        path = f"/v2/stocks/{symbol}/bars"
-        response = self._request(
-            "GET",
-            path,
-            params={"timeframe": self.settings.default_timeframe, "limit": 1},
-        )
-        bars = response.get("bars") or []
-        if not bars:
-            raise RuntimeError(f"No bar data available for {symbol}")
-        return float(bars[-1].get("c", bars[-1].get("close", 0.0)))
+        try:
+            response = self.market_data_client.get(
+                f"/v2/stocks/{symbol}/bars",
+                params={"timeframe": self.settings.default_timeframe, "limit": 1},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            bars = payload.get("bars") or []
+            if not bars:
+                raise RuntimeError(f"No bar data available for {symbol}")
+            return float(bars[-1].get("c", bars[-1].get("close", 0.0)))
+        except httpx.HTTPStatusError as exc:
+            raise BrokerUpstreamError(
+                f"Alpaca market data error {exc.response.status_code}: {exc.response.text}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise BrokerConnectionError(f"Failed to connect to Alpaca market data: {exc}") from exc
 
 
 def create_broker(settings: Settings | None = None) -> BrokerInterface:

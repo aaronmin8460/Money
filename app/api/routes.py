@@ -21,7 +21,13 @@ from app.risk.risk_manager import RiskManager
 from app.services.backtest import run_backtest
 from app.services.auto_trader import get_auto_trader
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
-from app.strategies.ema_crossover import EMACrossoverStrategy
+from app.services.broker import (
+    BrokerAuthError,
+    BrokerConnectionError,
+    BrokerUpstreamError,
+    create_broker,
+)
+from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
 
 logger = get_logger("api")
 router = APIRouter()
@@ -115,7 +121,7 @@ def run_once(request: RunOnceRequest = Body(...)) -> dict[str, Any]:
     symbol = request.symbol or (settings.default_symbols[0] if settings.default_symbols else "AAPL")
     portfolio = Portfolio()
     risk_manager = RiskManager(portfolio)
-    strategy = EMACrossoverStrategy()
+    strategy = RegimeMomentumBreakoutStrategy()
     market_data_service = (
         AlpacaMarketDataService(settings)
         if settings.is_alpaca_mode
@@ -200,3 +206,17 @@ def auto_stop() -> dict[str, str]:
 def auto_run_now() -> dict[str, Any]:
     trader = get_auto_trader()
     return trader.run_now()
+
+
+@router.get("/strategy/signals")
+def strategy_signals() -> dict[str, Any]:
+    trader = get_auto_trader()
+    return {"signals": trader._last_signals}
+
+
+@router.get("/strategy/positions")
+def strategy_positions() -> dict[str, Any]:
+    settings = get_settings()
+    broker = create_broker(settings)
+    positions = broker.get_positions()
+    return {"positions": positions}

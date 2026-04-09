@@ -27,3 +27,9 @@ def test_paper_broker_get_account() -> None:
     assert account.buying_power == 100_000.0
     assert account.mode == "paper"
     assert account.trading_enabled is False
+
+
+def test_paper_broker_market_open_true() -> None:
+    settings = Settings(broker_mode="paper")
+    broker = PaperBroker(settings)
+    assert broker.is_market_open() is True

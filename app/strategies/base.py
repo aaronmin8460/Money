@@ -20,6 +20,11 @@ class TradeSignal:
     price: float | None = None
     reason: str | None = None
     timestamp: str | None = None
+    atr: float | None = None
+    stop_price: float | None = None
+    trailing_stop: float | None = None
+    momentum_score: float | None = None
+    regime_state: str | None = None
 
 
 class BaseStrategy(ABC):

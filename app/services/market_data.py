@@ -16,6 +16,9 @@ class MarketDataService(Protocol):
     def load_historical(self, csv_path: Path) -> pd.DataFrame:
         ...
 
+    def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50) -> pd.DataFrame:
+        ...
+
 
 class CSVMarketDataService:
     def get_latest_price(self, symbol: str) -> float:
@@ -29,6 +32,16 @@ class CSVMarketDataService:
         df = pd.read_csv(csv_path, parse_dates=["Date"])
         df = df.sort_values("Date").reset_index(drop=True)
         return df
+
+    def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50) -> pd.DataFrame:
+        sample_path = Path("data/sample.csv")
+        if not sample_path.exists():
+            raise FileNotFoundError("Sample CSV data not found for CSVMarketDataService.")
+
+        df = self.load_historical(sample_path)
+        if limit and len(df) > limit:
+            df = df.tail(limit)
+        return df.reset_index(drop=True)
 
 
 class AlpacaMarketDataService:

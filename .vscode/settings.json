@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^pytest -q$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

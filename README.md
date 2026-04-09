@@ -1,32 +1,42 @@
 # Money Trading Bot
 
-A beginner-friendly algorithmic trading skeleton for paper trading only.
+A paper-trading algorithmic trading system built around FastAPI, Alpaca paper market access, and a risk-aware trading pipeline.
 
-This project provides a safe, deterministic trading system structure with:
+This repository now includes:
 
-- clean architecture
-- risk controls
-- local persistence with SQLite
-- a small FastAPI control surface
-- sample EMA crossover strategy
-- mock paper broker behavior by default
+- A regime-filtered momentum breakout strategy for paper trading
+- Alpaca paper trading endpoints separated from market data endpoints
+- Risk-based position sizing with ATR stop placement
+- Safe auto-trading loop with cooldowns, market-open checks, and ranked entries
+- SQLite persistence for signals, orders, and auto-trader run history
+- API control surface for monitoring and manual orchestration
+
+## What changed
+
+The strategy now uses:
+
+- SPY regime filter based on 50/200-day SMA crossover
+- Breakout entries above the prior 20-day high
+- Trend confirmation via 20 EMA, 50 SMA, and 100 SMA
+- Volume confirmation relative to 20-day average volume
+- Momentum ranking across the configured universe
+- ATR-based initial stops and trailing stop logic
+- Volatility-adjusted position sizing based on account equity
+
+This is paper trading only. It should not be interpreted as investment advice or a guarantee of profitability.
 
 ## Project structure
 
 - `app/` - main application packages
-  - `config/` - settings and environment loading
-  - `data/` - market data helpers and CSV loaders
-  - `strategies/` - trading strategy implementations
-  - `risk/` - risk management and guardrails
-  - `execution/` - order execution and signal handling
-  - `portfolio/` - portfolio state tracking and metrics
-  - `monitoring/` - logging utilities
-  - `db/` - SQLAlchemy models and database initialization
-  - `api/` - FastAPI routes and application startup
-  - `services/` - broker, market data, and backtest services
-- `backtests/` - backtest utilities and helper modules
-- `tests/` - pytest test coverage
-- `scripts/` - simple CLI helpers
+- `app/api/` - FastAPI routes and app startup
+- `app/config/` - settings and environment loading
+- `app/db/` - SQLAlchemy models and initialization
+- `app/portfolio/` - portfolio tracking and reconciliation
+- `app/risk/` - risk management guardrails
+- `app/execution/` - order execution and signal processing
+- `app/services/` - broker interface, market data, backtests, auto-trader
+- `app/strategies/` - trading strategies
+- `tests/` - pytest coverage
 - `main.py` - FastAPI entrypoint
 
 ## Installation
@@ -35,89 +45,71 @@ This project provides a safe, deterministic trading system structure with:
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 ```
 
 ## Configuration
 
-Update `.env` with your environment values. By default, the bot runs in paper trading mode and trading is disabled unless `TRADING_ENABLED=true`.
+Create or update `.env` with the following values:
 
-Required environment variables:
-
-- `APP_ENV` - environment name (development, staging, production)
-- `LOG_LEVEL` - log verbosity
-- `DATABASE_URL` - sqlite or database connection string
-- `BROKER_MODE` - `paper` by default
-- `TRADING_ENABLED` - `false` by default
-- `MAX_RISK_PER_TRADE` - maximum risk per trade as a decimal
-- `MAX_DAILY_LOSS_PCT` - daily loss limit as a decimal
-- `MAX_DRAWDOWN_PCT` - drawdown limit as a decimal
-- `MAX_POSITIONS` - maximum concurrent positions
-- `DEFAULT_TIMEFRAME` - example value `1D`
-- `DEFAULT_SYMBOLS` - JSON array of default symbols, e.g., `["AAPL","SPY"]`
-
-Optional Alpaca variables:
-
-- `ALPACA_API_KEY`
-- `ALPACA_SECRET_KEY`
-- `ALPACA_BASE_URL` - for trading API
-- `ALPACA_DATA_BASE_URL` - for market data API
-- `AUTO_TRADE_ENABLED` - enable automated trading
-- `SCAN_INTERVAL_SECONDS` - how often to scan symbols
-- `MAX_POSITION_NOTIONAL` - max notional per position
-- `COOLDOWN_SECONDS_PER_SYMBOL` - cooldown after trade
-- `TAKE_PROFIT_PCT` - take profit percentage
-- `STOP_LOSS_ATR_MULTIPLIER` - stop loss ATR multiplier
-- `ALLOW_EXTENDED_HOURS` - allow extended hours trading
-
-## How to connect Alpaca paper trading
-
-1. Create an Alpaca paper trading account at https://app.alpaca.markets.
-2. Generate paper API keys in the Alpaca dashboard.
-3. Copy `.env.example` to `.env`.
-4. Set `BROKER_MODE=alpaca`.
-5. Add your `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` to `.env`.
-6. Keep `TRADING_ENABLED=false` until you are ready to test with paper orders.
-
-Example `.env` values for Alpaca paper mode:
-
-```env
-BROKER_MODE=alpaca
+```ini
+APP_ENV=development
+LOG_LEVEL=INFO
+DATABASE_URL=sqlite:///./trading.db
+BROKER_MODE=paper
 TRADING_ENABLED=false
-ALPACA_API_KEY=your-paper-key
-ALPACA_SECRET_KEY=your-paper-secret
+ALPACA_API_KEY=your_key
+ALPACA_SECRET_KEY=your_secret
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
-DEFAULT_SYMBOLS=["AAPL","SPY"]
+ALPACA_DATA_BASE_URL=https://data.alpaca.markets
+DEFAULT_SYMBOLS=["AAPL","SPY","QQQ"]
+MAX_RISK_PER_TRADE=0.01
+MAX_POSITIONS=3
+MAX_POSITION_NOTIONAL=10000
+COOLDOWN_SECONDS_PER_SYMBOL=300
+ALLOW_EXTENDED_HOURS=false
 ```
 
-### Testing Alpaca integration safely
+### Important note
 
-- Start the API in dry-run mode first.
-- Verify `GET /broker/status` before placing orders.
-- Use `POST /run-once` to evaluate signals and risk without executing trades.
-- Only set `TRADING_ENABLED=true` when you want live paper order submission.
+- `ALPACA_BASE_URL` is used for trading/account/order endpoints.
+- `ALPACA_DATA_BASE_URL` is used for Alpaca market data bar requests.
+- The system runs in paper trading mode only and does not guarantee profits.
 
-> Warning: paper trading is not the same as live trading. Results may differ in a real market environment.
-
-## Initialize database
-
-```bash
-python scripts/init_db.py
-```
-
-## Run the API
+## Running the API
 
 ```bash
 uvicorn main:app --reload
 ```
 
-API endpoints:
+## Auto-trader endpoints
 
-- `GET /health`
-- `GET /config`
+- `GET /auto/status`
+- `POST /auto/start`
+- `POST /auto/stop`
+- `POST /auto/run-now`
+
+## Broker and strategy endpoints
+
 - `GET /broker/status`
 - `GET /broker/account`
 - `GET /positions`
+- `GET /orders`
+- `GET /strategy/signals`
+- `GET /strategy/positions`
+
+## Dry-run vs paper order submission
+
+When `TRADING_ENABLED=false`, the bot will still evaluate signals and position size but will not submit real Alpaca paper orders. This is the safe default for testing.
+
+## Testing
+
+```bash
+pytest
+```
+
+## Disclaimer
+
+This code is designed for learning and paper trading. Paper results are not a guarantee of future performance.
 - `GET /orders`
 - `GET /trades`
 - `GET /risk`
