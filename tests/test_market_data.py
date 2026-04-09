@@ -14,12 +14,14 @@ class TestAlpacaMarketDataService:
 
     @pytest.fixture
     def settings(self):
-        """Create test settings with Alpaca credentials."""
-        s = Settings()
-        s.alpaca_api_key = "test_key"
-        s.alpaca_secret_key = "test_secret"
-        s.alpaca_data_base_url = "https://data.alpaca.markets"
-        s.default_timeframe = "1D"
+        """Create test settings with Alpaca credentials (no env file)."""
+        # Create settings with explicit test values to avoid .env leakage
+        s = Settings(
+            alpaca_api_key="test_key",
+            alpaca_secret_key="test_secret",
+            alpaca_data_base_url="https://data.alpaca.markets",
+            default_timeframe="1D",
+        )
         return s
 
     @pytest.fixture
@@ -52,7 +54,7 @@ class TestAlpacaMarketDataService:
 
     @patch("httpx.Client.get")
     def test_fetch_bars_sends_proper_params(self, mock_get, service, settings):
-        """Verify fetch_bars sends start, end, timeframe, limit, and sort=asc to Alpaca."""
+        """Verify fetch_bars sends start, end, timeframe, limit, sort, and feed=iex to Alpaca."""
         # Mock response with sample bars
         mock_response = MagicMock()
         mock_response.json.return_value = {
@@ -75,6 +77,7 @@ class TestAlpacaMarketDataService:
         assert params["timeframe"] == "1D"
         assert params["limit"] == 50
         assert params["sort"] == "asc"
+        assert params["feed"] == "iex"  # ✅ Verify free-tier IEX feed is used
         assert "start" in params
         assert "end" in params
         assert params["start"].endswith("Z")

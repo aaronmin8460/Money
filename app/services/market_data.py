@@ -94,7 +94,7 @@ class AlpacaMarketDataService:
         return start_iso, end_iso
 
     def _request(self, symbol: str, timeframe: str, limit: int = 1) -> dict[str, Any]:
-        """Fetch bars from Alpaca with proper historical window."""
+        """Fetch bars from Alpaca with proper historical window and free-tier feed."""
         start_iso, end_iso = self._compute_historical_window(timeframe, limit)
         
         try:
@@ -106,6 +106,7 @@ class AlpacaMarketDataService:
                     "end": end_iso,
                     "limit": limit,
                     "sort": "asc",
+                    "feed": "iex",  # Use IEX feed (free tier, works on basic/paper accounts)
                 },
             )
             response.raise_for_status()
