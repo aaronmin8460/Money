@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     max_positions: int = Field(3, env="MAX_POSITIONS")
     default_timeframe: str = Field("1D", env="DEFAULT_TIMEFRAME")
     default_symbols: List[str] = Field(default_factory=lambda: ["AAPL", "SPY"], env="DEFAULT_SYMBOLS")
+    auto_trade_enabled: bool = Field(False, env="AUTO_TRADE_ENABLED")
+    scan_interval_seconds: int = Field(60, env="SCAN_INTERVAL_SECONDS")
+    alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
+    max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
+    cooldown_seconds_per_symbol: int = Field(300, env="COOLDOWN_SECONDS_PER_SYMBOL")
+    take_profit_pct: float = Field(0.05, env="TAKE_PROFIT_PCT")
+    stop_loss_atr_multiplier: float = Field(2.0, env="STOP_LOSS_ATR_MULTIPLIER")
+    allow_extended_hours: bool = Field(False, env="ALLOW_EXTENDED_HOURS")
 
     class Config:
         env_file = ".env"

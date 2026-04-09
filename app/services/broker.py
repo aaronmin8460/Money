@@ -195,6 +195,15 @@ class AlpacaBroker(BrokerInterface):
         except httpx.RequestError as exc:
             raise BrokerConnectionError(f"Failed to connect to Alpaca API: {exc}") from exc
 
+    def is_market_open(self) -> bool:
+        """Check if the market is currently open."""
+        try:
+            data = self._request("GET", "/v2/clock")
+            return data.get("is_open", False)
+        except BrokerError:
+            # If clock check fails, assume closed for safety
+            return False
+
     def get_account(self) -> BrokerAccount:
         data = self._request("GET", "/v2/account")
         try:

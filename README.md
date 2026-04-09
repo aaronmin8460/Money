@@ -56,11 +56,19 @@ Required environment variables:
 - `DEFAULT_TIMEFRAME` - example value `1D`
 - `DEFAULT_SYMBOLS` - JSON array of default symbols, e.g., `["AAPL","SPY"]`
 
-Optional Alpaca variables for future use:
+Optional Alpaca variables:
 
 - `ALPACA_API_KEY`
 - `ALPACA_SECRET_KEY`
-- `ALPACA_BASE_URL`
+- `ALPACA_BASE_URL` - for trading API
+- `ALPACA_DATA_BASE_URL` - for market data API
+- `AUTO_TRADE_ENABLED` - enable automated trading
+- `SCAN_INTERVAL_SECONDS` - how often to scan symbols
+- `MAX_POSITION_NOTIONAL` - max notional per position
+- `COOLDOWN_SECONDS_PER_SYMBOL` - cooldown after trade
+- `TAKE_PROFIT_PCT` - take profit percentage
+- `STOP_LOSS_ATR_MULTIPLIER` - stop loss ATR multiplier
+- `ALLOW_EXTENDED_HOURS` - allow extended hours trading
 
 ## How to connect Alpaca paper trading
 
@@ -115,6 +123,10 @@ API endpoints:
 - `GET /risk`
 - `POST /run-once`
 - `POST /backtest`
+- `GET /auto/status`
+- `POST /auto/start`
+- `POST /auto/stop`
+- `POST /auto/run-now`
 
 ## Local Development and Verification
 
@@ -132,13 +144,50 @@ curl http://127.0.0.1:8000/broker/status
 
 # Check broker account (in paper mode, should return mock data)
 curl http://127.0.0.1:8000/broker/account
+
+# Check auto-trader status
+curl http://127.0.0.1:8000/auto/status
+
+# Run a manual scan
+curl -X POST http://127.0.0.1:8000/auto/run-now
+
+# Start auto-trading (if AUTO_TRADE_ENABLED=true)
+curl -X POST http://127.0.0.1:8000/auto/start
+
+# Stop auto-trading
+curl -X POST http://127.0.0.1:8000/auto/stop
 ```
 
 ### Environment Variable Notes
 
 - `DEFAULT_SYMBOLS` must be a valid JSON array, e.g., `["AAPL","SPY"]`. Comma-separated strings are not supported.
 - For Alpaca mode, ensure `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are set. If authentication fails, `/broker/account` will return a 401 error with details.
+- `ALPACA_BASE_URL` is for trading operations (account, orders, positions).
+- `ALPACA_DATA_BASE_URL` is for market data (bars, quotes).
 - VS Code's integrated terminal may not automatically load `.env` files; ensure your environment variables are set or source the `.env` manually if needed.
+
+## Auto-Trading
+
+The bot can run automated trading cycles:
+
+1. **Manual Run**: Use `POST /auto/run-now` to execute one scan cycle immediately.
+2. **Automated**: Set `AUTO_TRADE_ENABLED=true` and use `POST /auto/start` to begin periodic scanning.
+3. **Status**: Use `GET /auto/status` to check the current state.
+
+### Safety Features
+
+- Only trades during market hours (unless `ALLOW_EXTENDED_HOURS=true`).
+- Respects `TRADING_ENABLED=false` for dry-run mode.
+- Symbol-level cooldowns prevent over-trading.
+- Position sizing based on buying power and risk limits.
+- Reconciliation ensures local and broker state sync.
+
+### Testing Auto-Trading Safely
+
+- Start with `BROKER_MODE=paper` and `TRADING_ENABLED=false`.
+- Use `POST /auto/run-now` to test signal generation without orders.
+- Enable `TRADING_ENABLED=true` only for paper orders.
+- Monitor logs and `/auto/status` for activity.
 
 ## Run tests
 

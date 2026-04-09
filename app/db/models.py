@@ -74,3 +74,27 @@ class RiskEvent(Base):
     symbol = Column(String(20), nullable=True)
     details = Column(Text, nullable=True)
     is_blocked = Column(Boolean, default=True)
+
+
+class AutoTraderRun(Base):
+    __tablename__ = "auto_trader_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    symbols_scanned = Column(Text, nullable=True)  # JSON list
+    signals_generated = Column(Text, nullable=True)  # JSON dict
+    orders_submitted = Column(Text, nullable=True)  # JSON list
+    error_message = Column(Text, nullable=True)
+
+
+class SignalEvent(Base):
+    __tablename__ = "signal_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False)
+    signal = Column(String(10), nullable=False)  # BUY, SELL, HOLD
+    strength = Column(Float, nullable=True)
+    price = Column(Float, nullable=False)
+    reason = Column(Text, nullable=True)
+    generated_at = Column(DateTime, default=datetime.utcnow)

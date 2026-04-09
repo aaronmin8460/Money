@@ -19,7 +19,7 @@ from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskManager
 from app.services.backtest import run_backtest
-from app.services.broker import BrokerAuthError, BrokerConnectionError, BrokerUpstreamError, create_broker
+from app.services.auto_trader import get_auto_trader
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
 from app.strategies.ema_crossover import EMACrossoverStrategy
 
@@ -170,3 +170,33 @@ def backtest(request: BacktestRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
     return result
+
+
+@router.get("/auto/status")
+def auto_status() -> dict[str, Any]:
+    trader = get_auto_trader()
+    return trader.get_status()
+
+
+@router.post("/auto/start")
+def auto_start() -> dict[str, str]:
+    trader = get_auto_trader()
+    if trader.start():
+        return {"message": "Auto-trader started"}
+    else:
+        return {"message": "Auto-trader is already running"}
+
+
+@router.post("/auto/stop")
+def auto_stop() -> dict[str, str]:
+    trader = get_auto_trader()
+    if trader.stop():
+        return {"message": "Auto-trader stopped"}
+    else:
+        return {"message": "Auto-trader is not running"}
+
+
+@router.post("/auto/run-now")
+def auto_run_now() -> dict[str, Any]:
+    trader = get_auto_trader()
+    return trader.run_now()

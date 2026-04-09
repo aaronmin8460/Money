@@ -38,7 +38,7 @@ class AlpacaMarketDataService:
             raise ValueError(
                 "Alpaca market data requires ALPACA_API_KEY and ALPACA_SECRET_KEY."
             )
-        self.base_url = str(self.settings.alpaca_base_url).rstrip("/")
+        self.base_url = str(self.settings.alpaca_data_base_url).rstrip("/")
         self.client = httpx.Client(
             base_url=self.base_url,
             headers={

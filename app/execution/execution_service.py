@@ -38,10 +38,11 @@ class ExecutionService:
             }
 
         price = signal.price or self.market_data_service.get_latest_price(signal.symbol)
+        quantity = self._calculate_position_size(signal.symbol, price)
         order = OrderRequest(
             symbol=signal.symbol,
             side=signal.signal,
-            quantity=1.0,
+            quantity=quantity,
             price=price,
             is_dry_run=self.dry_run or not settings.trading_enabled,
         )
@@ -86,6 +87,20 @@ class ExecutionService:
             "action": action,
             "order": executed_order,
         }
+
+    def _calculate_position_size(self, symbol: str, current_price: float) -> int:
+        """Calculate position size based on risk and available cash."""
+        settings = get_settings()
+        try:
+            max_quantity = int(settings.max_position_notional // current_price)
+            # Bound by buying power
+            account = self.broker.get_account()
+            buying_power = account.buying_power
+            max_by_bp = int(buying_power // current_price)
+            quantity = min(max_quantity, max_by_bp, 1000)  # Cap at 1000 for safety
+            return max(quantity, 0)
+        except Exception:
+            return 0
 
     def run_once(self, symbol: str, strategy: BaseStrategy, data: Any) -> dict[str, Any]:
         signals = strategy.generate_signals(symbol, data)
