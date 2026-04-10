@@ -14,6 +14,7 @@ from app.services.broker import BrokerInterface, create_broker
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, MarketDataService
 from app.services.market_overview import MarketOverviewService
 from app.services.scanner import ScannerService
+from app.services.tranche_state import TrancheStateStore
 from app.strategies.base import BaseStrategy
 from app.strategies.registry import StrategyRegistry, build_strategy_registry
 
@@ -36,6 +37,7 @@ class RuntimeContainer:
     strategy_registry: StrategyRegistry
     execution_service: ExecutionService
     strategy: BaseStrategy
+    tranche_state: TrancheStateStore
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _auto_trader: AutoTrader | None = field(default=None, init=False, repr=False)
 
@@ -104,6 +106,7 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         dry_run=not settings.trading_enabled,
         market_data_service=market_data_service,
         settings=settings,
+        tranche_state=TrancheStateStore(),
     )
     runtime = RuntimeContainer(
         settings=settings,
@@ -117,6 +120,7 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         strategy_registry=strategy_registry,
         execution_service=execution_service,
         strategy=strategy,
+        tranche_state=execution_service.tranche_state,
     )
     runtime.sync_with_broker()
     logger.info(

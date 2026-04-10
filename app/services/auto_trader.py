@@ -39,6 +39,7 @@ class AutoTrader:
         self.risk_manager = runtime.risk_manager
         self.market_data_service = runtime.market_data_service
         self.execution_service = runtime.execution_service
+        self.tranche_state = runtime.tranche_state
         self.asset_catalog = runtime.asset_catalog
         self.scanner = runtime.scanner
         self.market_overview = runtime.market_overview
@@ -158,6 +159,7 @@ class AutoTrader:
         asset = self._resolve_asset(symbol, asset_class)
         try:
             with self._execution_lock:
+                self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
                 signal = self._evaluate_asset(asset, prefer_primary_strategy=True)
                 execution = self.execution_service.process_signal(signal)
@@ -209,6 +211,7 @@ class AutoTrader:
                 "last_rejection_reason": latest_rejection.get("reason") if latest_rejection else None,
                 "last_accepted_candidate": self._last_accepted_candidate,
                 "last_rejected_candidate": self._last_rejected_candidate,
+                "tranche_state": self.tranche_state.snapshot(),
                 "last_ranked_candidates": self._last_ranked_candidates,
                 "last_regime_snapshot": self._last_regime_snapshot,
                 "last_scan_overview": self._last_scan_overview,
@@ -464,6 +467,7 @@ class AutoTrader:
         )
 
         with self._execution_lock:
+            scan_bar_index = self.tranche_state.increment_scan_bar_index()
             self._sync_portfolio_from_broker()
             if self.settings.universe_scan_enabled:
                 scan_result = self.scanner.scan(limit=max(10, self.settings.max_positions_total * 3))
@@ -492,8 +496,19 @@ class AutoTrader:
                 ),
                 reverse=True,
             )
+            open_symbols_set = set(self.portfolio.positions.keys())
+            scale_in_buy_signals = [
+                signal
+                for signal in buy_signals
+                if signal.symbol in open_symbols_set and self.execution_service.has_pending_tranche(signal.symbol)
+            ]
+            new_symbol_buy_signals = [
+                signal
+                for signal in buy_signals
+                if signal.symbol not in open_symbols_set
+            ]
             available_slots = max(0, self.settings.max_positions_total - len(self.portfolio.positions))
-            selected_buy_signals = buy_signals[:available_slots]
+            selected_buy_signals = scale_in_buy_signals + new_symbol_buy_signals[:available_slots]
 
             for signal in sell_signals + selected_buy_signals:
                 execution = self.execution_service.process_signal(signal)
@@ -509,6 +524,7 @@ class AutoTrader:
                 self._last_ranked_candidates = [item.to_dict() for item in scan_result.opportunities]
                 self._last_regime_snapshot = scan_result.regime_status
                 self._last_scan_overview = scan_result.to_dict()
+                self._last_scan_overview["scan_bar_index"] = scan_bar_index
                 self._last_run_result = self._summarize_results("auto", results)
 
             self._persist_run(results, run_type="auto")

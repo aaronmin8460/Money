@@ -28,6 +28,43 @@ def test_risk_manager_blocks_duplicate_long() -> None:
     assert "duplicate" in decision.reason.lower()
 
 
+def test_risk_manager_allows_valid_next_tranche_duplicate_buy() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+    )
+    portfolio = Portfolio()
+    portfolio.positions["AAPL"] = Position(
+        symbol="AAPL",
+        quantity=10.0,
+        entry_price=150.0,
+        side="BUY",
+        current_price=150.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    manager = RiskManager(portfolio, settings=settings, broker=FakeBroker())
+
+    decision = manager.evaluate_order(
+        "AAPL",
+        "BUY",
+        1.0,
+        100.0,
+        sizing={
+            "allow_duplicate_buy_for_scale_in": True,
+            "tranche_consumes_new_slot": False,
+            "is_valid_next_tranche": True,
+            "tranche_number": 2,
+            "tranche_count_total": 3,
+            "final_submitted_notional": 100.0,
+            "comparison_operator": ">",
+        },
+    )
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
+
+
 @dataclass
 class FakeAccount:
     cash: float = 100000.0

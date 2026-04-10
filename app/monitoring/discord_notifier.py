@@ -274,6 +274,27 @@ def build_trade_notification_payload(
         detail_lines.append(f"Active Strategy: {settings.active_strategy}")
     if strategy:
         detail_lines.append(f"Strategy: {strategy}")
+    tranche_meta = (proposal.metadata or {}).get("tranche") if proposal.metadata else None
+    if isinstance(tranche_meta, dict):
+        tranche_number = tranche_meta.get("tranche_number")
+        tranche_count_total = tranche_meta.get("tranche_count_total")
+        if tranche_number and tranche_count_total:
+            detail_lines.append(f"Tranche: {int(tranche_number)}/{int(tranche_count_total)}")
+        tranche_notional = tranche_meta.get("next_tranche_notional")
+        if tranche_notional is not None:
+            detail_lines.append(f"Tranche Notional: {_format_money(tranche_notional)}")
+        projected_notional = tranche_meta.get("projected_position_notional_after_fill")
+        if projected_notional is not None:
+            detail_lines.append(f"Post-Fill Position Notional: {_format_money(projected_notional)}")
+        remaining_allocation = tranche_meta.get("remaining_planned_allocation")
+        if remaining_allocation is not None:
+            detail_lines.append(f"Remaining Planned Allocation: {_format_money(remaining_allocation)}")
+        scale_in_mode = tranche_meta.get("scale_in_mode")
+        if scale_in_mode:
+            detail_lines.append(f"Scale-In Mode: {scale_in_mode}")
+        decision_reason = tranche_meta.get("decision_reason")
+        if decision_reason:
+            detail_lines.append(f"Add Reason: {decision_reason}")
     relevant_rule = _format_relevant_rule(risk)
     if relevant_rule:
         detail_lines.append(f"Rule: {relevant_rule}")
@@ -569,6 +590,16 @@ def _format_relevant_rule(risk: RiskDecision | None) -> str | None:
 def _format_rejection_context_lines(risk: RiskDecision) -> list[str]:
     details = risk.details or {}
     lines: list[str] = []
+    blocked_reason = details.get("blocked_reason")
+    if blocked_reason:
+        lines.append(f"Blocked Reason: {blocked_reason}")
+    tranche_number = details.get("tranche_number")
+    tranche_count_total = details.get("tranche_count_total")
+    if tranche_number and tranche_count_total:
+        lines.append(f"Attempted Tranche: {int(tranche_number)}/{int(tranche_count_total)}")
+    scale_in_mode = details.get("scale_in_mode")
+    if scale_in_mode:
+        lines.append(f"Scale-In Mode: {scale_in_mode}")
     if str(details.get("side", "")).upper() == "SELL" and "is_risk_reducing_sell" in details:
         lines.append(f"Risk-Reducing Sell: {_yes_no(details.get('is_risk_reducing_sell'))}")
     if "has_tracked_position" in details:
@@ -593,24 +624,32 @@ def _format_rejection_context_lines(risk: RiskDecision) -> list[str]:
     raw_calculated_qty = details.get("raw_calculated_qty")
     if raw_calculated_qty is not None:
         lines.append(f"Raw Qty: {_format_decimal(float(raw_calculated_qty), min_decimals=0, max_decimals=6)}")
+    rounded_qty = details.get("rounded_qty", details.get("rounded_quantity"))
+    if rounded_qty is not None:
+        lines.append(f"Rounded Qty: {_format_decimal(float(rounded_qty), min_decimals=0, max_decimals=6)}")
     raw_price = details.get("raw_price")
     if raw_price is not None:
         lines.append(f"Raw Price: {_format_money(raw_price, max_decimals=6)}")
     raw_notional_before_rounding = details.get("raw_notional_before_rounding")
     if raw_notional_before_rounding is not None:
         lines.append(f"Raw Notional: {_format_money(raw_notional_before_rounding, max_decimals=6)}")
-    rounded_notional = details.get("rounded_notional")
-    if rounded_notional is not None:
-        lines.append(f"Rounded Notional: {_format_money(rounded_notional)}")
+    final_submitted_notional = details.get("final_submitted_notional", details.get("rounded_notional"))
+    if final_submitted_notional is not None:
+        lines.append(f"Final Submitted Notional: {_format_money(final_submitted_notional)}")
     max_allowed_notional = details.get("max_allowed_notional")
     if max_allowed_notional is not None:
         lines.append(f"Max Allowed Notional: {_format_money(max_allowed_notional)}")
+    max_position_notional = details.get("max_position_notional")
+    if max_position_notional is not None:
+        lines.append(f"Max Position Notional: {_format_money(max_position_notional)}")
     hard_max_position_notional = details.get("hard_max_position_notional")
     if hard_max_position_notional is not None:
         lines.append(f"Hard Max Notional: {_format_money(hard_max_position_notional)}")
     comparison_operator = details.get("comparison_operator")
     if comparison_operator:
         lines.append(f"Comparison: {comparison_operator}")
+    if "quantity_reduced_to_fit_cap" in details:
+        lines.append(f"Qty Reduced To Fit Cap: {_yes_no(details.get('quantity_reduced_to_fit_cap'))}")
     return lines
 
 

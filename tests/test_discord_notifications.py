@@ -176,6 +176,8 @@ def test_submitted_trade_sends_embed_webhook_without_duplicate_content(mock_post
     assert "Price: $150.00" in embed["description"]
     assert "Active Strategy: equity_momentum_breakout" in embed["description"]
     assert "Strategy: test_strategy" in embed["description"]
+    assert "Tranche: 1/3" in embed["description"]
+    assert "Scale-In Mode: confirmation" in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -238,6 +240,7 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
     assert "Rule: position_count" in embed["description"]
     assert "Tracked Position: no" in embed["description"]
     assert "Equity: $100,000.00" in embed["description"]
+    assert "Attempted Tranche: 1/3" in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")

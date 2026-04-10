@@ -87,6 +87,8 @@ Signals are normalized with fields such as symbol, asset class, strategy name, d
 - When short selling is disabled, bearish `SELL` signals are exit-only. If there is no tracked long position, the bot will not place a sell and will surface `no_position_to_sell` diagnostics instead of behaving like a short-entry engine.
 - Daily loss and drawdown controls still block new exposure such as `BUY` orders, but real risk-reducing sells are allowed so the bot can exit losing longs.
 - Position sizing uses `Decimal` math plus `POSITION_NOTIONAL_BUFFER_PCT` so auto-sized orders land safely under the hard `MAX_POSITION_NOTIONAL` cap instead of right on the boundary.
+- Entry sizing is staged with tranche plans (`ENTRY_TRANCHES`, `ENTRY_TRANCHE_WEIGHTS`) so new exposure is scaled in across multiple buys instead of one full-size entry.
+- `SCALE_IN_MODE` controls add-on rules (`confirmation`, `time`, or `momentum`), and `ALLOW_AVERAGE_DOWN=false` keeps the default behavior safety-first.
 
 ## Why Repeated Rejects Happen
 
@@ -95,7 +97,8 @@ Repeated paper-mode rejects usually mean the bot is still evaluating symbols aft
 - `BUY` orders are correctly rejected once the current daily loss exceeds `MAX_DAILY_LOSS_PCT` or `MAX_DAILY_LOSS`.
 - Before this fix, a bearish strategy could emit `SELL` for symbols with no tracked long position. Those looked like new exposure, so the risk manager rejected them under the daily-loss rule and Discord showed noisy `SELL ... rejected` alerts.
 - The bot now treats bearish sells as exit-only when short selling is disabled. If no tracked long exists, the strategy returns `HOLD` for scan flow and execution/risk still reject direct sell attempts with the explicit rule `no_position_to_sell`.
-- The bot now sizes `BUY` orders below the hard cap using `POSITION_NOTIONAL_BUFFER_PCT` and surfaces the raw qty, raw price, raw notional, rounded notional, and comparison operator in rejection diagnostics when a candidate still fails risk validation.
+- The bot now clamps final submitted quantity using `Decimal` math so the rounded order notional sent to the broker never exceeds `MAX_POSITION_NOTIONAL`.
+- Rejection diagnostics now expose raw qty, rounded qty, rounded price, raw notional, final submitted notional, cap values, comparison operator, and whether quantity was reduced to fit the cap.
 
 ## Installation
 
@@ -141,6 +144,13 @@ Important trading behavior settings:
 - `ACTIVE_STRATEGY=equity_momentum_breakout`
 - `SHORT_SELLING_ENABLED=false`
 - `POSITION_NOTIONAL_BUFFER_PCT=0.995`
+- `ENTRY_TRANCHES=3`
+- `ENTRY_TRANCHE_WEIGHTS=0.4,0.3,0.3`
+- `SCALE_IN_MODE=confirmation`
+- `MIN_BARS_BETWEEN_TRANCHES=1`
+- `MINUTES_BETWEEN_TRANCHES=5`
+- `ADD_ON_FAVORABLE_MOVE_PCT=0.5`
+- `ALLOW_AVERAGE_DOWN=false`
 - `MAX_DAILY_LOSS=2000`
 - `MAX_DAILY_LOSS_PCT=0.02`
 - `MAX_DRAWDOWN_PCT=0.10`
@@ -186,6 +196,7 @@ DISCORD_NOTIFY_START_STOP=true
 `DISCORD_NOTIFY_DRY_RUNS` is optional and defaults to `false` so local testing and paper-mode scans do not spam Discord unless you explicitly opt in.
 
 Rejected trade notifications now include the exact risk rule, whether the symbol had a tracked position, whether a rejected sell was risk-reducing, the active strategy, current equity vs daily baseline context, and the raw/rounded notional sizing details when the candidate failed on exposure rules.
+Submitted BUY notifications now include tranche number, tranche notional, projected post-fill position notional, remaining planned allocation, scale-in mode, and add reason.
 
 ## Diagnostics
 
@@ -195,6 +206,7 @@ Use the diagnostics routes to understand why the bot is blocking new exposure, w
 - `GET /diagnostics/risk`
 - `GET /diagnostics/strategy`
 - `GET /diagnostics/portfolio`
+- `GET /diagnostics/tranches`
 - `GET /diagnostics/rejections/latest`
 
 These routes expose:
@@ -212,6 +224,7 @@ These routes expose:
 - broker-reported positions
 - latest risk events
 - latest rejection rule and reason
+- per-symbol tranche plan state (target, filled count, next tranche, remaining allocation, last decision reason)
 
 ## Resetting Local State
 
@@ -237,9 +250,10 @@ python scripts/reset_local_state.py --wipe-local-db
 The reset flow:
 
 - stops the auto-trader if it is running
-- clears in-memory portfolio state, cooldowns, cached rejections, and auto-trader debug state
+- clears in-memory portfolio state, cooldowns, cached rejections, tranche state, and auto-trader debug state
 - can cancel open paper orders and close paper positions
 - can wipe the local SQLite history by dropping and recreating the schema
+- does not claim to erase Alpaca remote paper order/fill history
 
 ## How To Fully Reset Alpaca Paper Trading
 
@@ -361,6 +375,7 @@ Diagnostics:
 - `GET /diagnostics/strategies`
 - `GET /diagnostics/risk`
 - `GET /diagnostics/portfolio`
+- `GET /diagnostics/tranches`
 - `GET /diagnostics/rejections/latest`
 - `POST /admin/reset-local-state`
 
@@ -370,6 +385,8 @@ Legacy compatibility:
 - `POST /backtest`
 - `GET /strategy/signals`
 - `GET /strategy/positions`
+
+`POST /run-once` now requires an explicit `symbol` in the request body and no longer silently falls back to `AAPL`.
 
 ## Verification Commands
 
@@ -397,8 +414,10 @@ curl http://127.0.0.1:8000/diagnostics/auto
 curl http://127.0.0.1:8000/diagnostics/strategy
 curl http://127.0.0.1:8000/diagnostics/risk
 curl http://127.0.0.1:8000/diagnostics/portfolio
+curl http://127.0.0.1:8000/diagnostics/tranches
 curl http://127.0.0.1:8000/diagnostics/rejections/latest
 curl -X POST http://127.0.0.1:8000/admin/reset-local-state
+curl -X POST http://127.0.0.1:8000/run-once -H "Content-Type: application/json" -d '{"symbol":"MSFT","asset_class":"equity"}'
 ```
 
 ## Mock Mode Notes

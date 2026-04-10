@@ -290,8 +290,12 @@ class RiskManager:
                 return RiskDecision(False, "Strategy cooldown is active.", rule="strategy_cooldown", details=decision_details)
 
         order_notional = self._round_money(quantity_decimal * price_decimal)
+        if decision_details.get("final_submitted_notional") is not None:
+            order_notional = self._round_money(self._decimal(decision_details["final_submitted_notional"]))
+        allow_duplicate_buy_for_scale_in = bool(decision_details.get("allow_duplicate_buy_for_scale_in"))
+        tranche_consumes_new_slot = bool(decision_details.get("tranche_consumes_new_slot", True))
         if normalized_side == "BUY":
-            if symbol in self.portfolio.positions:
+            if symbol in self.portfolio.positions and not allow_duplicate_buy_for_scale_in:
                 return RiskDecision(
                     False,
                     "Duplicate buy order blocked for existing position.",
@@ -300,13 +304,14 @@ class RiskManager:
                 )
 
             max_positions = self.settings.max_positions_total
-            if len(self.portfolio.positions) >= max_positions:
-                return RiskDecision(
-                    False,
-                    f"Maximum simultaneous positions ({max_positions}) reached.",
-                    rule="position_count",
-                    details=decision_details,
-                )
+            if tranche_consumes_new_slot:
+                if len(self.portfolio.positions) >= max_positions:
+                    return RiskDecision(
+                        False,
+                        f"Maximum simultaneous positions ({max_positions}) reached.",
+                        rule="position_count",
+                        details=decision_details,
+                    )
 
             positions_by_class = self.portfolio.position_counts_by_asset_class()
             class_limit = int(
@@ -315,7 +320,7 @@ class RiskManager:
                     max_positions,
                 )
             )
-            if positions_by_class.get(resolved_asset_class.value, 0) >= class_limit:
+            if tranche_consumes_new_slot and positions_by_class.get(resolved_asset_class.value, 0) >= class_limit:
                 return RiskDecision(
                     False,
                     f"Maximum positions for asset class '{resolved_asset_class.value}' reached.",
@@ -346,29 +351,32 @@ class RiskManager:
             max_position_notional = self._decimal(self.settings.max_position_notional)
             comparison_operator = decision_details.get("comparison_operator", ">")
             if order_notional > max_position_notional:
+                submitted_notional_text = str(order_notional.normalize())
+                max_notional_text = str(max_position_notional.normalize())
                 return RiskDecision(
                     False,
                     (
-                        f"Order notional ({float(order_notional):.2f}) exceeds max position notional "
-                        f"({float(max_position_notional):.2f}) using comparison '{comparison_operator}'."
+                        f"Final submitted notional ({submitted_notional_text}) exceeds max position notional "
+                        f"({max_notional_text}) using comparison '{comparison_operator}'."
                     ),
                     rule="position_notional",
                     details=decision_details,
                 )
 
-            correlated_open_positions = sum(
-                1
-                for position in self.portfolio.positions.values()
-                if position.asset_class == resolved_asset_class
-                and (exchange is None or position.exchange == exchange)
-            )
-            if correlated_open_positions >= self.settings.max_correlated_positions:
-                return RiskDecision(
-                    False,
-                    "Correlated position limit reached for this asset class/exchange group.",
-                    rule="correlated_positions",
-                    details=decision_details,
+            if tranche_consumes_new_slot:
+                correlated_open_positions = sum(
+                    1
+                    for position in self.portfolio.positions.values()
+                    if position.asset_class == resolved_asset_class
+                    and (exchange is None or position.exchange == exchange)
                 )
+                if correlated_open_positions >= self.settings.max_correlated_positions:
+                    return RiskDecision(
+                        False,
+                        "Correlated position limit reached for this asset class/exchange group.",
+                        rule="correlated_positions",
+                        details=decision_details,
+                    )
 
             if self.settings.is_simulated_mode and order_notional > self._decimal(account["cash"]):
                 return RiskDecision(
@@ -505,6 +513,21 @@ class RiskManager:
             )
         return decision
 
+    def record_manual_rejection(self, symbol: str, side: str, decision: RiskDecision) -> None:
+        if decision.approved:
+            return
+        self._remember_rejection(symbol, side, decision)
+        self.record_event(
+            symbol,
+            decision.reason,
+            {
+                "side": side,
+                "rule": decision.rule,
+                "decision_details": decision.details,
+                "source": "manual_rejection",
+            },
+        )
+
     def _build_decision_details(
         self,
         *,
@@ -534,7 +557,15 @@ class RiskManager:
             "quantity": quantity,
             "price": price,
             "rounded_price": sizing.get("rounded_price") if sizing else price,
-            "order_notional": float(self._round_money(self._decimal(quantity) * self._decimal(price))),
+            "order_notional": float(
+                self._round_money(
+                    self._decimal(
+                        sizing.get("final_submitted_notional")
+                        if sizing and sizing.get("final_submitted_notional") is not None
+                        else (self._decimal(quantity) * self._decimal(price))
+                    )
+                )
+            ),
             "asset_class": asset_class.value,
             "strategy_name": strategy_name,
             "short_selling_enabled": self.settings.short_selling_enabled,

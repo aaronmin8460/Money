@@ -50,6 +50,7 @@ def test_local_reset_clears_runtime_state() -> None:
     trader._last_signals = {"AAPL": {"signal": "BUY"}}
     trader._last_order = {"symbol": "AAPL"}
     trader._last_error = "example"
+    assert runtime.tranche_state.snapshot()
 
     result = reset_local_state(LocalStateResetOptions(), runtime=runtime)
 
@@ -62,6 +63,8 @@ def test_local_reset_clears_runtime_state() -> None:
     assert runtime.broker.list_orders() == []
     assert trader.get_status()["last_signals"] == {}
     assert trader.get_status()["last_order"] is None
+    assert runtime.tranche_state.snapshot() == []
+    assert result["tranche_state"] == []
 
 
 def test_local_reset_with_db_wipe_clears_persisted_history() -> None:

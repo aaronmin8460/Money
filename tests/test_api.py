@@ -88,13 +88,13 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     signals = strategy_signals_response.json()["signals"]
     auto_status = auto_status_response.json()
 
-    assert account["cash"] == 90100.0
+    assert account["cash"] == 96100.0
     assert account["positions"] == 1
     assert len(positions) == 1
     assert positions[0]["symbol"] == "AAPL"
     assert len(orders) == 1
     assert orders[0]["status"] == "FILLED"
-    assert risk["cash"] == 90100.0
+    assert risk["cash"] == 96100.0
     assert risk["equity"] == 100000.0
     assert risk["open_positions_count"] == 1
     assert risk["trading_enabled"] is True
@@ -104,6 +104,17 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     assert auto_status["open_positions_count"] == 1
     assert auto_status["active_strategy"] == "equity_momentum_breakout"
     assert auto_status["last_order"]["symbol"] == "AAPL"
+    assert auto_status["tranche_state"][0]["filled_tranche_count"] == 1
+
+
+def test_run_once_requires_explicit_symbol() -> None:
+    settings_module._settings = build_settings(trading_enabled=True)
+
+    with TestClient(app) as client:
+        response = client.post("/run-once", json={})
+
+    assert response.status_code == 400
+    assert "symbol is required" in response.json()["detail"]
 
 
 def test_auto_trade_enabled_starts_on_startup() -> None:
@@ -210,6 +221,7 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
         strategy_response = client.get("/diagnostics/strategy")
         portfolio_response = client.get("/diagnostics/portfolio")
         rejections_response = client.get("/diagnostics/rejections/latest")
+        tranches_response = client.get("/diagnostics/tranches")
 
     assert risk_response.status_code == 200
     risk_data = risk_response.json()
@@ -226,6 +238,7 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert auto_data["active_strategy"] == "equity_momentum_breakout"
     assert "latest_signals" in auto_data
     assert "latest_rejected_order_candidate" in auto_data
+    assert "tranche_state" in auto_data
 
     assert strategy_response.status_code == 200
     strategy_data = strategy_response.json()
@@ -237,11 +250,17 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert "tracked_local_positions" in portfolio_data
     assert "broker_positions" in portfolio_data
     assert portfolio_data["tracked_local_positions"][0]["sellable"] is True
+    assert "tranche_state" in portfolio_data
 
     assert rejections_response.status_code == 200
     rejection_data = rejections_response.json()
     assert rejection_data["latest"]["rule"] == "no_position_to_sell"
     assert rejection_data["latest"]["has_tracked_position"] is False
+
+    assert tranches_response.status_code == 200
+    tranche_data = tranches_response.json()
+    assert tranche_data["active_strategy"] == "equity_momentum_breakout"
+    assert isinstance(tranche_data["tranche_state"], list)
 
 
 def test_admin_reset_local_state_endpoint_works_with_default_payload() -> None:

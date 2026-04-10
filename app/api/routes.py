@@ -101,7 +101,15 @@ def risk() -> dict[str, Any]:
 @router.post("/run-once", response_model=RunOnceResult)
 def run_once(request: RunOnceRequest = Body(...)) -> dict[str, Any]:
     runtime = get_runtime()
-    symbol = request.symbol or (runtime.settings.manual_symbols[0] if runtime.settings.manual_symbols else "AAPL")
+    if not request.symbol or not request.symbol.strip():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "symbol is required for /run-once. "
+                "This endpoint no longer falls back to a hidden default symbol."
+            ),
+        )
+    symbol = request.symbol.strip().upper()
     trader = runtime.get_auto_trader()
     try:
         result = trader.run_symbol_now(symbol, request.asset_class)

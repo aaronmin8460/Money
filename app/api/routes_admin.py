@@ -47,6 +47,13 @@ def config() -> dict[str, Any]:
         "max_position_notional": settings.max_position_notional,
         "position_notional_buffer_pct": settings.position_notional_buffer_pct,
         "effective_max_position_notional": settings.effective_max_position_notional,
+        "entry_tranches": settings.entry_tranches,
+        "entry_tranche_weights": settings.entry_tranche_weights,
+        "scale_in_mode": settings.scale_in_mode,
+        "min_bars_between_tranches": settings.min_bars_between_tranches,
+        "minutes_between_tranches": settings.minutes_between_tranches,
+        "add_on_favorable_move_pct": settings.add_on_favorable_move_pct,
+        "allow_average_down": settings.allow_average_down,
         "max_notional_per_position": settings.max_notional_per_position,
         "max_notional_per_asset_class": settings.max_notional_per_asset_class,
         "max_daily_loss": settings.max_daily_loss,
@@ -74,7 +81,18 @@ def diagnostics_universe() -> dict[str, Any]:
 @router.get("/diagnostics/data-feed")
 def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = None) -> dict[str, Any]:
     runtime = get_runtime()
-    resolved_symbol = symbol or (runtime.settings.manual_symbols[0] if runtime.settings.manual_symbols else "AAPL")
+    resolved_symbol = symbol.strip().upper() if symbol else None
+    if not resolved_symbol:
+        active_symbols = runtime.settings.active_symbols
+        if not active_symbols:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No symbol provided and no configured ACTIVE/DEFAULT symbols are available. "
+                    "Pass ?symbol=... explicitly."
+                ),
+            )
+        resolved_symbol = active_symbols[0]
     resolved_asset_class = asset_class or "equity"
     return {
         "symbol": resolved_symbol,
@@ -155,6 +173,7 @@ def diagnostics_auto() -> dict[str, Any]:
         "latest_rejected_order_candidate": status["last_rejected_candidate"],
         "latest_rejection": status["last_rejection"],
         "last_rejection_reason": status["last_rejection_reason"],
+        "tranche_state": status["tranche_state"],
     }
 
 
@@ -199,6 +218,16 @@ def diagnostics_portfolio() -> dict[str, Any]:
         ),
         "tracked_local_positions": runtime.portfolio.positions_diagnostics(),
         "broker_positions": broker_positions,
+        "tranche_state": runtime.tranche_state.snapshot(),
+    }
+
+
+@router.get("/diagnostics/tranches")
+def diagnostics_tranches() -> dict[str, Any]:
+    runtime = get_runtime()
+    return {
+        "active_strategy": runtime.settings.active_strategy,
+        "tranche_state": runtime.tranche_state.snapshot(),
     }
 
 

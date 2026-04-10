@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any, List
+from typing import Annotated, Any, List
 
 from pydantic import AnyHttpUrl, Field, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, NoDecode
 
 from app.domain.models import AssetClass
 
@@ -39,6 +39,36 @@ def _parse_json_object(value: str | dict[str, Any] | None, field_name: str) -> d
     if not isinstance(parsed, dict):
         raise ValueError(f"{field_name} must be a JSON object.")
     return parsed
+
+
+def _parse_numeric_list(value: str | list[float] | list[str] | None, field_name: str) -> list[float]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        parsed_values = value
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                parsed_values = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field_name} must be valid JSON when provided as an array: {exc}") from exc
+            if not isinstance(parsed_values, list):
+                raise ValueError(f"{field_name} JSON payload must be a list.")
+        else:
+            parsed_values = [part.strip() for part in stripped.split(",") if part.strip()]
+    else:
+        raise ValueError(f"{field_name} must be a comma-separated string or list of numbers.")
+
+    numbers: list[float] = []
+    for item in parsed_values:
+        try:
+            numbers.append(float(item))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} contains a non-numeric value: {item!r}") from exc
+    return numbers
 
 
 def is_placeholder_discord_webhook_url(value: str | None) -> bool:
@@ -98,6 +128,16 @@ class Settings(BaseSettings):
     alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
     max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
     position_notional_buffer_pct: float = Field(0.995, env="POSITION_NOTIONAL_BUFFER_PCT")
+    entry_tranches: int = Field(3, env="ENTRY_TRANCHES")
+    entry_tranche_weights: Annotated[list[float], NoDecode] = Field(
+        default_factory=lambda: [0.4, 0.3, 0.3],
+        env="ENTRY_TRANCHE_WEIGHTS",
+    )
+    scale_in_mode: str = Field("confirmation", env="SCALE_IN_MODE")
+    min_bars_between_tranches: int = Field(1, env="MIN_BARS_BETWEEN_TRANCHES")
+    minutes_between_tranches: int = Field(5, env="MINUTES_BETWEEN_TRANCHES")
+    add_on_favorable_move_pct: float = Field(0.5, env="ADD_ON_FAVORABLE_MOVE_PCT")
+    allow_average_down: bool = Field(False, env="ALLOW_AVERAGE_DOWN")
     max_total_exposure: float = Field(50_000.0, env="MAX_TOTAL_EXPOSURE")
     max_notional_per_position: float = Field(10_000.0, env="MAX_NOTIONAL_PER_POSITION")
     max_notional_per_asset_class: dict[str, float] = Field(
@@ -224,6 +264,10 @@ class Settings(BaseSettings):
     def parse_enabled_asset_classes(cls, value: str | list[str]) -> list[str]:
         return [item.lower() for item in _parse_json_list(value, "ENABLED_ASSET_CLASSES")]
 
+    @field_validator("entry_tranche_weights", mode="before")
+    def parse_entry_tranche_weights(cls, value: str | list[float] | list[str]) -> list[float]:
+        return _parse_numeric_list(value, "ENTRY_TRANCHE_WEIGHTS")
+
     @field_validator("discord_webhook_url", mode="before")
     def parse_discord_webhook_url(cls, value: str | None) -> str | None:
         if isinstance(value, str) and not value.strip():
@@ -277,6 +321,28 @@ class Settings(BaseSettings):
 
         if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
             raise ValueError("POSITION_NOTIONAL_BUFFER_PCT must be greater than 0 and less than or equal to 1.")
+        if self.entry_tranches <= 0:
+            raise ValueError("ENTRY_TRANCHES must be greater than 0.")
+        if len(self.entry_tranche_weights) != self.entry_tranches:
+            raise ValueError(
+                "ENTRY_TRANCHES must match the number of ENTRY_TRANCHE_WEIGHTS values."
+            )
+        if any(weight <= 0 for weight in self.entry_tranche_weights):
+            raise ValueError("ENTRY_TRANCHE_WEIGHTS values must all be greater than 0.")
+        total_weight = float(sum(self.entry_tranche_weights))
+        if abs(total_weight - 1.0) > 1e-6:
+            raise ValueError(
+                f"ENTRY_TRANCHE_WEIGHTS must sum to 1.0 (got {total_weight:.6f})."
+            )
+        self.scale_in_mode = self.scale_in_mode.strip().lower()
+        if self.scale_in_mode not in {"confirmation", "time", "momentum"}:
+            raise ValueError("SCALE_IN_MODE must be one of: confirmation, time, momentum.")
+        if self.min_bars_between_tranches < 0:
+            raise ValueError("MIN_BARS_BETWEEN_TRANCHES must be >= 0.")
+        if self.minutes_between_tranches < 0:
+            raise ValueError("MINUTES_BETWEEN_TRANCHES must be >= 0.")
+        if self.add_on_favorable_move_pct < 0:
+            raise ValueError("ADD_ON_FAVORABLE_MOVE_PCT must be >= 0.")
 
         if self.is_paper_mode and not self.has_alpaca_credentials:
             raise ValueError(

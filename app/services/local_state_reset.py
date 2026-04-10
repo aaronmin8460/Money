@@ -74,6 +74,7 @@ def reset_local_state(
 
     runtime.risk_manager.clear_runtime_state()
     trader.reset_runtime_state()
+    runtime.tranche_state.clear_all()
 
     wiped_tables: list[str] = []
     if resolved_options.wipe_local_db:
@@ -104,6 +105,7 @@ def reset_local_state(
             else None
         ),
         "latest_rejection": runtime.risk_manager.get_rejection_snapshot(limit=1)["latest"],
+        "tranche_state": runtime.tranche_state.snapshot(),
         "local_db_wiped": bool(wiped_tables),
         "wiped_tables": wiped_tables,
     }
