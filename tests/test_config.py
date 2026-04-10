@@ -7,7 +7,7 @@ from app.config.settings import Settings
 def test_settings_defaults() -> None:
     """Test default settings without reading from .env."""
     # Create settings without env file to avoid .env leakage
-    with patch.dict(os.environ, {}, clear=False):
+    with patch.dict(os.environ, {}, clear=True):
         settings = Settings(
             _env_file=None,  # Disable env file loading
             broker_mode="paper",
@@ -23,7 +23,7 @@ def test_settings_defaults() -> None:
 
 
 def test_discord_notifications_require_webhook_when_enabled() -> None:
-    with patch.dict(os.environ, {}, clear=False):
+    with patch.dict(os.environ, {}, clear=True):
         try:
             Settings(
                 _env_file=None,
