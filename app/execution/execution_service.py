@@ -323,8 +323,6 @@ class ExecutionService:
             action=action,
             signal=signal,
             proposal=proposal,
-            broker_mode=self.settings.broker_mode,
-            trading_enabled=self.settings.trading_enabled,
             risk=risk_decision,
             order=order,
         )

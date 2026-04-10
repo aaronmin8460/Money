@@ -10,6 +10,7 @@ from app.api.routes_scanner import router as scanner_router
 from app.api.routes_signals import router as signals_router
 from app.config.settings import get_settings
 from app.db.init_db import init_db
+from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import init_logging, get_logger
 from app.services.runtime import close_runtime, get_runtime
 
@@ -30,6 +31,12 @@ def on_startup() -> None:
     init_db()
     logger = get_logger("api.startup")
     runtime = get_runtime(settings)
+    notifier = get_discord_notifier(settings)
+    notifier.send_system_notification(
+        event="Bot started",
+        reason="application startup completed",
+        category="start_stop",
+    )
     if settings.auto_trade_enabled:
         started = runtime.get_auto_trader().start()
         logger.info(
@@ -41,4 +48,13 @@ def on_startup() -> None:
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    close_runtime()
+    settings = get_settings()
+    notifier = get_discord_notifier(settings)
+    try:
+        close_runtime()
+    finally:
+        notifier.send_system_notification(
+            event="Bot stopped",
+            reason="application shutdown completed",
+            category="start_stop",
+        )

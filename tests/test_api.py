@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from fastapi.testclient import TestClient
 
 from app.api.app import app
@@ -7,6 +8,9 @@ from app.config import settings as settings_module
 from app.config.settings import Settings
 from app.services.runtime import get_runtime
 from app.strategies.base import Signal, TradeSignal
+
+app_module = importlib.import_module("app.api.app")
+routes_admin_module = importlib.import_module("app.api.routes_admin")
 
 
 def build_settings(**overrides: object) -> Settings:
@@ -112,3 +116,68 @@ def test_auto_trade_enabled_starts_on_startup() -> None:
     assert "already running" in start_response.json()["message"].lower()
     assert stop_response.status_code == 200
     assert "stopped" in stop_response.json()["message"].lower()
+
+
+def test_app_startup_and_shutdown_send_notifications(monkeypatch) -> None:
+    settings_module._settings = build_settings(
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+    )
+    calls: list[dict[str, object]] = []
+
+    class StubNotifier:
+        def send_system_notification(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    monkeypatch.setattr(app_module, "get_discord_notifier", lambda settings: StubNotifier())
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert calls[0]["event"] == "Bot started"
+    assert calls[0]["reason"] == "application startup completed"
+    assert calls[-1]["event"] == "Bot stopped"
+    assert calls[-1]["reason"] == "application shutdown completed"
+
+
+def test_admin_notifications_test_endpoint(monkeypatch) -> None:
+    settings_module._settings = build_settings(app_env="development")
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    class StubNotifier:
+        enabled = True
+
+        def send_system_notification(self, **kwargs):
+            calls.append(("system", kwargs))
+            return True
+
+        def send_trade_notification(self, **kwargs):
+            calls.append(("trade", kwargs))
+            return True
+
+    monkeypatch.setattr(routes_admin_module, "get_discord_notifier", lambda settings: StubNotifier())
+
+    with TestClient(app) as client:
+        response = client.post("/admin/notifications/test")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["debug_only"] is True
+    assert payload["trade_action"] == "dry_run"
+    assert payload["results"]["application_start"] is True
+    assert payload["results"]["application_stop"] is True
+    assert payload["results"]["trade"] is True
+    assert calls[0][1]["event"] == "Bot started"
+    assert calls[1][1]["event"] == "Bot stopped"
+    assert calls[2][0] == "trade"
+
+
+def test_admin_notifications_test_endpoint_is_debug_only() -> None:
+    settings_module._settings = build_settings(app_env="production")
+
+    with TestClient(app) as client:
+        response = client.post("/admin/notifications/test")
+
+    assert response.status_code == 403

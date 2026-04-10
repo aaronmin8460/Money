@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
+from app.domain.models import AssetClass
+from app.monitoring.discord_notifier import get_discord_notifier
+from app.risk.risk_manager import RiskDecision
+from app.services.broker import OrderRequest
 from app.services.runtime import get_runtime
+from app.strategies.base import Signal, TradeSignal
 
 router = APIRouter(tags=["admin"])
 
@@ -85,3 +90,69 @@ def diagnostics_strategies() -> dict[str, Any]:
             }
         )
     return {"strategies": strategies}
+
+
+@router.post("/admin/notifications/test")
+def admin_notifications_test() -> dict[str, Any]:
+    runtime = get_runtime()
+    settings = runtime.settings
+    if settings.app_env.lower() != "development":
+        raise HTTPException(status_code=403, detail="Debug notification endpoint is only available in development.")
+
+    notifier = get_discord_notifier(settings)
+    trade_action = "dry_run" if not settings.trading_enabled else "submitted"
+    signal = TradeSignal(
+        symbol="BTC/USD",
+        signal=Signal.BUY,
+        asset_class=AssetClass.CRYPTO,
+        strategy_name="regime_momentum_breakout",
+        price=65000.0,
+        reason="debug notification test",
+    )
+    proposal = OrderRequest(
+        symbol="BTC/USD",
+        side=Signal.BUY.value,
+        quantity=0.001,
+        asset_class=AssetClass.CRYPTO,
+        price=65000.0,
+        time_in_force="gtc",
+        is_dry_run=trade_action == "dry_run",
+    )
+    order = {
+        "id": "debug-notification-order",
+        "status": "DRY_RUN" if trade_action == "dry_run" else "FILLED",
+        "symbol": "BTC/USD",
+        "asset_class": AssetClass.CRYPTO.value,
+        "side": Signal.BUY.value,
+        "quantity": 0.001,
+        "price": 65000.0,
+        "is_dry_run": trade_action == "dry_run",
+        "executed_at": "2026-04-10T14:05:00Z",
+    }
+    risk = RiskDecision(True, "Sample trade approved.", rule="approved")
+
+    results = {
+        "application_start": notifier.send_system_notification(
+            event="Bot started",
+            reason="debug endpoint start notification",
+            category="start_stop",
+        ),
+        "application_stop": notifier.send_system_notification(
+            event="Bot stopped",
+            reason="debug endpoint stop notification",
+            category="start_stop",
+        ),
+        "trade": notifier.send_trade_notification(
+            action=trade_action,
+            signal=signal,
+            proposal=proposal,
+            risk=risk,
+            order=order,
+        ),
+    }
+    return {
+        "debug_only": True,
+        "notifications_enabled": notifier.enabled,
+        "trade_action": trade_action,
+        "results": results,
+    }

@@ -41,6 +41,13 @@ def _parse_json_object(value: str | dict[str, Any] | None, field_name: str) -> d
     return parsed
 
 
+def is_placeholder_discord_webhook_url(value: str | None) -> bool:
+    if not value:
+        return False
+    lowered = value.lower()
+    return "your_webhook_id" in lowered or "your_webhook_token" in lowered
+
+
 class Settings(BaseSettings):
     app_env: str = Field("development", env="APP_ENV")
     log_level: str = Field("INFO", env="LOG_LEVEL")
@@ -246,6 +253,11 @@ class Settings(BaseSettings):
         if self.discord_notifications_enabled and not self.discord_webhook_url:
             raise ValueError(
                 "DISCORD_NOTIFICATIONS_ENABLED=true requires DISCORD_WEBHOOK_URL to be set."
+            )
+        if is_placeholder_discord_webhook_url(str(self.discord_webhook_url) if self.discord_webhook_url else None):
+            raise ValueError(
+                "DISCORD_WEBHOOK_URL must be a real Discord webhook URL, not a placeholder such as "
+                "'your_webhook_id/your_webhook_token'."
             )
         if self.max_notional_per_position != self.max_position_notional:
             self.max_position_notional = self.max_notional_per_position

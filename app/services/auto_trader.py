@@ -75,13 +75,8 @@ class AutoTrader:
 
         logger.info("Auto-trader started")
         self._notify_system_event(
-            title="Auto-Trader Started",
-            message="Background trading loop started.",
-            context={
-                "broker_mode": self.settings.broker_mode,
-                "trading_enabled": self.settings.trading_enabled,
-                "scan_interval_seconds": self.settings.scan_interval_seconds,
-            },
+            event="Bot started",
+            reason="background loop started",
         )
         return True
 
@@ -102,12 +97,8 @@ class AutoTrader:
 
         logger.info("Auto-trader stopped")
         self._notify_system_event(
-            title="Auto-Trader Stopped",
-            message="Background trading loop stopped.",
-            context={
-                "broker_mode": self.settings.broker_mode,
-                "trading_enabled": self.settings.trading_enabled,
-            },
+            event="Bot stopped",
+            reason="background loop stopped",
         )
         return True
 
@@ -414,15 +405,15 @@ class AutoTrader:
     def _notify_system_event(
         self,
         *,
-        title: str,
-        message: str,
-        context: dict[str, Any] | None = None,
+        event: str,
+        reason: str,
+        details: dict[str, Any] | None = None,
     ) -> None:
         notifier = get_discord_notifier(self.settings)
         notifier.send_system_notification(
-            title=title,
-            message=message,
-            context=context,
+            event=event,
+            reason=reason,
+            details=details,
             category="start_stop",
         )
 

@@ -1,7 +1,9 @@
 import os
 from unittest.mock import patch
 
-from app.config.settings import Settings
+import pytest
+
+from app.config.settings import Settings, is_placeholder_discord_webhook_url
 
 
 def test_settings_defaults() -> None:
@@ -24,14 +26,31 @@ def test_settings_defaults() -> None:
 
 def test_discord_notifications_require_webhook_when_enabled() -> None:
     with patch.dict(os.environ, {}, clear=True):
-        try:
+        with pytest.raises(ValueError, match="DISCORD_WEBHOOK_URL"):
             Settings(
                 _env_file=None,
                 broker_mode="paper",
                 trading_enabled=False,
                 discord_notifications_enabled=True,
             )
-        except ValueError as exc:
-            assert "DISCORD_WEBHOOK_URL" in str(exc)
-        else:
-            raise AssertionError("Expected Discord notification settings validation to fail without a webhook URL.")
+
+
+def test_placeholder_discord_webhook_url_is_detected() -> None:
+    assert (
+        is_placeholder_discord_webhook_url(
+            "https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
+        )
+        is True
+    )
+
+
+def test_discord_notifications_reject_placeholder_webhook_url() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError, match="real Discord webhook URL"):
+            Settings(
+                _env_file=None,
+                broker_mode="paper",
+                trading_enabled=False,
+                discord_notifications_enabled=True,
+                discord_webhook_url="https://discord.com/api/webhooks/your_webhook_id/your_webhook_token",
+            )

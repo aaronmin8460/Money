@@ -7,9 +7,14 @@ import httpx
 from app.config.settings import Settings
 from app.domain.models import AssetClass
 from app.execution.execution_service import ExecutionService
+from app.monitoring.discord_notifier import (
+    DiscordNotifier,
+    build_system_notification_message,
+    build_trade_notification_message,
+)
 from app.portfolio.portfolio import Portfolio
-from app.risk.risk_manager import RiskManager
-from app.services.broker import PaperBroker
+from app.risk.risk_manager import RiskDecision, RiskManager
+from app.services.broker import OrderRequest, PaperBroker
 from app.strategies.base import Signal, TradeSignal
 
 
@@ -19,7 +24,7 @@ def build_execution_service(**setting_overrides: object) -> tuple[ExecutionServi
         "broker_mode": "paper",
         "trading_enabled": True,
         "discord_notifications_enabled": True,
-        "discord_webhook_url": "https://discord.com/api/webhooks/test/token",
+        "discord_webhook_url": "https://discord.com/api/webhooks/test-id/test-token",
         "min_avg_volume": 1,
         "min_dollar_volume": 1,
         "min_price": 1,
@@ -51,10 +56,84 @@ def build_signal() -> TradeSignal:
     )
 
 
-def build_response() -> Mock:
+def build_response(status_code: int = 204, text: str = "") -> Mock:
     response = Mock()
-    response.raise_for_status.return_value = None
+    response.status_code = status_code
+    response.text = text
     return response
+
+
+def test_build_system_notification_message_plain_text() -> None:
+    message = build_system_notification_message(
+        mode_label="PAPER",
+        event="Bot started",
+        reason="background loop started",
+        timestamp="2026-04-10T13:55:57Z",
+    )
+
+    assert message == (
+        "[Money Bot][PAPER]\n"
+        "Bot started\n"
+        "Reason: background loop started\n"
+        "Time: 2026-04-10T13:55:57Z"
+    )
+
+
+def test_build_trade_notification_message_plain_text() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+    )
+    signal = TradeSignal(
+        symbol="BTC/USD",
+        signal=Signal.BUY,
+        asset_class=AssetClass.CRYPTO,
+        strategy_name="regime_momentum_breakout",
+        price=65000.0,
+    )
+    proposal = OrderRequest(
+        symbol="BTC/USD",
+        side=Signal.BUY.value,
+        quantity=0.001,
+        asset_class=AssetClass.CRYPTO,
+        price=65000.0,
+        is_dry_run=False,
+    )
+    order = {
+        "id": "order-123",
+        "status": "FILLED",
+        "quantity": 0.001,
+        "price": 65000.0,
+        "executed_at": "2026-04-10T14:05:00Z",
+        "is_dry_run": False,
+    }
+
+    message = build_trade_notification_message(
+        settings=settings,
+        action="submitted",
+        signal=signal,
+        proposal=proposal,
+        risk=RiskDecision(True, "Order approved by risk manager.", rule="approved"),
+        order=order,
+    )
+
+    assert message == (
+        "[Money Bot][PAPER]\n"
+        "Trade executed\n"
+        "Symbol: BTC/USD\n"
+        "Asset Class: crypto\n"
+        "Side: BUY\n"
+        "Quantity: 0.001\n"
+        "Price: 65000\n"
+        "Strategy: regime_momentum_breakout\n"
+        "Action: SUBMITTED\n"
+        "Order Status: FILLED\n"
+        "Order ID: order-123\n"
+        "Time: 2026-04-10T14:05:00Z"
+    )
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -68,7 +147,7 @@ def test_no_webhook_sent_when_notifications_disabled(mock_post: Mock) -> None:
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
-def test_submitted_trade_sends_webhook(mock_post: Mock) -> None:
+def test_submitted_trade_sends_plain_text_webhook(mock_post: Mock) -> None:
     mock_post.return_value = build_response()
     execution, _broker = build_execution_service()
 
@@ -77,8 +156,9 @@ def test_submitted_trade_sends_webhook(mock_post: Mock) -> None:
     assert result["action"] == "submitted"
     mock_post.assert_called_once()
     payload = mock_post.call_args.kwargs["json"]
-    assert payload["embeds"][0]["title"] == "Trade Submitted"
-    assert any(field["name"] == "Symbol" and field["value"] == "AAPL" for field in payload["embeds"][0]["fields"])
+    assert "embeds" not in payload
+    assert payload["content"].startswith("[Money Bot][PAPER]\nTrade executed\n")
+    assert "Symbol: AAPL" in payload["content"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -104,7 +184,8 @@ def test_dry_runs_send_only_when_enabled(mock_post: Mock) -> None:
     assert enabled_result["action"] == "dry_run"
     assert mock_post.call_count == 1
     payload = mock_post.call_args.kwargs["json"]
-    assert payload["embeds"][0]["title"] == "Dry Run Trade"
+    assert "[Money Bot][DRY_RUN]" in payload["content"]
+    assert "Dry run trade" in payload["content"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -130,7 +211,33 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
     assert enabled_result["action"] == "rejected"
     assert mock_post.call_count == 1
     payload = mock_post.call_args.kwargs["json"]
-    assert payload["embeds"][0]["title"] == "Trade Rejected"
+    assert "Trade rejected" in payload["content"]
+    assert "Risk Reason:" in payload["content"]
+
+
+@patch("app.monitoring.discord_notifier.httpx.post")
+def test_non_2xx_webhook_logs_sanitized_target(mock_post: Mock, caplog) -> None:
+    mock_post.return_value = build_response(status_code=400, text="bad webhook request")
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=False,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/1234567890/super-secret-token",
+    )
+    notifier = DiscordNotifier(settings)
+
+    sent = notifier.send_system_notification(
+        event="Bot started",
+        reason="background loop started",
+        category="start_stop",
+    )
+
+    assert sent is False
+    assert "status 400" in caplog.text
+    assert "bad webhook request" in caplog.text
+    assert "discord.com/api/webhooks/1234...7890/***" in caplog.text
+    assert "super-secret-token" not in caplog.text
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
