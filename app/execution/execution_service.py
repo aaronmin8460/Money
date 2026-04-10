@@ -63,13 +63,42 @@ class ExecutionService:
     def process_signal(self, signal: TradeSignal) -> dict[str, Any]:
         self._annotate_signal_context(signal)
         if signal.signal == Signal.HOLD:
+            normalized_snapshot = (signal.metrics or {}).get("normalized_snapshot", {})
+            latest_price = signal.price or normalized_snapshot.get("evaluation_price")
+            hold_risk = RiskDecision(
+                approved=False,
+                reason=signal.reason or "No trade signal.",
+                rule=(signal.metrics or {}).get("decision_code", "no_signal"),
+                details={
+                    **(signal.metrics or {}),
+                    "latest_price": latest_price,
+                },
+            )
+            hold_proposal = OrderRequest(
+                symbol=signal.symbol,
+                side=Signal.HOLD.value,
+                quantity=0.0,
+                notional=None,
+                asset_class=signal.asset_class,
+                price=latest_price,
+                time_in_force="gtc" if signal.asset_class == AssetClass.CRYPTO else "day",
+                is_dry_run=True,
+                metadata={"hold": True, "normalized_snapshot": normalized_snapshot},
+            )
+            self._persist_signal_event(signal, latest_price or 0.0, 0.0, hold_risk)
+            self._notify_trade_event(
+                action="hold",
+                signal=signal,
+                proposal=hold_proposal,
+                risk_decision=hold_risk,
+            )
             logger.info("Signal is HOLD", extra={"symbol": signal.symbol, "strategy": signal.strategy_name})
             return {
                 "symbol": signal.symbol,
                 "signal": signal.signal.value,
-                "latest_price": signal.price,
+                "latest_price": latest_price,
                 "proposal": {},
-                "risk": RiskDecision(False, "No trade signal", rule="hold").to_dict(),
+                "risk": hold_risk.to_dict(),
                 "action": "hold",
                 "order": None,
             }
@@ -741,6 +770,7 @@ class ExecutionService:
         avg_volume = signal.metrics.get("avg_volume") if signal.metrics else None
         dollar_volume = signal.metrics.get("dollar_volume") if signal.metrics else None
         exchange = signal.metrics.get("exchange") if signal.metrics else None
+        normalized_snapshot = signal.metrics.get("normalized_snapshot", {}) if signal.metrics else {}
         quantity = proposal.quantity or ((proposal.notional or 0.0) / max(price, 1e-9))
         return self.risk_manager.guard_against(
             proposal.symbol,
@@ -755,6 +785,16 @@ class ExecutionService:
             dollar_volume=dollar_volume,
             data_age_seconds=data_age_seconds,
             exchange=exchange,
+            quote_bid=normalized_snapshot.get("bid_price"),
+            quote_ask=normalized_snapshot.get("ask_price"),
+            quote_mid=normalized_snapshot.get("mid_price"),
+            quote_timestamp=normalized_snapshot.get("quote_timestamp"),
+            quote_age_seconds=normalized_snapshot.get("quote_age_seconds"),
+            quote_available=normalized_snapshot.get("quote_available"),
+            quote_stale=normalized_snapshot.get("quote_stale"),
+            spread_abs=normalized_snapshot.get("spread_abs"),
+            price_source_used=normalized_snapshot.get("price_source_used"),
+            fallback_pricing_used=normalized_snapshot.get("fallback_pricing_used"),
             sizing=proposal.metadata.get("sizing") if proposal.metadata else None,
         )
 

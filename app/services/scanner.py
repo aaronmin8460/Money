@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -11,7 +11,7 @@ import pandas as pd
 from app.config.settings import Settings, get_settings
 from app.db.models import RankedOpportunityRecord, ScannerRun
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass, AssetMetadata, RankedOpportunity
+from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot, RankedOpportunity
 from app.monitoring.logger import get_logger
 from app.services.asset_catalog import AssetCatalogService
 from app.services.market_data import MarketDataService
@@ -34,6 +34,7 @@ class ScanResult:
     momentum: list[RankedOpportunity]
     regime_status: dict[str, int]
     errors: list[dict[str, str]]
+    symbol_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +51,7 @@ class ScanResult:
             "momentum": [item.to_dict() for item in self.momentum],
             "regime_status": self.regime_status,
             "errors": self.errors,
+            "symbol_snapshots": self.symbol_snapshots,
         }
 
 
@@ -74,24 +76,34 @@ class ScannerService:
         selected_assets = self._select_assets(asset_class, symbols)
         opportunities: list[RankedOpportunity] = []
         errors: list[dict[str, str]] = []
+        symbol_snapshots: dict[str, dict[str, Any]] = {}
 
         for asset in selected_assets:
             try:
-                snapshot = self.market_data_service.get_snapshot(asset.symbol, asset.asset_class)
+                normalized_snapshot = self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
+                symbol_snapshots[asset.symbol] = normalized_snapshot.to_dict()
                 bars = self.market_data_service.fetch_bars(
                     asset.symbol,
                     asset_class=asset.asset_class,
                     timeframe=self.settings.default_timeframe,
                     limit=max(30, self.settings.scanner_limit_per_asset_class),
                 )
-                opportunity = self._analyze_asset(asset, bars, snapshot)
+                opportunity = self._analyze_asset(asset, bars, normalized_snapshot)
                 if opportunity is not None:
                     opportunities.append(opportunity)
             except Exception as exc:
                 logger.warning("Scanner failed for %s: %s", asset.symbol, exc)
                 errors.append({"symbol": asset.symbol, "error": str(exc)})
 
-        result = self._build_result(started_at, asset_class, selected_assets, opportunities, errors, limit)
+        result = self._build_result(
+            started_at,
+            asset_class,
+            selected_assets,
+            opportunities,
+            errors,
+            limit,
+            symbol_snapshots=symbol_snapshots,
+        )
         self._persist_scan(result)
         return result
 
@@ -123,7 +135,7 @@ class ScannerService:
         self,
         asset: AssetMetadata,
         bars: pd.DataFrame,
-        snapshot: dict[str, Any],
+        snapshot: NormalizedMarketSnapshot,
     ) -> RankedOpportunity | None:
         if bars.empty or len(bars) < 5:
             return None
@@ -144,9 +156,8 @@ class ScannerService:
         latest = df.iloc[-1]
         previous = df.iloc[-2] if len(df) > 1 else latest
 
-        last_price = float(snapshot.get("trade", {}).get("price") or latest["Close"])
-        quote = snapshot.get("quote", {})
-        spread_pct = quote.get("spread_pct") or 0.0
+        last_price = float(snapshot.evaluation_price or snapshot.last_trade_price or latest["Close"])
+        spread_pct = snapshot.spread_pct or 0.0
         avg_volume = float(latest["avg_volume"] or 0.0)
         dollar_volume = avg_volume * last_price
         relative_volume = float(latest["Volume"] / avg_volume) if avg_volume > 0 else 0.0
@@ -207,8 +218,8 @@ class ScannerService:
             tags.append("loser")
         if asset.asset_class == AssetClass.CRYPTO:
             tags.append("twenty_four_seven")
-        if snapshot.get("session", {}).get("session_state"):
-            tags.append(snapshot["session"]["session_state"])
+        if snapshot.session_state:
+            tags.append(snapshot.session_state)
 
         return RankedOpportunity(
             symbol=asset.symbol,
@@ -233,7 +244,11 @@ class ScannerService:
                 "dollar_volume": dollar_volume,
                 "spread_pct": spread_pct,
                 "last_close": float(latest["Close"]),
-                "session_state": snapshot.get("session", {}).get("session_state"),
+                "session_state": snapshot.session_state,
+                "quote_available": snapshot.quote_available,
+                "quote_stale": snapshot.quote_stale,
+                "price_source_for_ranking": snapshot.price_source_used,
+                "normalized_snapshot": snapshot.to_dict(),
             },
         )
 
@@ -245,6 +260,8 @@ class ScannerService:
         opportunities: list[RankedOpportunity],
         errors: list[dict[str, str]],
         limit: int,
+        *,
+        symbol_snapshots: dict[str, dict[str, Any]] | None = None,
     ) -> ScanResult:
         generated_at = datetime.utcnow()
         sorted_by_quality = sorted(opportunities, key=lambda item: item.signal_quality_score, reverse=True)
@@ -277,6 +294,7 @@ class ScannerService:
             momentum=sorted(opportunities, key=lambda item: item.momentum_score, reverse=True)[:limit],
             regime_status=regime_status,
             errors=errors,
+            symbol_snapshots=symbol_snapshots or {},
         )
 
     def _persist_scan(self, result: ScanResult) -> None:

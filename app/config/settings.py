@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     default_timeframe: str = Field("1D", env="DEFAULT_TIMEFRAME")
     default_symbols: List[str] = Field(default_factory=lambda: ["AAPL", "SPY"], env="DEFAULT_SYMBOLS")
     active_strategy: str = Field("equity_momentum_breakout", env="ACTIVE_STRATEGY")
+    active_strategy_by_asset_class: dict[str, str] = Field(default_factory=dict, env="ACTIVE_STRATEGY_BY_ASSET_CLASS")
     strategy_name: str | None = Field(None, env="STRATEGY_NAME", exclude=True, repr=False)
     auto_trade_enabled: bool = Field(False, env="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(60, env="SCAN_INTERVAL_SECONDS")
@@ -179,8 +180,13 @@ class Settings(BaseSettings):
     min_avg_volume: float = Field(1_000.0, env="MIN_AVG_VOLUME")
     max_spread_pct: float = Field(0.02, env="MAX_SPREAD_PCT")
     data_stale_after_seconds: int = Field(900, env="DATA_STALE_AFTER_SECONDS")
+    quote_stale_after_seconds: int = Field(30, env="QUOTE_STALE_AFTER_SECONDS")
     scanner_limit_per_asset_class: int = Field(50, env="SCANNER_LIMIT_PER_ASSET_CLASS")
     strategy_switches: dict[str, bool] = Field(default_factory=dict, env="STRATEGY_SWITCHES")
+    discord_notify_holds_manual: bool = Field(True, env="DISCORD_NOTIFY_HOLDS_MANUAL")
+    discord_notify_scan_summary: bool = Field(True, env="DISCORD_NOTIFY_SCAN_SUMMARY")
+    discord_notify_crypto: bool = Field(True, env="DISCORD_NOTIFY_CRYPTO")
+    discord_timezone: str = Field("America/Indiana/Indianapolis", env="DISCORD_TIMEZONE")
 
     class Config:
         env_file = ".env"
@@ -292,6 +298,7 @@ class Settings(BaseSettings):
         "scan_interval_seconds_by_asset_class",
         "max_notional_per_asset_class",
         "strategy_switches",
+        "active_strategy_by_asset_class",
         mode="before",
     )
     def parse_json_objects(cls, value: str | dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
@@ -318,9 +325,16 @@ class Settings(BaseSettings):
         if not self.active_strategy:
             raise ValueError("ACTIVE_STRATEGY must not be empty.")
         self.strategy_name = self.active_strategy
+        self.active_strategy_by_asset_class = {
+            str(key).strip().lower(): str(value).strip().lower()
+            for key, value in self.active_strategy_by_asset_class.items()
+            if str(key).strip() and str(value).strip()
+        }
 
         if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
             raise ValueError("POSITION_NOTIONAL_BUFFER_PCT must be greater than 0 and less than or equal to 1.")
+        if self.quote_stale_after_seconds < 0:
+            raise ValueError("QUOTE_STALE_AFTER_SECONDS must be >= 0.")
         if self.entry_tranches <= 0:
             raise ValueError("ENTRY_TRANCHES must be greater than 0.")
         if len(self.entry_tranche_weights) != self.entry_tranches:
@@ -375,6 +389,15 @@ class Settings(BaseSettings):
         if self.max_positions_total != self.max_positions:
             self.max_positions = self.max_positions_total
         return self
+
+    def strategy_for_asset_class(self, asset_class: AssetClass | str) -> str:
+        key = asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class).strip().lower()
+        mapped = self.active_strategy_by_asset_class.get(key)
+        if mapped:
+            return mapped
+        if key == AssetClass.CRYPTO.value and self.active_strategy != "crypto_momentum_trend":
+            return "crypto_momentum_trend"
+        return self.active_strategy
 
 
 _settings: Settings | None = None

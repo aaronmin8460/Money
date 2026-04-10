@@ -13,6 +13,7 @@ from app.domain.models import (
     AssetClass,
     AssetMetadata,
     MarketSessionStatus,
+    NormalizedMarketSnapshot,
     NormalizedBar,
     QuoteSnapshot,
     SessionState,
@@ -51,6 +52,13 @@ class MarketDataService(Protocol):
         ...
 
     def get_snapshot(self, symbol: str, asset_class: AssetClass | str) -> dict[str, Any]:
+        ...
+
+    def get_normalized_snapshot(
+        self,
+        symbol: str,
+        asset_class: AssetClass | str,
+    ) -> NormalizedMarketSnapshot:
         ...
 
     def batch_snapshot(
@@ -204,9 +212,96 @@ def _session_status_for(asset_class: AssetClass) -> MarketSessionStatus:
     )
 
 
+def _quote_valid(bid_price: float | None, ask_price: float | None) -> bool:
+    if bid_price is None or ask_price is None:
+        return False
+    if bid_price <= 0 or ask_price <= 0:
+        return False
+    if bid_price > ask_price:
+        return False
+    return True
+
+
+def _build_normalized_snapshot(
+    *,
+    symbol: str,
+    asset_class: AssetClass,
+    session: MarketSessionStatus,
+    trade: TradeSnapshot,
+    quote: QuoteSnapshot,
+    quote_stale_after_seconds: int,
+    source: str,
+    fallback_price: float | None = None,
+    exchange: str | None = None,
+) -> NormalizedMarketSnapshot:
+    bid_price = quote.bid_price
+    ask_price = quote.ask_price
+    quote_timestamp = quote.timestamp
+    trade_timestamp = trade.timestamp
+
+    quote_available = _quote_valid(bid_price, ask_price)
+    mid_price = None
+    spread_abs = None
+    spread_pct = None
+    quote_age_seconds = None
+    quote_stale = False
+
+    if quote_available:
+        mid_price = ((ask_price or 0.0) + (bid_price or 0.0)) / 2
+        spread_abs = max(0.0, (ask_price or 0.0) - (bid_price or 0.0))
+        if mid_price and mid_price > 0:
+            spread_pct = spread_abs / mid_price
+        if quote_timestamp is not None and quote_stale_after_seconds > 0:
+            quote_age_seconds = max(
+                0.0,
+                (datetime.now(timezone.utc) - quote_timestamp.astimezone(timezone.utc)).total_seconds(),
+            )
+            quote_stale = quote_age_seconds > quote_stale_after_seconds
+
+    last_trade_price = trade.price
+    fallback_used = False
+    evaluation_price = last_trade_price
+    price_source_used = "last_trade"
+    if evaluation_price is None and mid_price is not None:
+        evaluation_price = mid_price
+        price_source_used = "mid_quote"
+    if evaluation_price is None and fallback_price is not None:
+        evaluation_price = fallback_price
+        fallback_used = True
+        price_source_used = "latest_bar_close_fallback"
+
+    source_timestamp = quote_timestamp or trade_timestamp
+    if source_timestamp is None and session.as_of is not None:
+        source_timestamp = session.as_of
+
+    return NormalizedMarketSnapshot(
+        symbol=symbol,
+        asset_class=asset_class,
+        last_trade_price=last_trade_price,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        mid_price=mid_price,
+        spread_abs=spread_abs,
+        spread_pct=spread_pct,
+        quote_available=quote_available,
+        quote_stale=quote_stale,
+        quote_timestamp=quote_timestamp,
+        trade_timestamp=trade_timestamp,
+        source_timestamp=source_timestamp,
+        quote_age_seconds=quote_age_seconds,
+        fallback_pricing_used=fallback_used,
+        price_source_used=price_source_used,
+        evaluation_price=evaluation_price,
+        session_state=session.session_state.value,
+        exchange=exchange,
+        source=source,
+    )
+
+
 class CSVMarketDataService:
-    def __init__(self, data_dir: str | Path = "data"):
+    def __init__(self, data_dir: str | Path = "data", settings: Settings | None = None):
         self.data_dir = Path(data_dir)
+        self.settings = settings or get_settings()
 
     def list_supported_symbols(self) -> list[str]:
         if not self.data_dir.exists():
@@ -360,6 +455,7 @@ class CSVMarketDataService:
         bars = self.get_bars(symbol, asset_class, timeframe="1D", limit=2)
         trade = self.get_latest_trade(symbol, asset_class)
         quote = self.get_latest_quote(symbol, asset_class)
+        normalized_snapshot = self.get_normalized_snapshot(symbol, asset_class)
         previous_close = bars[-2].close if len(bars) > 1 else trade.price
         daily_change_pct = None
         if previous_close and previous_close > 0 and trade.price is not None:
@@ -373,6 +469,7 @@ class CSVMarketDataService:
             "session": session.to_dict(),
             "daily_change_pct": daily_change_pct,
             "latest_bar": bars[-1].to_dict() if bars else None,
+            "normalized": normalized_snapshot.to_dict(),
         }
 
     def batch_snapshot(
@@ -395,10 +492,40 @@ class CSVMarketDataService:
         return _session_status_for(resolved_asset_class)
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
-        trade = self.get_latest_trade(symbol, asset_class or infer_asset_class(symbol))
-        if trade.price is None:
+        snapshot = self.get_normalized_snapshot(symbol, asset_class or infer_asset_class(symbol))
+        if snapshot.evaluation_price is None:
             raise RuntimeError(f"No latest price available for symbol {symbol}")
-        return float(trade.price)
+        return float(snapshot.evaluation_price)
+
+    def get_normalized_snapshot(
+        self,
+        symbol: str,
+        asset_class: AssetClass | str,
+    ) -> NormalizedMarketSnapshot:
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        trade = self.get_latest_trade(symbol, resolved_asset_class)
+        quote = self.get_latest_quote(symbol, resolved_asset_class)
+        session = self.get_session_status(resolved_asset_class)
+        fallback_price: float | None = None
+        try:
+            bars = self.get_bars(symbol, resolved_asset_class, timeframe="1D", limit=1)
+            if bars:
+                fallback_price = bars[-1].close
+        except Exception:
+            fallback_price = None
+        return _build_normalized_snapshot(
+            symbol=canonicalize_symbol(symbol, resolved_asset_class),
+            asset_class=resolved_asset_class,
+            session=session,
+            trade=trade,
+            quote=quote,
+            quote_stale_after_seconds=self.settings.quote_stale_after_seconds,
+            source="csv",
+            fallback_price=fallback_price,
+            exchange="MOCK",
+        )
 
 
 class AlpacaMarketDataService:
@@ -615,6 +742,7 @@ class AlpacaMarketDataService:
         quote = self.get_latest_quote(resolved_symbol, resolved_asset_class)
         trade = self.get_latest_trade(resolved_symbol, resolved_asset_class)
         session = self.get_session_status(resolved_asset_class)
+        normalized_snapshot = self.get_normalized_snapshot(resolved_symbol, resolved_asset_class)
         prev_close = float(daily_bar.get("o", daily_bar.get("open", 0.0))) or None
         daily_change_pct = None
         if prev_close and prev_close > 0 and trade.price is not None:
@@ -629,6 +757,7 @@ class AlpacaMarketDataService:
             "daily_change_pct": daily_change_pct,
             "latest_bar": snapshot.get("latestBar") or snapshot.get("minuteBar") or snapshot.get("minute_bar"),
             "daily_bar": daily_bar,
+            "normalized": normalized_snapshot.to_dict(),
         }
 
     def batch_snapshot(
@@ -668,15 +797,42 @@ class AlpacaMarketDataService:
         return _session_status_for(resolved_asset_class)
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
-        bars = self.fetch_bars(
-            symbol,
-            asset_class=asset_class or infer_asset_class(symbol),
-            timeframe=self.settings.default_timeframe,
-            limit=1,
-        )
-        if bars.empty:
+        snapshot = self.get_normalized_snapshot(symbol, asset_class or infer_asset_class(symbol))
+        if snapshot.evaluation_price is None:
             raise RuntimeError(f"No latest price available for symbol {symbol}")
-        return float(bars.iloc[-1]["Close"])
+        return float(snapshot.evaluation_price)
+
+    def get_normalized_snapshot(
+        self,
+        symbol: str,
+        asset_class: AssetClass | str,
+    ) -> NormalizedMarketSnapshot:
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        resolved_symbol = canonicalize_symbol(symbol, resolved_asset_class)
+        trade = self.get_latest_trade(resolved_symbol, resolved_asset_class)
+        quote = self.get_latest_quote(resolved_symbol, resolved_asset_class)
+        session = self.get_session_status(resolved_asset_class)
+        fallback_price: float | None = None
+        try:
+            bars = self.get_bars(resolved_symbol, resolved_asset_class, timeframe=self.settings.default_timeframe, limit=1)
+            if bars:
+                fallback_price = bars[-1].close
+        except Exception:
+            fallback_price = None
+        exchange = "CRYPTO" if resolved_asset_class == AssetClass.CRYPTO else "IEX"
+        return _build_normalized_snapshot(
+            symbol=resolved_symbol,
+            asset_class=resolved_asset_class,
+            session=session,
+            trade=trade,
+            quote=quote,
+            quote_stale_after_seconds=self.settings.quote_stale_after_seconds,
+            source="alpaca",
+            fallback_price=fallback_price,
+            exchange=exchange,
+        )
 
     def close(self) -> None:
         self.client.close()

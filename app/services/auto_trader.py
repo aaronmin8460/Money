@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from app.config.settings import Settings, get_settings
 from app.db.models import AutoTraderRun, BotRunHistory
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass, AssetMetadata
+from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import get_logger
 from app.services.market_data import infer_asset_class, normalize_asset_class
@@ -59,6 +59,7 @@ class AutoTrader:
         self._last_run_result: Optional[Dict[str, Any]] = None
         self._last_accepted_candidate: Optional[Dict[str, Any]] = None
         self._last_rejected_candidate: Optional[Dict[str, Any]] = None
+        self._last_symbol_evaluations: List[Dict[str, Any]] = []
         self._last_ranked_candidates: List[Dict[str, Any]] = []
         self._last_regime_snapshot: Dict[str, Any] = {}
         self._last_scan_overview: Dict[str, Any] = {}
@@ -161,12 +162,13 @@ class AutoTrader:
             with self._execution_lock:
                 self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
-                signal = self._evaluate_asset(asset, prefer_primary_strategy=True)
+                signal = self._evaluate_asset(asset, prefer_primary_strategy=True, evaluation_mode="manual")
                 execution = self.execution_service.process_signal(signal)
                 result = self._build_execution_result(asset.symbol, signal, execution)
                 if execution.get("order"):
                     self._record_order(execution["order"])
                 self._track_execution_result(result)
+                self._last_symbol_evaluations = [self._build_symbol_evaluation(asset, signal, execution)]
                 self._persist_run([result], run_type="manual_symbol")
 
             with self._state_lock:
@@ -211,11 +213,19 @@ class AutoTrader:
                 "last_rejection_reason": latest_rejection.get("reason") if latest_rejection else None,
                 "last_accepted_candidate": self._last_accepted_candidate,
                 "last_rejected_candidate": self._last_rejected_candidate,
+                "last_symbol_evaluations": self._last_symbol_evaluations,
                 "tranche_state": self.tranche_state.snapshot(),
                 "last_ranked_candidates": self._last_ranked_candidates,
                 "last_regime_snapshot": self._last_regime_snapshot,
                 "last_scan_overview": self._last_scan_overview,
                 "market_open": self._market_open,
+                "crypto_monitoring_active": self.settings.crypto_trading_enabled,
+                "quote_stale_after_seconds": self.settings.quote_stale_after_seconds,
+                "strategy_routing": {
+                    "equity": self.settings.strategy_for_asset_class(AssetClass.EQUITY),
+                    "etf": self.settings.strategy_for_asset_class(AssetClass.ETF),
+                    "crypto": self.settings.strategy_for_asset_class(AssetClass.CRYPTO),
+                },
                 "allow_extended_hours": self.settings.allow_extended_hours,
                 "open_positions_count": len(self.portfolio.positions),
             }
@@ -291,16 +301,46 @@ class AutoTrader:
         except Exception:
             self._market_open = True
 
-    def _build_context(self, asset: AssetMetadata, bars: Any) -> StrategyContext:
+    def _select_strategy_for_asset(self, asset: AssetMetadata) -> Any:
+        requested_name = self.settings.strategy_for_asset_class(asset.asset_class)
+        try:
+            strategy = self.strategy_registry.get(requested_name)
+            if strategy.supports(asset.asset_class):
+                return strategy
+        except Exception:
+            pass
+
+        try:
+            active_strategy = self.strategy_registry.get(self.settings.active_strategy)
+            if active_strategy.supports(asset.asset_class):
+                return active_strategy
+        except Exception:
+            pass
+
+        if asset.asset_class == AssetClass.CRYPTO:
+            try:
+                return self.strategy_registry.get("crypto_momentum_trend")
+            except Exception:
+                return self.strategy
+        return self.strategy
+
+    def _build_context(
+        self,
+        asset: AssetMetadata,
+        bars: Any,
+        *,
+        strategy: Any,
+        snapshot: NormalizedMarketSnapshot,
+    ) -> StrategyContext:
         benchmark_bars = None
-        regime_symbol = getattr(self.strategy, "regime_symbol", "SPY")
+        regime_symbol = getattr(strategy, "regime_symbol", "SPY")
         if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != regime_symbol:
             try:
                 # Fetch enough benchmark data for regime strategies
-                regime_long_sma = getattr(self.strategy, "regime_long_sma", 25)
+                regime_long_sma = getattr(strategy, "regime_long_sma", 25)
                 benchmark_limit = (
                     250
-                    if getattr(self.strategy, "name", "") == "equity_momentum_breakout"
+                    if getattr(strategy, "name", "") == "equity_momentum_breakout"
                     else max(30, regime_long_sma + 5)
                 )
                 benchmark_bars = self.market_data_service.fetch_bars(
@@ -322,6 +362,7 @@ class AutoTrader:
                 "short_selling_enabled": self.settings.short_selling_enabled,
                 "has_tracked_position": tracked_position is not None,
                 "has_sellable_long_position": self.portfolio.is_sellable_long_position(asset.symbol),
+                "normalized_snapshot": snapshot.to_dict(),
                 "tracked_position": (
                     {
                         "symbol": tracked_position.symbol,
@@ -338,38 +379,61 @@ class AutoTrader:
             },
         )
 
-    def _evaluate_asset(self, asset: AssetMetadata, prefer_primary_strategy: bool = False) -> TradeSignal:
-        if not self.strategy.supports(asset.asset_class):
+    def _evaluate_asset(
+        self,
+        asset: AssetMetadata,
+        prefer_primary_strategy: bool = False,
+        *,
+        evaluation_mode: str = "auto",
+        precomputed_snapshot: dict[str, Any] | None = None,
+    ) -> TradeSignal:
+        strategy = self._select_strategy_for_asset(asset)
+        normalized_snapshot: NormalizedMarketSnapshot
+        if precomputed_snapshot:
+            normalized_snapshot = NormalizedMarketSnapshot.from_dict(precomputed_snapshot)
+        else:
+            normalized_snapshot = self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
+
+        if not strategy.supports(asset.asset_class):
             return TradeSignal(
                 symbol=asset.symbol,
                 signal=Signal.HOLD,
                 asset_class=asset.asset_class,
-                strategy_name=self.strategy.name,
+                strategy_name=strategy.name,
                 reason=(
-                    f"Active strategy '{self.settings.active_strategy}' does not support "
+                    f"Selected strategy '{strategy.name}' does not support "
                     f"asset class '{asset.asset_class.value}'."
                 ),
+                price=normalized_snapshot.evaluation_price,
+                entry_price=normalized_snapshot.evaluation_price,
+                metrics={
+                    "decision_code": "unsupported_asset_class",
+                    "evaluation_mode": evaluation_mode,
+                    "normalized_snapshot": normalized_snapshot.to_dict(),
+                    "strategy_selected": strategy.name,
+                    "asset_class": asset.asset_class.value,
+                },
             )
 
         # Fetch enough data for regime strategies (at least 250 bars for 200-day regime)
-        min_bars = 250 if getattr(self.strategy, "name", "") == "equity_momentum_breakout" else 60
+        min_bars = 250 if getattr(strategy, "name", "") == "equity_momentum_breakout" else 60
         bars = self.market_data_service.fetch_bars(
             asset.symbol,
             asset_class=asset.asset_class,
             timeframe=self.settings.default_timeframe,
             limit=min_bars,
         )
-        context = self._build_context(asset, bars)
+        context = self._build_context(asset, bars, strategy=strategy, snapshot=normalized_snapshot)
         candidate_signals: list[TradeSignal] = []
         strategy_input: Any = bars
-        if getattr(self.strategy, "name", "") == "equity_momentum_breakout":
+        if getattr(strategy, "name", "") == "equity_momentum_breakout":
             strategy_input = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
         try:
-            candidate_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input, context=context))
+            candidate_signals.extend(strategy.generate_signals(asset.symbol, strategy_input, context=context))
         except TypeError as exc:
             if "unexpected keyword argument 'context'" not in str(exc):
                 raise
-            candidate_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input))
+            candidate_signals.extend(strategy.generate_signals(asset.symbol, strategy_input))
         except Exception as exc:
             logger.warning("Strategy evaluation failed for %s: %s", asset.symbol, exc)
         if not candidate_signals:
@@ -377,8 +441,17 @@ class AutoTrader:
                 symbol=asset.symbol,
                 signal=Signal.HOLD,
                 asset_class=asset.asset_class,
-                strategy_name=self.strategy.name,
-                reason=f"Active strategy '{self.settings.active_strategy}' generated no signal.",
+                strategy_name=strategy.name,
+                reason=f"Selected strategy '{strategy.name}' generated no signal.",
+                price=normalized_snapshot.evaluation_price,
+                entry_price=normalized_snapshot.evaluation_price,
+                metrics={
+                    "decision_code": "no_signal",
+                    "evaluation_mode": evaluation_mode,
+                    "normalized_snapshot": normalized_snapshot.to_dict(),
+                    "strategy_selected": strategy.name,
+                    "asset_class": asset.asset_class.value,
+                },
             )
         signal = sorted(
             candidate_signals,
@@ -390,6 +463,9 @@ class AutoTrader:
             reverse=True,
         )[0]
         signal = self._normalize_signal_for_long_only(asset, signal)
+        if normalized_snapshot.evaluation_price is not None:
+            signal.price = float(normalized_snapshot.evaluation_price)
+            signal.entry_price = float(normalized_snapshot.evaluation_price)
         signal.liquidity_score = signal.liquidity_score or 0.0
         if signal.metrics is None:
             signal.metrics = {}
@@ -397,8 +473,20 @@ class AutoTrader:
         signal.metrics.setdefault("avg_volume", float(bars["Volume"].tail(10).mean()) if not bars.empty else None)
         signal.metrics.setdefault("dollar_volume", (signal.metrics.get("avg_volume") or 0.0) * (signal.entry_price or signal.price or 0.0))
         signal.metrics.setdefault("latest_volume", latest_volume)
-        if context.quote is not None:
-            signal.metrics.setdefault("spread_pct", context.quote.spread_pct)
+        signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
+        signal.metrics["decision_code"] = signal.metrics.get("decision_code") or ("no_signal" if signal.signal == Signal.HOLD else "signal")
+        signal.metrics["evaluation_mode"] = evaluation_mode
+        signal.metrics["strategy_selected"] = strategy.name
+        signal.metrics["asset_class"] = asset.asset_class.value
+        signal.metrics["normalized_snapshot"] = normalized_snapshot.to_dict()
+        signal.metrics["quote_available"] = normalized_snapshot.quote_available
+        signal.metrics["quote_stale"] = normalized_snapshot.quote_stale
+        signal.metrics["price_source_used"] = normalized_snapshot.price_source_used
+        signal.metrics["fallback_pricing_used"] = normalized_snapshot.fallback_pricing_used
+        signal.metrics["quote_timestamp"] = (
+            normalized_snapshot.quote_timestamp.isoformat() if normalized_snapshot.quote_timestamp else None
+        )
+        signal.metrics["quote_age_seconds"] = normalized_snapshot.quote_age_seconds
         signal.metrics.setdefault("exchange", asset.exchange)
         return signal
 
@@ -478,11 +566,38 @@ class AutoTrader:
             open_symbols = list(self.portfolio.positions.keys())
             all_symbols = list(dict.fromkeys(candidate_symbols + open_symbols))
             assets = [self._resolve_asset(symbol) for symbol in all_symbols]
+            snapshot_by_symbol = scan_result.symbol_snapshots or {}
 
             signals: list[TradeSignal] = []
+            symbol_evaluations: list[dict[str, Any]] = []
             for asset in assets:
-                signal = self._evaluate_asset(asset)
+                signal = self._evaluate_asset(
+                    asset,
+                    evaluation_mode="auto",
+                    precomputed_snapshot=snapshot_by_symbol.get(asset.symbol),
+                )
                 self._last_signals[asset.symbol] = signal.to_dict()
+                symbol_evaluations.append(
+                    {
+                        "symbol": asset.symbol,
+                        "asset_class": asset.asset_class.value,
+                        "strategy_selected": (signal.metrics or {}).get("strategy_selected", signal.strategy_name),
+                        "market_session_state": (signal.metrics or {}).get("normalized_snapshot", {}).get("session_state"),
+                        "latest_normalized_snapshot": (signal.metrics or {}).get("normalized_snapshot"),
+                        "quote_available": (signal.metrics or {}).get("quote_available"),
+                        "price_source_for_ranking": (
+                            (scan_result.symbol_snapshots.get(asset.symbol, {}) if scan_result.symbol_snapshots else {}).get("price_source_used")
+                        ),
+                        "price_source_for_signal": (signal.metrics or {}).get("price_source_used"),
+                        "price_source_for_order_proposal": None,
+                        "price_source_for_spread_check": None,
+                        "latest_price": signal.price,
+                        "signal": signal.signal.value,
+                        "action": "pending",
+                        "decision_rule": None,
+                        "decision_reason": signal.reason,
+                    }
+                )
                 if signal.signal != Signal.HOLD or asset.symbol in self.portfolio.positions:
                     signals.append(signal)
 
@@ -514,6 +629,19 @@ class AutoTrader:
                 execution = self.execution_service.process_signal(signal)
                 action_result = self._build_execution_result(signal.symbol, signal, execution)
                 results.append(action_result)
+                for row in symbol_evaluations:
+                    if row["symbol"] == signal.symbol:
+                        row["action"] = execution.get("action")
+                        row["latest_price"] = execution.get("latest_price")
+                        row["decision_rule"] = (execution.get("risk") or {}).get("rule")
+                        row["decision_reason"] = (execution.get("risk") or {}).get("reason")
+                        row["price_source_for_order_proposal"] = (
+                            (execution.get("risk") or {}).get("details", {}).get("price_source_used")
+                        )
+                        row["price_source_for_spread_check"] = (
+                            (execution.get("risk") or {}).get("details", {}).get("price_source_used")
+                        )
+                        break
                 if execution.get("order"):
                     self._record_order(execution["order"])
                 self._track_execution_result(action_result)
@@ -525,9 +653,11 @@ class AutoTrader:
                 self._last_regime_snapshot = scan_result.regime_status
                 self._last_scan_overview = scan_result.to_dict()
                 self._last_scan_overview["scan_bar_index"] = scan_bar_index
+                self._last_symbol_evaluations = symbol_evaluations
                 self._last_run_result = self._summarize_results("auto", results)
 
             self._persist_run(results, run_type="auto")
+            self._notify_scan_summary(all_symbols=all_symbols, evaluations=symbol_evaluations, results=results)
             return results
 
     def _build_execution_result(
@@ -546,6 +676,31 @@ class AutoTrader:
             "risk": execution.get("risk"),
             "action": execution.get("action"),
             "order": execution.get("order"),
+        }
+
+    def _build_symbol_evaluation(
+        self,
+        asset: AssetMetadata,
+        signal: TradeSignal,
+        execution: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        snapshot = (signal.metrics or {}).get("normalized_snapshot", {})
+        return {
+            "symbol": asset.symbol,
+            "asset_class": asset.asset_class.value,
+            "strategy_selected": (signal.metrics or {}).get("strategy_selected", signal.strategy_name),
+            "market_session_state": snapshot.get("session_state"),
+            "latest_normalized_snapshot": snapshot,
+            "quote_available": snapshot.get("quote_available"),
+            "price_source_for_ranking": snapshot.get("price_source_used"),
+            "price_source_for_signal": snapshot.get("price_source_used"),
+            "price_source_for_order_proposal": (execution.get("risk") or {}).get("details", {}).get("price_source_used"),
+            "price_source_for_spread_check": (execution.get("risk") or {}).get("details", {}).get("price_source_used"),
+            "latest_price": execution.get("latest_price"),
+            "signal": signal.signal.value,
+            "action": execution.get("action"),
+            "decision_rule": (execution.get("risk") or {}).get("rule"),
+            "decision_reason": (execution.get("risk") or {}).get("reason"),
         }
 
     def _record_order(self, order: Dict[str, Any]) -> None:
@@ -635,6 +790,42 @@ class AutoTrader:
             },
         )
 
+    def _notify_scan_summary(
+        self,
+        *,
+        all_symbols: list[str],
+        evaluations: list[dict[str, Any]],
+        results: list[dict[str, Any]],
+    ) -> None:
+        notifier = get_discord_notifier(self.settings)
+        action_counts: dict[str, int] = {}
+        for result in results:
+            action = str(result.get("action", "unknown"))
+            action_counts[action] = action_counts.get(action, 0) + 1
+        preview = evaluations[:8]
+        compact_rows = [
+            {
+                "symbol": item.get("symbol"),
+                "asset_class": item.get("asset_class"),
+                "strategy": item.get("strategy_selected"),
+                "latest_price": item.get("latest_price"),
+                "action": item.get("action"),
+                "reason": item.get("decision_reason"),
+            }
+            for item in preview
+        ]
+        notifier.send_system_notification(
+            event="Scan summary",
+            reason="Auto scan cycle completed.",
+            category="scan_summary",
+            details={
+                "evaluated_symbols": ", ".join(all_symbols[:12]),
+                "evaluated_count": len(all_symbols),
+                "action_counts": action_counts,
+                "symbol_results": compact_rows,
+            },
+        )
+
     def reset_runtime_state(self) -> None:
         with self._state_lock:
             self._last_run_time = None
@@ -645,6 +836,7 @@ class AutoTrader:
             self._last_run_result = None
             self._last_accepted_candidate = None
             self._last_rejected_candidate = None
+            self._last_symbol_evaluations = []
             self._last_ranked_candidates = []
             self._last_regime_snapshot = {}
             self._last_scan_overview = {}

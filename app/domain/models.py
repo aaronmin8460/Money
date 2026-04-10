@@ -170,6 +170,95 @@ class MarketSessionStatus:
 
 
 @dataclass(slots=True)
+class NormalizedMarketSnapshot:
+    symbol: str
+    asset_class: AssetClass
+    last_trade_price: float | None = None
+    bid_price: float | None = None
+    ask_price: float | None = None
+    mid_price: float | None = None
+    spread_abs: float | None = None
+    spread_pct: float | None = None
+    quote_available: bool = False
+    quote_stale: bool = False
+    quote_timestamp: datetime | None = None
+    trade_timestamp: datetime | None = None
+    source_timestamp: datetime | None = None
+    quote_age_seconds: float | None = None
+    fallback_pricing_used: bool = False
+    price_source_used: str = "last_trade"
+    evaluation_price: float | None = None
+    session_state: str | None = None
+    exchange: str | None = None
+    source: str | None = None
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "NormalizedMarketSnapshot":
+        def _parse_ts(value: Any) -> datetime | None:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value
+            text = str(value).replace("Z", "+00:00")
+            try:
+                return datetime.fromisoformat(text)
+            except ValueError:
+                return None
+
+        asset_class_value = payload.get("asset_class", AssetClass.UNKNOWN.value)
+        try:
+            resolved_asset_class = AssetClass(str(asset_class_value))
+        except ValueError:
+            resolved_asset_class = AssetClass.UNKNOWN
+        return cls(
+            symbol=str(payload.get("symbol", "")),
+            asset_class=resolved_asset_class,
+            last_trade_price=payload.get("last_trade_price"),
+            bid_price=payload.get("bid_price"),
+            ask_price=payload.get("ask_price"),
+            mid_price=payload.get("mid_price"),
+            spread_abs=payload.get("spread_abs"),
+            spread_pct=payload.get("spread_pct"),
+            quote_available=bool(payload.get("quote_available", False)),
+            quote_stale=bool(payload.get("quote_stale", False)),
+            quote_timestamp=_parse_ts(payload.get("quote_timestamp")),
+            trade_timestamp=_parse_ts(payload.get("trade_timestamp")),
+            source_timestamp=_parse_ts(payload.get("source_timestamp")),
+            quote_age_seconds=payload.get("quote_age_seconds"),
+            fallback_pricing_used=bool(payload.get("fallback_pricing_used", False)),
+            price_source_used=str(payload.get("price_source_used", "last_trade")),
+            evaluation_price=payload.get("evaluation_price"),
+            session_state=payload.get("session_state"),
+            exchange=payload.get("exchange"),
+            source=payload.get("source"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "asset_class": self.asset_class.value,
+            "last_trade_price": self.last_trade_price,
+            "bid_price": self.bid_price,
+            "ask_price": self.ask_price,
+            "mid_price": self.mid_price,
+            "spread_abs": self.spread_abs,
+            "spread_pct": self.spread_pct,
+            "quote_available": self.quote_available,
+            "quote_stale": self.quote_stale,
+            "quote_timestamp": self.quote_timestamp.isoformat() if self.quote_timestamp else None,
+            "trade_timestamp": self.trade_timestamp.isoformat() if self.trade_timestamp else None,
+            "source_timestamp": self.source_timestamp.isoformat() if self.source_timestamp else None,
+            "quote_age_seconds": self.quote_age_seconds,
+            "fallback_pricing_used": self.fallback_pricing_used,
+            "price_source_used": self.price_source_used,
+            "evaluation_price": self.evaluation_price,
+            "session_state": self.session_state,
+            "exchange": self.exchange,
+            "source": self.source,
+        }
+
+
+@dataclass(slots=True)
 class RankedOpportunity:
     symbol: str
     asset_class: AssetClass

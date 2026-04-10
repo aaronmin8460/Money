@@ -167,6 +167,16 @@ class RiskManager:
         asset_class: AssetClass | str | None = None,
         strategy_name: str | None = None,
         spread_pct: float | None = None,
+        quote_bid: float | None = None,
+        quote_ask: float | None = None,
+        quote_mid: float | None = None,
+        quote_timestamp: str | None = None,
+        quote_age_seconds: float | None = None,
+        quote_available: bool | None = None,
+        quote_stale: bool | None = None,
+        spread_abs: float | None = None,
+        price_source_used: str | None = None,
+        fallback_pricing_used: bool | None = None,
         avg_volume: float | None = None,
         dollar_volume: float | None = None,
         data_age_seconds: float | None = None,
@@ -191,6 +201,16 @@ class RiskManager:
             asset_class=resolved_asset_class,
             strategy_name=strategy_name,
             spread_pct=spread_pct,
+            quote_bid=quote_bid,
+            quote_ask=quote_ask,
+            quote_mid=quote_mid,
+            quote_timestamp=quote_timestamp,
+            quote_age_seconds=quote_age_seconds,
+            quote_available=quote_available,
+            quote_stale=quote_stale,
+            spread_abs=spread_abs,
+            price_source_used=price_source_used,
+            fallback_pricing_used=fallback_pricing_used,
             avg_volume=avg_volume,
             dollar_volume=dollar_volume,
             data_age_seconds=data_age_seconds,
@@ -267,8 +287,30 @@ class RiskManager:
         if data_age_seconds is not None and data_age_seconds > self.settings.data_stale_after_seconds:
             return RiskDecision(False, "Market data is stale.", rule="stale_data", details=decision_details)
 
-        if spread_pct is not None and spread_pct > self.settings.max_spread_pct:
-            return RiskDecision(False, "Spread exceeds configured limit.", rule="spread_limit", details=decision_details)
+        normalized_quote_available = bool(quote_available)
+        normalized_quote_stale = bool(quote_stale)
+        if spread_pct is not None:
+            decision_details["spread_pct"] = spread_pct
+        if normalized_quote_stale and not reduces_exposure:
+            return RiskDecision(
+                False,
+                "Quote data is stale and cannot be used for safe spread validation.",
+                rule="stale_quote",
+                details=decision_details,
+            )
+        if normalized_quote_available and spread_pct is not None and spread_pct > self.settings.max_spread_pct:
+            return RiskDecision(
+                False,
+                (
+                    f"Spread exceeds configured limit using bid/ask quote data "
+                    f"(bid={quote_bid}, ask={quote_ask}, spread_pct={spread_pct:.6f})."
+                ),
+                rule="spread_limit",
+                details=decision_details,
+            )
+        if not normalized_quote_available:
+            decision_details["spread_check_skipped"] = True
+            decision_details["spread_skip_reason"] = "quotes_unavailable"
 
         if resolved_asset_class != AssetClass.CRYPTO and price < self.settings.min_price:
             return RiskDecision(False, "Price below configured minimum.", rule="min_price", details=decision_details)
@@ -539,6 +581,16 @@ class RiskManager:
         asset_class: AssetClass,
         strategy_name: str | None,
         spread_pct: float | None,
+        quote_bid: float | None,
+        quote_ask: float | None,
+        quote_mid: float | None,
+        quote_timestamp: str | None,
+        quote_age_seconds: float | None,
+        quote_available: bool | None,
+        quote_stale: bool | None,
+        spread_abs: float | None,
+        price_source_used: str | None,
+        fallback_pricing_used: bool | None,
         avg_volume: float | None,
         dollar_volume: float | None,
         data_age_seconds: float | None,
@@ -591,6 +643,16 @@ class RiskManager:
             "current_daily_loss_pct": current_daily_loss_pct,
             "drawdown_pct": self.portfolio.drawdown_pct(),
             "spread_pct": spread_pct,
+            "bid": quote_bid,
+            "ask": quote_ask,
+            "mid": quote_mid,
+            "spread_abs": spread_abs,
+            "quote_timestamp": quote_timestamp,
+            "quote_age_seconds": quote_age_seconds,
+            "quote_available": quote_available,
+            "quote_stale": quote_stale,
+            "price_source_used": price_source_used,
+            "fallback_pricing_used": fallback_pricing_used,
             "avg_volume": avg_volume,
             "dollar_volume": dollar_volume,
             "data_age_seconds": data_age_seconds,

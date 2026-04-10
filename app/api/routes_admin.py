@@ -34,6 +34,7 @@ def config() -> dict[str, Any]:
         "short_selling_enabled": settings.short_selling_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
         "active_strategy": settings.active_strategy,
+        "active_strategy_by_asset_class": settings.active_strategy_by_asset_class,
         "default_symbols": settings.default_symbols,
         "enabled_asset_classes": sorted(item.value for item in settings.enabled_asset_class_set),
         "universe_scan_enabled": settings.universe_scan_enabled,
@@ -62,9 +63,14 @@ def config() -> dict[str, Any]:
         "min_price": settings.min_price,
         "min_avg_volume": settings.min_avg_volume,
         "max_spread_pct": settings.max_spread_pct,
+        "quote_stale_after_seconds": settings.quote_stale_after_seconds,
         "watchlists": settings.watchlists,
         "excluded_symbols": settings.excluded_symbols,
         "included_symbols": settings.included_symbols,
+        "discord_notify_holds_manual": settings.discord_notify_holds_manual,
+        "discord_notify_scan_summary": settings.discord_notify_scan_summary,
+        "discord_notify_crypto": settings.discord_notify_crypto,
+        "discord_timezone": settings.discord_timezone,
     }
 
 
@@ -100,6 +106,10 @@ def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = N
         "quote": runtime.market_data_service.get_latest_quote(resolved_symbol, resolved_asset_class).to_dict(),
         "trade": runtime.market_data_service.get_latest_trade(resolved_symbol, resolved_asset_class).to_dict(),
         "session": runtime.market_data_service.get_session_status(resolved_asset_class).to_dict(),
+        "normalized_snapshot": runtime.market_data_service.get_normalized_snapshot(
+            resolved_symbol,
+            resolved_asset_class,
+        ).to_dict(),
     }
 
 
@@ -132,7 +142,9 @@ def diagnostics_strategy() -> dict[str, Any]:
         "supported_asset_classes": sorted(item.value for item in strategy.supported_asset_classes),
         "signal_only": strategy.signal_only,
         "latest_signals": trader_status["last_signals"],
+        "symbol_evaluations": trader_status["last_symbol_evaluations"],
         "latest_scanned_symbols": trader_status["last_scanned_symbols"],
+        "strategy_routing": trader_status["strategy_routing"],
         "available_strategies": diagnostics_strategies()["strategies"],
     }
 
@@ -174,6 +186,10 @@ def diagnostics_auto() -> dict[str, Any]:
         "latest_rejection": status["last_rejection"],
         "last_rejection_reason": status["last_rejection_reason"],
         "tranche_state": status["tranche_state"],
+        "symbol_evaluations": status["last_symbol_evaluations"],
+        "strategy_routing": status["strategy_routing"],
+        "quote_stale_after_seconds": status["quote_stale_after_seconds"],
+        "crypto_monitoring_active": status["crypto_monitoring_active"],
     }
 
 
