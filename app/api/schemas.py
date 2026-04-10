@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class BacktestRequest(BaseModel):
@@ -12,6 +12,13 @@ class BacktestRequest(BaseModel):
 
 class RunOnceRequest(BaseModel):
     symbol: str | None = None
+    asset_class: str | None = None
+
+
+class SignalRunRequest(BaseModel):
+    symbol: str | None = None
+    asset_class: str | None = None
+    limit: int = Field(10, ge=1, le=100)
 
 
 class BrokerStatus(BaseModel):
@@ -20,6 +27,7 @@ class BrokerStatus(BaseModel):
     has_credentials: bool
     safe_dry_run: bool
     broker_label: str
+    live_trading_enabled: bool | None = None
 
 
 class AccountSummary(BaseModel):
@@ -51,3 +59,5 @@ class RunOnceResult(BaseModel):
     risk: dict[str, Any]
     action: str
     order: Any | None = None
+    asset_class: str | None = None
+    strategy_name: str | None = None

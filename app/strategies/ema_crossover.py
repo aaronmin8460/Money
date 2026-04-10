@@ -2,16 +2,25 @@ from __future__ import annotations
 
 import pandas as pd
 
-from app.strategies.base import BaseStrategy, Signal, TradeSignal
+from app.domain.models import AssetClass
+from app.strategies.base import BaseStrategy, Signal, StrategyContext, TradeSignal
 
 
 class EMACrossoverStrategy(BaseStrategy):
+    name = "ema_crossover"
+    supported_asset_classes = {AssetClass.EQUITY, AssetClass.ETF}
+
     def __init__(self, short_window: int = 12, long_window: int = 26, atr_multiplier: float = 1.5):
         self.short_window = short_window
         self.long_window = long_window
         self.atr_multiplier = atr_multiplier
 
-    def generate_signals(self, symbol: str, data: pd.DataFrame) -> list[TradeSignal]:
+    def generate_signals(
+        self,
+        symbol: str,
+        data: pd.DataFrame,
+        context: StrategyContext | None = None,
+    ) -> list[TradeSignal]:
         if data.empty:
             return []
 
@@ -43,10 +52,14 @@ class EMACrossoverStrategy(BaseStrategy):
                 TradeSignal(
                     symbol=symbol,
                     signal=direction,
+                    asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
+                    strategy_name=self.name,
                     strength=abs(row["ema_short"] - row["ema_long"]),
                     price=float(row["Close"]),
                     reason=f"{reason}. ATR stop {stop_loss:.2f}",
                     timestamp=str(index),
+                    atr=float(row["atr"]),
+                    stop_price=float(stop_loss),
                 )
             )
 

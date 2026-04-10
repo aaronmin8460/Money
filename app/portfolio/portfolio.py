@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List
 
+from app.domain.models import AssetClass
+
 
 @dataclass
 class Position:
@@ -12,6 +14,8 @@ class Position:
     entry_price: float
     side: str
     current_price: float
+    asset_class: AssetClass = AssetClass.EQUITY
+    exchange: str | None = None
 
 
 @dataclass
@@ -35,14 +39,48 @@ class Portfolio:
                 "avg_entry_price": position.entry_price,
                 "side": position.side,
                 "current_price": position.current_price,
+                "asset_class": position.asset_class.value,
+                "exchange": position.exchange,
                 "market_value": position.quantity * position.current_price,
             }
             for position in self.positions.values()
         ]
 
-    def update_position(self, symbol: str, side: str, quantity: float, price: float) -> None:
+    def update_position(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        asset_class: AssetClass = AssetClass.EQUITY,
+        exchange: str | None = None,
+    ) -> None:
         if side.upper() == "BUY":
-            self.positions[symbol] = Position(symbol, quantity, price, side.upper(), price)
+            existing = self.positions.get(symbol)
+            if existing:
+                total_quantity = existing.quantity + quantity
+                average_entry = (
+                    (existing.entry_price * existing.quantity) + (price * quantity)
+                ) / total_quantity
+                self.positions[symbol] = Position(
+                    symbol,
+                    total_quantity,
+                    average_entry,
+                    side.upper(),
+                    price,
+                    asset_class=asset_class,
+                    exchange=exchange,
+                )
+            else:
+                self.positions[symbol] = Position(
+                    symbol,
+                    quantity,
+                    price,
+                    side.upper(),
+                    price,
+                    asset_class=asset_class,
+                    exchange=exchange,
+                )
             self.cash -= quantity * price
             self.last_trade_time = datetime.utcnow()
         elif side.upper() == "SELL" and symbol in self.positions:
@@ -86,6 +124,20 @@ class Portfolio:
     def exposure(self) -> float:
         return sum(position.quantity * position.current_price for position in self.positions.values())
 
+    def exposure_by_asset_class(self) -> Dict[str, float]:
+        exposure: Dict[str, float] = {}
+        for position in self.positions.values():
+            key = position.asset_class.value
+            exposure[key] = exposure.get(key, 0.0) + (position.quantity * position.current_price)
+        return exposure
+
+    def position_counts_by_asset_class(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for position in self.positions.values():
+            key = position.asset_class.value
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
     def drawdown_pct(self) -> float:
         if not self.equity_history:
             return 0.0
@@ -128,6 +180,19 @@ class Portfolio:
                     pos.get("current_price", pos.get("last_price", pos.get("price", entry_price)))
                 )
                 side = pos.get("side", "long")
-                self.positions[symbol] = Position(symbol, qty, entry_price, side, current_price)
+                asset_class = pos.get("asset_class", AssetClass.EQUITY.value)
+                try:
+                    normalized_asset_class = AssetClass(str(asset_class))
+                except ValueError:
+                    normalized_asset_class = AssetClass.EQUITY
+                self.positions[symbol] = Position(
+                    symbol,
+                    qty,
+                    entry_price,
+                    side,
+                    current_price,
+                    asset_class=normalized_asset_class,
+                    exchange=pos.get("exchange"),
+                )
 
         self._recalculate_equity()

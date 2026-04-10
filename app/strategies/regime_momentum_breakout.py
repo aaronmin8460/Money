@@ -4,42 +4,78 @@ from typing import Any
 
 import pandas as pd
 
-from app.strategies.base import BaseStrategy, Signal, TradeSignal
+from app.domain.models import AssetClass
+from app.strategies.base import BaseStrategy, Signal, StrategyContext, TradeSignal
 
 
 class RegimeMomentumBreakoutStrategy(BaseStrategy):
     """Advanced strategy using regime filter, momentum ranking, and breakout entries."""
 
+    name = "equity_momentum_breakout"
+    supported_asset_classes = {AssetClass.EQUITY, AssetClass.ETF}
+
     def __init__(self):
         self.regime_symbol = "SPY"
-        self.regime_long_sma = 200
-        self.regime_short_sma = 50
-        self.ema_window = 20
-        self.sma_short = 50
-        self.sma_long = 100
+        self.regime_long_sma = 20
+        self.regime_short_sma = 10
+        self.ema_window = 8
+        self.sma_short = 10
+        self.sma_long = 20
         self.atr_window = 14
-        self.breakout_window = 20
-        self.volume_window = 20
-        self.return_window = 20
-        self.return_3m_window = 60
+        self.breakout_window = 10
+        self.volume_window = 10
+        self.return_window = 5
+        self.return_3m_window = 15
 
-    def generate_signals(self, symbol: str, data: Any) -> list[TradeSignal]:
+    def generate_signals(
+        self,
+        symbol: str,
+        data: Any,
+        context: StrategyContext | None = None,
+    ) -> list[TradeSignal]:
         symbol_df, benchmark_df = self._unpack_data(data)
         if symbol_df.empty or len(symbol_df) < self.regime_long_sma:
-            return [TradeSignal(symbol=symbol, signal=Signal.HOLD, reason="Insufficient data")]
+            return [
+                TradeSignal(
+                    symbol=symbol,
+                    signal=Signal.HOLD,
+                    asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
+                    strategy_name=self.name,
+                    reason="Insufficient data",
+                )
+            ]
 
         symbol_df = symbol_df.copy()
         symbol_df = self._add_indicators(symbol_df)
         regime_state = self._get_regime_state(symbol_df, benchmark_df)
 
         if regime_state == "bearish":
-            return self._generate_exit_signals(symbol, symbol_df, regime_state)
+            return self._generate_exit_signals(
+                symbol,
+                symbol_df,
+                regime_state,
+                context.asset.asset_class if context else AssetClass.EQUITY,
+            )
         if regime_state == "unknown":
-            return [TradeSignal(symbol=symbol, signal=Signal.HOLD, reason="Regime unknown", regime_state=regime_state)]
+            return [
+                TradeSignal(
+                    symbol=symbol,
+                    signal=Signal.HOLD,
+                    asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
+                    strategy_name=self.name,
+                    reason="Regime unknown",
+                    regime_state=regime_state,
+                )
+            ]
 
         signals: list[TradeSignal] = []
         for _, row in symbol_df.iterrows():
-            candidate = self._evaluate_entry(symbol, row, regime_state)
+            candidate = self._evaluate_entry(
+                symbol,
+                row,
+                regime_state,
+                context.asset.asset_class if context else AssetClass.EQUITY,
+            )
             if candidate:
                 signals.append(candidate)
 
@@ -50,6 +86,8 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
             TradeSignal(
                 symbol=symbol,
                 signal=Signal.HOLD,
+                asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
+                strategy_name=self.name,
                 reason="No valid entry signal",
                 regime_state=regime_state,
             )
@@ -104,7 +142,13 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
             return "bullish"
         return "bearish"
 
-    def _evaluate_entry(self, symbol: str, row: pd.Series, regime_state: str) -> TradeSignal | None:
+    def _evaluate_entry(
+        self,
+        symbol: str,
+        row: pd.Series,
+        regime_state: str,
+        asset_class: AssetClass,
+    ) -> TradeSignal | None:
         if pd.isna(row["ema"]) or pd.isna(row["sma_short"]) or pd.isna(row["sma_long"]) or pd.isna(row["atr"]):
             return None
 
@@ -131,11 +175,15 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
             return TradeSignal(
                 symbol=symbol,
                 signal=Signal.BUY,
+                asset_class=asset_class,
+                strategy_name=self.name,
                 strength=momentum_score,
+                confidence_score=min(1.0, max(0.0, momentum_score * 10)),
                 price=float(row["Close"]),
                 reason="Regime bullish, breakout above 20-day high with volume",
                 atr=float(row["atr"]),
                 stop_price=initial_stop,
+                target_price=float(row["Close"] + 3.0 * row["atr"]),
                 trailing_stop=trailing_stop,
                 momentum_score=momentum_score,
                 regime_state=regime_state,
@@ -143,13 +191,21 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
             )
         return None
 
-    def _generate_exit_signals(self, symbol: str, df: pd.DataFrame, regime_state: str) -> list[TradeSignal]:
+    def _generate_exit_signals(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        regime_state: str,
+        asset_class: AssetClass,
+    ) -> list[TradeSignal]:
         latest = df.iloc[-1]
         if pd.notna(latest["ema"]) and latest["Close"] < latest["ema"]:
             return [
                 TradeSignal(
                     symbol=symbol,
                     signal=Signal.SELL,
+                    asset_class=asset_class,
+                    strategy_name=self.name,
                     price=float(latest["Close"]),
                     reason="Bearish regime and close below EMA",
                     regime_state=regime_state,
@@ -159,6 +215,8 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
             TradeSignal(
                 symbol=symbol,
                 signal=Signal.HOLD,
+                asset_class=asset_class,
+                strategy_name=self.name,
                 reason="Bearish regime, no exit signal",
                 regime_state=regime_state,
             )

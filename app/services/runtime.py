@@ -9,8 +9,12 @@ from app.execution.execution_service import ExecutionService
 from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskManager
+from app.services.asset_catalog import AssetCatalogService
 from app.services.broker import BrokerInterface, create_broker
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, MarketDataService
+from app.services.market_overview import MarketOverviewService
+from app.services.scanner import ScannerService
+from app.strategies.registry import StrategyRegistry, build_strategy_registry
 from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
 
 if TYPE_CHECKING:
@@ -26,6 +30,10 @@ class RuntimeContainer:
     portfolio: Portfolio
     risk_manager: RiskManager
     market_data_service: MarketDataService
+    asset_catalog: AssetCatalogService
+    scanner: ScannerService
+    market_overview: MarketOverviewService
+    strategy_registry: StrategyRegistry
     execution_service: ExecutionService
     strategy: RegimeMomentumBreakoutStrategy
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -45,6 +53,11 @@ class RuntimeContainer:
             except Exception as exc:
                 logger.warning("Failed to refresh runtime account state: %s", exc)
 
+            try:
+                self.asset_catalog.ensure_fresh()
+            except Exception as exc:
+                logger.warning("Failed to refresh asset catalog: %s", exc)
+
     def get_auto_trader(self) -> AutoTrader:
         if self._auto_trader is None:
             from app.services.auto_trader import AutoTrader
@@ -59,6 +72,9 @@ class RuntimeContainer:
         close = getattr(self.broker, "close", None)
         if callable(close):
             close()
+        market_data_close = getattr(self.market_data_service, "close", None)
+        if callable(market_data_close):
+            market_data_close()
 
 
 _runtime: RuntimeContainer | None = None
@@ -76,6 +92,10 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
 
     portfolio = Portfolio()
     risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    asset_catalog = AssetCatalogService(broker=broker, settings=settings)
+    scanner = ScannerService(asset_catalog=asset_catalog, market_data_service=market_data_service, settings=settings)
+    market_overview = MarketOverviewService(scanner)
+    strategy_registry = build_strategy_registry(settings)
     strategy = RegimeMomentumBreakoutStrategy()
     execution_service = ExecutionService(
         broker=broker,
@@ -83,6 +103,7 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         risk_manager=risk_manager,
         dry_run=not settings.trading_enabled,
         market_data_service=market_data_service,
+        settings=settings,
     )
     runtime = RuntimeContainer(
         settings=settings,
@@ -90,6 +111,10 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         portfolio=portfolio,
         risk_manager=risk_manager,
         market_data_service=market_data_service,
+        asset_catalog=asset_catalog,
+        scanner=scanner,
+        market_overview=market_overview,
+        strategy_registry=strategy_registry,
         execution_service=execution_service,
         strategy=strategy,
     )

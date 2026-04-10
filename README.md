@@ -1,43 +1,82 @@
 # Money Trading Bot
 
-A paper-trading algorithmic trading system built around FastAPI, Alpaca paper market access, and a risk-aware trading pipeline.
+Multi-asset market scanner and trading engine built with FastAPI, SQLite, and broker-aware services.
 
-This repository now includes:
+The project is API-first, paper-trading safe by default, and designed for learning, research, and paper execution. It does not guarantee profitability and should not be treated as investment advice.
 
-- A regime-filtered momentum breakout strategy for paper trading
-- Alpaca paper trading endpoints separated from market data endpoints
-- Risk-based position sizing with ATR stop placement
-- Safe auto-trading loop with cooldowns, market-open checks, and ranked entries
-- SQLite persistence for signals, orders, and auto-trader run history
-- API control surface for monitoring and manual orchestration
+## What It Does
 
-## What changed
+- Syncs a broker-aware asset universe instead of relying on a tiny hardcoded stock list.
+- Supports equities, ETFs, and supported crypto pairs.
+- Keeps options behind a feature flag and paper-only guardrail.
+- Normalizes bars, quotes, trades, snapshots, and session state across asset classes.
+- Scans the tradable universe for gainers, losers, breakouts, pullbacks, volatility, momentum, and overall opportunities.
+- Routes strategies by asset class and ranks generated signals.
+- Applies multi-asset risk controls before any order placement.
+- Persists catalog syncs, scanner runs, opportunities, signals, orders, fills, position snapshots, and bot runs in SQLite.
 
-The strategy now uses:
+## Architecture
 
-- SPY regime filter based on 50/200-day SMA crossover
-- Breakout entries above the prior 20-day high
-- Trend confirmation via 20 EMA, 50 SMA, and 100 SMA
-- Volume confirmation relative to 20-day average volume
-- Momentum ranking across the configured universe
-- ATR-based initial stops and trailing stop logic
-- Volatility-adjusted position sizing based on account equity
+- `app/api/`: FastAPI routers for assets, market data, scanner, signals, broker, automation, and diagnostics.
+- `app/config/`: environment-backed settings and feature flags.
+- `app/db/`: SQLAlchemy models and schema initialization.
+- `app/domain/`: normalized asset, market data, session, and opportunity types.
+- `app/services/asset_catalog.py`: broker-aware asset universe sync and cache.
+- `app/services/market_data.py`: normalized bars, quotes, trades, snapshots, and session behavior.
+- `app/services/scanner.py`: multi-asset ranking engine and scanner persistence.
+- `app/services/market_overview.py`: overview summaries built from scanner output.
+- `app/strategies/`: asset-class-specific strategies plus registry/routing.
+- `app/risk/`: exposure, liquidity, spread, drawdown, cooldown, and kill-switch controls.
+- `app/execution/`: normalized signal-to-order flow with dry-run and paper safety.
+- `app/services/auto_trader.py`: automation loop for scanning, signal ranking, and execution.
 
-This is paper trading only. It should not be interpreted as investment advice or a guarantee of profitability.
+## Supported Asset Classes
 
-## Project structure
+- `equity`
+- `etf`
+- `crypto`
+- `option`
+  Options remain disabled by default and are limited to feature-flagged, paper-only handling.
 
-- `app/` - main application packages
-- `app/api/` - FastAPI routes and app startup
-- `app/config/` - settings and environment loading
-- `app/db/` - SQLAlchemy models and initialization
-- `app/portfolio/` - portfolio tracking and reconciliation
-- `app/risk/` - risk management guardrails
-- `app/execution/` - order execution and signal processing
-- `app/services/` - broker interface, market data, backtests, auto-trader
-- `app/strategies/` - trading strategies
-- `tests/` - pytest coverage
-- `main.py` - FastAPI entrypoint
+## Universe Discovery
+
+`All markets` in this project means all tradable assets supported by the configured broker or data provider.
+
+- In `paper` / `mock` mode, the asset universe comes from local symbol CSVs in `data/`.
+- In `alpaca` mode, the asset catalog syncs from the broker asset list and caches the results in SQLite.
+- The catalog stores symbol, name, asset class, exchange, tradable flags, borrow flags, margin flags, and raw attributes.
+- Universe scanning can be narrowed with watchlists, inclusion lists, exclusion lists, and enabled asset-class switches.
+
+## Scanning and Signals
+
+The scanner produces ranked views for:
+
+- top gainers
+- top losers
+- unusual volume
+- breakout candidates
+- pullback candidates
+- high volatility
+- momentum
+- overall opportunities
+
+Strategies currently included:
+
+- equity/ETF momentum breakout
+- equity/ETF trend pullback
+- crypto momentum trend
+- mean reversion scanner
+- legacy EMA crossover support
+
+Signals are normalized with fields such as symbol, asset class, strategy name, direction, confidence score, entry, stop, target, ATR, momentum, liquidity, spread, regime, and reason.
+
+## Paper Trading Safety
+
+- Default broker mode is paper/mock safe.
+- `TRADING_ENABLED=false` is the default.
+- Live trading stays disabled unless `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_ACK=ENABLE_LIVE_TRADING`.
+- Alpaca live URLs are rejected unless live trading is explicitly enabled and acknowledged.
+- Options remain feature-flagged and paper-only.
 
 ## Installation
 
@@ -45,239 +84,139 @@ This is paper trading only. It should not be interpreted as investment advice or
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
 ## Configuration
 
-Create or update `.env` with the following values:
+Start from `.env.example`. Important categories:
 
-```ini
-APP_ENV=development
-LOG_LEVEL=INFO
-DATABASE_URL=sqlite:///./trading.db
-BROKER_MODE=paper
-TRADING_ENABLED=false
-AUTO_TRADE_ENABLED=false
-ALPACA_API_KEY=your_key
-ALPACA_SECRET_KEY=your_secret
-ALPACA_BASE_URL=https://paper-api.alpaca.markets
-ALPACA_DATA_BASE_URL=https://data.alpaca.markets
-DEFAULT_SYMBOLS=["AAPL","SPY","QQQ"]
-MAX_RISK_PER_TRADE=0.01
-MAX_POSITIONS=3
-MAX_POSITION_NOTIONAL=10000
-COOLDOWN_SECONDS_PER_SYMBOL=300
-ALLOW_EXTENDED_HOURS=false
-```
+- broker mode and credentials
+- paper vs live gating
+- enabled asset classes
+- universe refresh cadence
+- watchlists and exclusions
+- liquidity and spread thresholds
+- risk and exposure caps
+- strategy enable switches
 
-### Important note
+## Running Locally
 
-- `ALPACA_BASE_URL` is used for trading/account/order endpoints.
-- `ALPACA_DATA_BASE_URL` is used for Alpaca market data bar requests.
-- `AUTO_TRADE_ENABLED=true` starts the in-process auto-trader once during FastAPI startup.
-- The system runs in paper trading mode only and does not guarantee profits.
-
-## Running the API
+Initialize and run:
 
 ```bash
+source .venv/bin/activate
 uvicorn main:app --reload
 ```
 
-## Auto-trader endpoints
+Run tests:
+
+```bash
+source .venv/bin/activate
+pytest
+```
+
+## Key Endpoints
+
+Assets:
+
+- `GET /assets`
+- `GET /assets/search`
+- `GET /assets/{symbol}`
+- `POST /assets/refresh`
+- `GET /assets/stats`
+
+Market data:
+
+- `GET /market/bars`
+- `GET /market/quote`
+- `GET /market/trade`
+- `GET /market/snapshot`
+- `GET /market/session`
+
+Scanner:
+
+- `GET /scanner/overview`
+- `GET /scanner/top-gainers`
+- `GET /scanner/top-losers`
+- `GET /scanner/breakouts`
+- `GET /scanner/momentum`
+- `GET /scanner/volatility`
+- `GET /scanner/opportunities`
+- `GET /scanner/asset-class/{asset_class}`
+
+Signals:
+
+- `GET /signals`
+- `POST /signals/run`
+- `GET /signals/top`
+
+Trading and automation:
 
 - `GET /auto/status`
 - `POST /auto/start`
 - `POST /auto/stop`
 - `POST /auto/run-now`
-
-## Broker and strategy endpoints
-
+- `GET /orders`
+- `GET /positions`
+- `GET /trades`
+- `GET /risk`
+- `GET /broker/account`
 - `GET /broker/status`
-- `GET /broker/account`
-- `GET /positions`
-- `GET /orders`
-- `GET /risk`
+
+Diagnostics:
+
+- `GET /health`
+- `GET /config`
+- `GET /diagnostics/universe`
+- `GET /diagnostics/data-feed`
+- `GET /diagnostics/strategies`
+
+Legacy compatibility:
+
 - `POST /run-once`
+- `POST /backtest`
 - `GET /strategy/signals`
 - `GET /strategy/positions`
 
-## Shared runtime state
+## Verification Commands
 
-In `paper` and `mock` mode, the API uses one shared in-process runtime container for:
-
-- broker state
-- portfolio state
-- risk state
-- auto-trader state
-
-That means these endpoints now observe the same runtime inside one app process:
-
-- `GET /broker/account`
-- `GET /positions`
-- `GET /orders`
-- `GET /risk`
-- `POST /run-once`
-- `GET /strategy/positions`
-- `GET /strategy/signals`
-- `GET /auto/status`
-
-If the process restarts, mock state resets. This is intentional and keeps paper/mock behavior explicit.
-
-## Dry-run vs paper order submission
-
-When `TRADING_ENABLED=false`, the bot will still evaluate signals and position size but will not submit real Alpaca paper orders. This is the safe default for testing.
-
-When `TRADING_ENABLED=true` in `paper` or `mock` mode, filled mock orders persist in memory for the lifetime of the app process and remain visible through the API endpoints above.
-
-## AUTO_TRADE_ENABLED
-
-- `AUTO_TRADE_ENABLED=true` calls the same `POST /auto/start` logic automatically during FastAPI startup.
-- Startup is idempotent inside a single process, so repeated startup hooks do not create duplicate auto-trader threads.
-- `POST /auto/start` and `POST /auto/stop` still work normally.
-- With `uvicorn --reload`, a new worker process gets a fresh in-memory runtime after each reload.
-- For predictable behavior, use a single app worker when relying on in-process paper/mock state or the background auto-trader.
-
-## Mock market data files
-
-Mock mode now resolves symbols from symbol-specific CSV files instead of silently reusing generic sample data.
-
-- `data/AAPL.csv`
-- `data/SPY.csv`
-- `data/QQQ.csv`
-
-Resolution rules are explicit:
-
-1. `CSVMarketDataService.fetch_bars("AAPL")` looks for `data/AAPL.csv`.
-2. If that file is missing, it also checks the lowercase filename variant.
-3. If no symbol file exists, mock mode returns a clear error telling you which file to add and which symbols are currently available.
-
-`PaperBroker.get_latest_price()` uses the same symbol-specific CSV source, so prices and bars stay aligned in mock mode.
-
-`data/sample.csv` remains useful for backtests and examples, but mock API calls no longer treat it as a catch-all fallback for arbitrary symbols.
-
-## Risk semantics
-
-Risk checks now distinguish between separate concepts:
-
-- maximum position notional
-- maximum simultaneous positions
-- stop-based dollar risk when a stop price is available
-- available cash / buying power
-- daily loss and drawdown guardrails
-
-`MAX_RISK_PER_TRADE` now refers to actual stop-based trade risk when a stop is present, instead of acting like a mislabeled notional multiplier.
-
-## Risk endpoint
-
-`GET /risk` now returns a live runtime snapshot including:
-
-- `trading_enabled`
-- `broker_mode`
-- `cash`
-- `equity`
-- `buying_power`
-- `open_positions_count`
-- `risk_events`
-- `drawdown_pct`
-- `daily_loss_pct`
-
-## Testing
+Assuming the API is running on `127.0.0.1:8000`:
 
 ```bash
-pytest
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/config
+curl http://127.0.0.1:8000/assets/stats
+curl "http://127.0.0.1:8000/assets/search?q=BTC"
+curl "http://127.0.0.1:8000/market/snapshot?symbol=AAPL&asset_class=equity"
+curl "http://127.0.0.1:8000/market/snapshot?symbol=BTC/USD&asset_class=crypto"
+curl "http://127.0.0.1:8000/scanner/overview?limit=5"
+curl "http://127.0.0.1:8000/scanner/asset-class/crypto?limit=5"
+curl -X POST http://127.0.0.1:8000/signals/run -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
+curl -X POST http://127.0.0.1:8000/auto/run-now
+curl http://127.0.0.1:8000/signals/top
+curl http://127.0.0.1:8000/risk
 ```
+
+## Mock Mode Notes
+
+The repository includes local mock CSVs for:
+
+- `AAPL`
+- `SPY`
+- `QQQ`
+- `BTC/USD`
+- `ETH/USD`
+
+In mock mode, the catalog and scanner treat those as the supported universe.
+
+## Broker Limitations
+
+- Broker coverage is limited to what the configured provider exposes.
+- ETF classification in broker mode may depend on provider metadata and lightweight heuristics.
+- Options support is feature-flagged, limited, and intentionally conservative.
+- Large live universes may require tighter filters or scan limits to stay within provider rate limits.
 
 ## Disclaimer
 
-This code is designed for learning and paper trading. Paper results are not a guarantee of future performance.
-
-- `GET /orders`
-- `GET /trades`
-- `GET /risk`
-- `POST /run-once`
-- `POST /backtest`
-- `GET /auto/status`
-- `POST /auto/start`
-- `POST /auto/stop`
-- `POST /auto/run-now`
-
-## Local Development and Verification
-
-After starting the API with `uvicorn main:app --reload`, verify the setup:
-
-```bash
-# Check health
-curl http://127.0.0.1:8000/health
-
-# Check config (note DEFAULT_SYMBOLS is JSON)
-curl http://127.0.0.1:8000/config
-
-# Check broker status
-curl http://127.0.0.1:8000/broker/status
-
-# Check broker account (in paper mode, should return mock data)
-curl http://127.0.0.1:8000/broker/account
-
-# Check auto-trader status
-curl http://127.0.0.1:8000/auto/status
-
-# Run a manual scan
-curl -X POST http://127.0.0.1:8000/auto/run-now
-
-# Start auto-trading (if AUTO_TRADE_ENABLED=true)
-curl -X POST http://127.0.0.1:8000/auto/start
-
-# Stop auto-trading
-curl -X POST http://127.0.0.1:8000/auto/stop
-```
-
-### Environment Variable Notes
-
-- `DEFAULT_SYMBOLS` must be a valid JSON array, e.g., `["AAPL","SPY"]`. Comma-separated strings are not supported.
-- For Alpaca mode, ensure `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` are set. If authentication fails, `/broker/account` will return a 401 error with details.
-- `ALPACA_BASE_URL` is for trading operations (account, orders, positions).
-- `ALPACA_DATA_BASE_URL` is for market data (bars, quotes).
-- VS Code's integrated terminal may not automatically load `.env` files; ensure your environment variables are set or source the `.env` manually if needed.
-
-## Auto-Trading
-
-The bot can run automated trading cycles:
-
-1. **Manual Run**: Use `POST /auto/run-now` to execute one scan cycle immediately.
-2. **Automated**: Set `AUTO_TRADE_ENABLED=true` to auto-start on API startup, or use `POST /auto/start` to begin periodic scanning manually.
-3. **Status**: Use `GET /auto/status` to check the current state.
-
-### Safety Features
-
-- Only trades during market hours (unless `ALLOW_EXTENDED_HOURS=true`).
-- Respects `TRADING_ENABLED=false` for dry-run mode.
-- Symbol-level cooldowns prevent over-trading.
-- Position sizing based on buying power and risk limits.
-- Reconciliation ensures local and broker state sync.
-
-### Testing Auto-Trading Safely
-
-- Start with `BROKER_MODE=paper` and `TRADING_ENABLED=false`.
-- Use `POST /auto/run-now` to test signal generation without orders.
-- Use `POST /run-once` for a single-symbol execution path that updates the same in-process runtime state used by `/risk`, `/strategy/*`, and `/auto/status`.
-- Enable `TRADING_ENABLED=true` only for paper orders.
-- Monitor logs and `/auto/status` for activity.
-
-## Run tests
-
-```bash
-pytest
-```
-
-## Run a sample backtest
-
-```bash
-python scripts/run_backtest.py --symbol SPY --csv-path data/sample.csv
-```
-
-## Safety notes
-
-- This project is configured for paper trading only by default.
-- No live trading is enabled unless `TRADING_ENABLED=true` and a paper broker is explicitly configured.
-- Real broker credentials are never hardcoded.
-- Paper trading behavior is a safe simulation and does not guarantee identical results in live markets.
+This project is for learning, experimentation, and paper trading. It does not promise profits or reliable market performance.

@@ -12,7 +12,6 @@ from app.api.schemas import (
     RunOnceRequest,
     RunOnceResult,
 )
-from app.config.settings import get_settings
 from app.monitoring.logger import get_logger
 from app.services.backtest import run_backtest
 from app.services.broker import (
@@ -22,40 +21,20 @@ from app.services.broker import (
 )
 from app.services.runtime import get_runtime
 
-logger = get_logger("api")
+logger = get_logger("api.trading")
 router = APIRouter()
-
-
-@router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "mode": get_settings().broker_mode}
-
-
-@router.get("/config")
-def config() -> dict[str, Any]:
-    settings = get_settings()
-    return {
-        "app_env": settings.app_env,
-        "broker_mode": settings.broker_mode,
-        "trading_enabled": settings.trading_enabled,
-        "auto_trade_enabled": settings.auto_trade_enabled,
-        "default_symbols": settings.default_symbols,
-        "max_risk_per_trade": settings.max_risk_per_trade,
-        "max_daily_loss_pct": settings.max_daily_loss_pct,
-        "max_drawdown_pct": settings.max_drawdown_pct,
-        "max_positions": settings.max_positions,
-    }
 
 
 @router.get("/broker/status", response_model=BrokerStatus)
 def broker_status() -> BrokerStatus:
-    settings = get_settings()
+    settings = get_runtime().settings
     return BrokerStatus(
         broker_mode=settings.broker_mode,
         trading_enabled=settings.trading_enabled,
         has_credentials=settings.has_alpaca_credentials,
-        safe_dry_run=not settings.trading_enabled or not settings.is_alpaca_mode,
-        broker_label="Alpaca Paper" if settings.is_alpaca_mode else "Paper Mock",
+        safe_dry_run=not settings.trading_enabled,
+        broker_label="Alpaca" if settings.is_alpaca_mode else "Paper Mock",
+        live_trading_enabled=settings.live_trading_enabled,
     )
 
 
@@ -89,8 +68,26 @@ def orders() -> list[dict[str, Any]]:
 
 
 @router.get("/trades")
-def trades() -> list[Any]:
-    return []
+def trades() -> list[dict[str, Any]]:
+    from app.db.models import FillRecord
+    from app.db.session import SessionLocal
+
+    with SessionLocal() as session:
+        rows = session.query(FillRecord).order_by(FillRecord.filled_at.desc()).limit(100).all()
+    return [
+        {
+            "id": row.id,
+            "order_id": row.order_id,
+            "symbol": row.symbol,
+            "asset_class": row.asset_class,
+            "side": row.side,
+            "quantity": row.quantity,
+            "price": row.price,
+            "status": row.status,
+            "filled_at": row.filled_at.isoformat(),
+        }
+        for row in rows
+    ]
 
 
 @router.get("/risk")
@@ -103,11 +100,10 @@ def risk() -> dict[str, Any]:
 @router.post("/run-once", response_model=RunOnceResult)
 def run_once(request: RunOnceRequest = Body(...)) -> dict[str, Any]:
     runtime = get_runtime()
-    settings = runtime.settings
-    symbol = request.symbol or (settings.default_symbols[0] if settings.default_symbols else "AAPL")
+    symbol = request.symbol or (runtime.settings.manual_symbols[0] if runtime.settings.manual_symbols else "AAPL")
     trader = runtime.get_auto_trader()
     try:
-        result = trader.run_symbol_now(symbol)
+        result = trader.run_symbol_now(symbol, request.asset_class)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
@@ -152,8 +148,7 @@ def auto_start() -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
     if trader.start():
         return {"message": "Auto-trader started"}
-    else:
-        return {"message": "Auto-trader is already running"}
+    return {"message": "Auto-trader is already running"}
 
 
 @router.post("/auto/stop")
@@ -161,8 +156,7 @@ def auto_stop() -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
     if trader.stop():
         return {"message": "Auto-trader stopped"}
-    else:
-        return {"message": "Auto-trader is not running"}
+    return {"message": "Auto-trader is not running"}
 
 
 @router.post("/auto/run-now")
@@ -174,7 +168,7 @@ def auto_run_now() -> dict[str, Any]:
 @router.get("/strategy/signals")
 def strategy_signals() -> dict[str, Any]:
     trader = get_runtime().get_auto_trader()
-    return {"signals": trader._last_signals}
+    return {"signals": trader.get_status()["last_signals"]}
 
 
 @router.get("/strategy/positions")

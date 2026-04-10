@@ -7,16 +7,12 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from app.config.settings import Settings, get_settings
-from app.db.models import AutoTraderRun
+from app.db.models import AutoTraderRun, BotRunHistory
 from app.db.session import SessionLocal
-from app.execution.execution_service import ExecutionService
+from app.domain.models import AssetClass, AssetMetadata
 from app.monitoring.logger import get_logger
-from app.portfolio.portfolio import Portfolio
-from app.risk.risk_manager import RiskManager
-from app.services.broker import BrokerInterface, create_broker
-from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
-from app.strategies.base import Signal, TradeSignal
-from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
+from app.services.market_data import infer_asset_class, normalize_asset_class
+from app.strategies.base import Signal, StrategyContext, TradeSignal
 
 if TYPE_CHECKING:
     from app.services.runtime import RuntimeContainer
@@ -25,41 +21,29 @@ logger = get_logger("auto_trader")
 
 
 class AutoTrader:
-    """Automated trading service for periodic symbol scanning and order execution."""
+    """Automated trading service for periodic scanning and order execution."""
 
     def __init__(self, settings: Settings | None = None, runtime: RuntimeContainer | None = None):
         self.settings = settings or get_settings()
         self.runtime = runtime
 
         if runtime is None:
-            self.market_data_service = (
-                AlpacaMarketDataService(self.settings)
-                if self.settings.is_alpaca_mode
-                else CSVMarketDataService()
-            )
-            self.broker: BrokerInterface = create_broker(
-                self.settings,
-                market_data_service=self.market_data_service if self.settings.is_paper_mode else None,
-            )
-            self.portfolio = Portfolio()
-            self.risk_manager = RiskManager(self.portfolio, settings=self.settings, broker=self.broker)
-            self.strategy = RegimeMomentumBreakoutStrategy()
-            self.exec_service = ExecutionService(
-                broker=self.broker,
-                portfolio=self.portfolio,
-                risk_manager=self.risk_manager,
-                dry_run=not self.settings.trading_enabled,
-                market_data_service=self.market_data_service,
-            )
-            self._execution_lock = threading.RLock()
-        else:
-            self.broker = runtime.broker
-            self.portfolio = runtime.portfolio
-            self.risk_manager = runtime.risk_manager
-            self.strategy = runtime.strategy
-            self.market_data_service = runtime.market_data_service
-            self.exec_service = runtime.execution_service
-            self._execution_lock = runtime.lock
+            from app.services.runtime import get_runtime
+
+            runtime = get_runtime(self.settings)
+
+        self.runtime = runtime
+        self.broker = runtime.broker
+        self.portfolio = runtime.portfolio
+        self.risk_manager = runtime.risk_manager
+        self.market_data_service = runtime.market_data_service
+        self.execution_service = runtime.execution_service
+        self.asset_catalog = runtime.asset_catalog
+        self.scanner = runtime.scanner
+        self.market_overview = runtime.market_overview
+        self.strategy_registry = runtime.strategy_registry
+        self.strategy = runtime.strategy
+        self._execution_lock = runtime.lock
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -71,11 +55,10 @@ class AutoTrader:
         self._last_error: Optional[str] = None
         self._last_ranked_candidates: List[Dict[str, Any]] = []
         self._last_regime_snapshot: Dict[str, Any] = {}
-        self._symbol_cooldowns: Dict[str, datetime.datetime] = {}
+        self._last_scan_overview: Dict[str, Any] = {}
         self._market_open: bool = True
 
     def start(self) -> bool:
-        """Start the auto-trading loop. Returns True if started, False if already running."""
         with self._state_lock:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.warning("Auto-trader is already running")
@@ -93,14 +76,12 @@ class AutoTrader:
         return True
 
     def stop(self) -> bool:
-        """Stop the auto-trading loop. Returns True if stopped, False if not running."""
         with self._state_lock:
             thread = self._thread
             if not self._running and not (thread and thread.is_alive()):
                 logger.warning("Auto-trader is not running")
                 self._thread = None
                 return False
-
             self._running = False
 
         if thread:
@@ -113,9 +94,8 @@ class AutoTrader:
         return True
 
     def run_now(self) -> Dict[str, Any]:
-        """Run one cycle immediately and return the results."""
         try:
-            results = self._scan_and_trade(self.settings.default_symbols)
+            results = self._scan_and_trade()
             with self._state_lock:
                 self._last_run_time = datetime.datetime.utcnow()
                 self._last_error = None
@@ -127,32 +107,31 @@ class AutoTrader:
                 self._last_error = error_msg
             return {"success": False, "error": error_msg}
 
-    def run_symbol_now(self, symbol: str) -> Dict[str, Any]:
-        normalized_symbol = symbol.strip().upper()
+    def run_symbol_now(self, symbol: str, asset_class: AssetClass | str | None = None) -> Dict[str, Any]:
         now = datetime.datetime.utcnow()
+        asset = self._resolve_asset(symbol, asset_class)
         try:
             with self._execution_lock:
-                self._prepare_cycle_state([normalized_symbol], now)
                 self._sync_portfolio_from_broker()
-                benchmark_data = self._load_benchmark_data()
-                signal = self._evaluate_symbol(normalized_symbol, benchmark_data, now, raise_fetch_errors=True)
-                execution = self.exec_service.process_signal(signal)
-                result = self._build_execution_result(normalized_symbol, signal, execution)
+                signal = self._evaluate_asset(asset, prefer_primary_strategy=True)
+                execution = self.execution_service.process_signal(signal)
+                result = self._build_execution_result(asset.symbol, signal, execution)
                 if execution.get("order"):
-                    self._record_order(normalized_symbol, execution["order"], now)
-                self._persist_run([result])
+                    self._record_order(execution["order"])
+                self._persist_run([result], run_type="manual_symbol")
 
             with self._state_lock:
                 self._last_run_time = now
                 self._last_error = None
+                self._last_scanned_symbols = [asset.symbol]
+                self._last_signals[asset.symbol] = signal.to_dict()
             return result
         except Exception as exc:
             with self._state_lock:
-                self._last_error = f"Run-once failed for {normalized_symbol}: {exc}"
+                self._last_error = f"Run-once failed for {asset.symbol}: {exc}"
             raise
 
     def get_status(self) -> Dict[str, Any]:
-        """Get current status of the auto-trader."""
         with self._state_lock:
             return {
                 "running": self._running,
@@ -163,10 +142,7 @@ class AutoTrader:
                 "last_error": self._last_error,
                 "last_ranked_candidates": self._last_ranked_candidates,
                 "last_regime_snapshot": self._last_regime_snapshot,
-                "symbol_cooldowns": {
-                    symbol: cooldown.isoformat()
-                    for symbol, cooldown in self._symbol_cooldowns.items()
-                },
+                "last_scan_overview": self._last_scan_overview,
                 "market_open": self._market_open,
                 "broker_mode": self.settings.broker_mode,
                 "trading_enabled": self.settings.trading_enabled,
@@ -174,14 +150,13 @@ class AutoTrader:
             }
 
     def _run_loop(self) -> None:
-        """Main loop for periodic scanning."""
         while True:
             with self._state_lock:
                 if not self._running:
                     break
 
             try:
-                self._scan_and_trade(self.settings.default_symbols)
+                self._scan_and_trade()
                 with self._state_lock:
                     self._last_run_time = datetime.datetime.utcnow()
                     self._last_error = None
@@ -193,16 +168,27 @@ class AutoTrader:
 
             time.sleep(self.settings.scan_interval_seconds)
 
-    def _prepare_cycle_state(self, symbols: List[str], now: datetime.datetime) -> None:
-        with self._state_lock:
-            self._last_scanned_symbols = symbols.copy()
-            self._last_ranked_candidates = []
-            self._last_signals = {}
-            self._last_regime_snapshot = {
-                "benchmark_symbol": self.strategy.regime_symbol,
-                "market_open": self._market_open,
-                "generated_at": now.isoformat(),
-            }
+    def _resolve_asset(
+        self,
+        symbol: str,
+        asset_class: AssetClass | str | None = None,
+    ) -> AssetMetadata:
+        asset = self.asset_catalog.get_asset(symbol)
+        if asset is not None:
+            return asset
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        broker_asset = self.broker.get_asset(symbol, resolved_asset_class)
+        if broker_asset is not None:
+            return broker_asset
+        return AssetMetadata(
+            symbol=symbol.strip().upper(),
+            name=symbol.strip().upper(),
+            asset_class=resolved_asset_class,
+            exchange="UNKNOWN",
+            tradable=True,
+        )
 
     def _sync_portfolio_from_broker(self) -> None:
         try:
@@ -217,93 +203,136 @@ class AutoTrader:
         except Exception as exc:
             logger.warning("Failed to refresh portfolio cash/equity: %s", exc)
 
-        if self.settings.is_alpaca_mode and self.settings.trading_enabled:
-            try:
-                self._market_open = self.broker.is_market_open()
-            except Exception as exc:
-                logger.warning("Failed to check market open: %s", exc)
-                self._market_open = False
-        else:
+        try:
+            self.asset_catalog.ensure_fresh()
+        except Exception as exc:
+            logger.warning("Failed to refresh asset catalog: %s", exc)
+
+        try:
+            self._market_open = self.broker.is_market_open(AssetClass.EQUITY)
+        except Exception:
             self._market_open = True
 
-    def _load_benchmark_data(self) -> Any | None:
-        if not self.strategy.regime_symbol:
-            return None
-
-        try:
-            return self.market_data_service.fetch_bars(
-                self.strategy.regime_symbol,
-                limit=max(self.strategy.regime_long_sma, self.strategy.return_3m_window) + 20,
-            )
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch benchmark bars for %s: %s",
-                self.strategy.regime_symbol,
-                exc,
-            )
-            return None
-
-    def _evaluate_symbol(
-        self,
-        symbol: str,
-        benchmark_data: Any | None,
-        now: datetime.datetime,
-        raise_fetch_errors: bool = False,
-    ) -> TradeSignal:
-        try:
-            bars = self.market_data_service.fetch_bars(symbol, limit=260)
-        except Exception as exc:
-            error_message = str(exc)
-            with self._state_lock:
-                self._last_signals[symbol] = {
-                    "symbol": symbol,
-                    "signal": Signal.HOLD.value,
-                    "action": "error",
-                    "error": error_message,
-                    "generated_at": now.isoformat(),
-                }
-            if raise_fetch_errors:
-                raise
-            return TradeSignal(symbol=symbol, signal=Signal.HOLD, reason=error_message)
-
-        input_data: Any = {"symbol": bars, "benchmark": benchmark_data} if benchmark_data is not None else bars
-        signals = self.strategy.generate_signals(symbol, input_data)
-        latest_signal = signals[-1] if signals else TradeSignal(
-            symbol=symbol,
-            signal=Signal.HOLD,
-            reason="Strategy returned no signals.",
+    def _build_context(self, asset: AssetMetadata, bars: Any) -> StrategyContext:
+        benchmark_bars = None
+        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != self.strategy.regime_symbol:
+            try:
+                benchmark_bars = self.market_data_service.fetch_bars(
+                    self.strategy.regime_symbol,
+                    asset_class=AssetClass.ETF,
+                    timeframe=self.settings.default_timeframe,
+                    limit=max(30, self.strategy.regime_long_sma + 5),
+                )
+            except Exception as exc:
+                logger.warning("Failed to fetch benchmark bars: %s", exc)
+        return StrategyContext(
+            asset=asset,
+            session=self.market_data_service.get_session_status(asset.asset_class),
+            quote=self.market_data_service.get_latest_quote(asset.symbol, asset.asset_class),
+            timeframe=self.settings.default_timeframe,
+            metadata={"benchmark_bars": benchmark_bars},
         )
 
-        signal_status = self._build_signal_status(symbol, latest_signal, now)
-        with self._state_lock:
-            self._last_signals[symbol] = signal_status
-            self._last_regime_snapshot = {
-                "benchmark_symbol": self.strategy.regime_symbol,
-                "market_open": self._market_open,
-                "generated_at": now.isoformat(),
-            }
-        return latest_signal
+    def _evaluate_asset(self, asset: AssetMetadata, prefer_primary_strategy: bool = False) -> TradeSignal:
+        bars = self.market_data_service.fetch_bars(
+            asset.symbol,
+            asset_class=asset.asset_class,
+            timeframe=self.settings.default_timeframe,
+            limit=60,
+        )
+        context = self._build_context(asset, bars)
+        legacy_signals: list[TradeSignal] = []
+        strategy_input = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
+        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
+            try:
+                legacy_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input))
+            except Exception as exc:
+                logger.warning("Legacy strategy evaluation failed for %s: %s", asset.symbol, exc)
+        if prefer_primary_strategy and legacy_signals:
+            candidate_signals = legacy_signals
+        else:
+            candidate_signals = legacy_signals + self.strategy_registry.generate_signals(asset, bars, context)
+        if not candidate_signals:
+            return TradeSignal(
+                symbol=asset.symbol,
+                signal=Signal.HOLD,
+                asset_class=asset.asset_class,
+                strategy_name="none",
+                reason="No strategy generated a signal.",
+            )
+        signal = sorted(
+            candidate_signals,
+            key=lambda item: (
+                item.signal != Signal.HOLD,
+                item.confidence_score or 0.0,
+                item.momentum_score or 0.0,
+            ),
+            reverse=True,
+        )[0]
+        signal.liquidity_score = signal.liquidity_score or 0.0
+        if signal.metrics is None:
+            signal.metrics = {}
+        latest_volume = float(bars.iloc[-1]["Volume"]) if not bars.empty else None
+        signal.metrics.setdefault("avg_volume", float(bars["Volume"].tail(10).mean()) if not bars.empty else None)
+        signal.metrics.setdefault("dollar_volume", (signal.metrics.get("avg_volume") or 0.0) * (signal.entry_price or signal.price or 0.0))
+        signal.metrics.setdefault("latest_volume", latest_volume)
+        if context.quote is not None:
+            signal.metrics.setdefault("spread_pct", context.quote.spread_pct)
+        signal.metrics.setdefault("exchange", asset.exchange)
+        return signal
 
-    def _build_signal_status(
-        self,
-        symbol: str,
-        signal: TradeSignal,
-        now: datetime.datetime,
-    ) -> Dict[str, Any]:
-        return {
-            "symbol": symbol,
-            "signal": signal.signal.value,
-            "price": signal.price,
-            "strength": signal.strength,
-            "reason": signal.reason,
-            "atr": signal.atr,
-            "stop_price": signal.stop_price,
-            "trailing_stop": signal.trailing_stop,
-            "momentum_score": signal.momentum_score,
-            "regime_state": signal.regime_state,
-            "timestamp": signal.timestamp,
-            "generated_at": now.isoformat(),
-        }
+    def _scan_and_trade(self) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        now = datetime.datetime.utcnow()
+
+        with self._execution_lock:
+            self._sync_portfolio_from_broker()
+            if self.settings.universe_scan_enabled:
+                scan_result = self.scanner.scan(limit=max(10, self.settings.max_positions_total * 3))
+            else:
+                scan_result = self.scanner.scan(symbols=self.settings.manual_symbols, limit=len(self.settings.manual_symbols))
+
+            candidate_symbols = [item.symbol for item in scan_result.opportunities]
+            open_symbols = list(self.portfolio.positions.keys())
+            all_symbols = list(dict.fromkeys(candidate_symbols + open_symbols))
+            assets = [self._resolve_asset(symbol) for symbol in all_symbols]
+
+            signals: list[TradeSignal] = []
+            for asset in assets:
+                signal = self._evaluate_asset(asset)
+                self._last_signals[asset.symbol] = signal.to_dict()
+                if signal.signal != Signal.HOLD or asset.symbol in self.portfolio.positions:
+                    signals.append(signal)
+
+            sell_signals = [signal for signal in signals if signal.signal == Signal.SELL]
+            buy_signals = [signal for signal in signals if signal.signal == Signal.BUY]
+            buy_signals = sorted(
+                buy_signals,
+                key=lambda item: (
+                    item.confidence_score or 0.0,
+                    item.momentum_score or 0.0,
+                ),
+                reverse=True,
+            )
+            available_slots = max(0, self.settings.max_positions_total - len(self.portfolio.positions))
+            selected_buy_signals = buy_signals[:available_slots]
+
+            for signal in sell_signals + selected_buy_signals:
+                execution = self.execution_service.process_signal(signal)
+                action_result = self._build_execution_result(signal.symbol, signal, execution)
+                results.append(action_result)
+                if execution.get("order"):
+                    self._record_order(execution["order"])
+
+            with self._state_lock:
+                self._last_run_time = now
+                self._last_scanned_symbols = all_symbols
+                self._last_ranked_candidates = [item.to_dict() for item in scan_result.opportunities]
+                self._last_regime_snapshot = scan_result.regime_status
+                self._last_scan_overview = scan_result.to_dict()
+
+            self._persist_run(results, run_type="auto")
+            return results
 
     def _build_execution_result(
         self,
@@ -313,6 +342,8 @@ class AutoTrader:
     ) -> Dict[str, Any]:
         return {
             "symbol": symbol,
+            "asset_class": signal.asset_class.value,
+            "strategy_name": signal.strategy_name,
             "signal": signal.signal.value,
             "latest_price": execution.get("latest_price"),
             "proposal": execution.get("proposal", {}),
@@ -321,113 +352,11 @@ class AutoTrader:
             "order": execution.get("order"),
         }
 
-    def _record_order(
-        self,
-        symbol: str,
-        order: Dict[str, Any],
-        now: datetime.datetime,
-    ) -> None:
+    def _record_order(self, order: Dict[str, Any]) -> None:
         with self._state_lock:
             self._last_order = order
-            self._symbol_cooldowns[symbol] = now + datetime.timedelta(
-                seconds=self.settings.cooldown_seconds_per_symbol
-            )
 
-    def _scan_and_trade(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        results: List[Dict[str, Any]] = []
-        now = datetime.datetime.utcnow()
-        normalized_symbols = [symbol.strip().upper() for symbol in symbols]
-
-        with self._execution_lock:
-            self._prepare_cycle_state(normalized_symbols, now)
-            self._sync_portfolio_from_broker()
-            benchmark_data = self._load_benchmark_data()
-
-            buy_candidates: List[Dict[str, Any]] = []
-            sell_candidates: List[Dict[str, Any]] = []
-
-            for symbol in normalized_symbols:
-                cooldown_end = self._symbol_cooldowns.get(symbol)
-                if cooldown_end and now < cooldown_end:
-                    results.append(
-                        {
-                            "symbol": symbol,
-                            "action": "cooldown",
-                            "cooldown_until": cooldown_end.isoformat(),
-                        }
-                    )
-                    continue
-
-                signal = self._evaluate_symbol(symbol, benchmark_data, now)
-                signal_status = self._last_signals[symbol]
-
-                if signal.signal == Signal.HOLD:
-                    results.append(signal_status)
-                    continue
-
-                candidate = {"symbol": symbol, "signal": signal, "status": signal_status}
-                if signal.signal == Signal.SELL:
-                    sell_candidates.append(candidate)
-                else:
-                    buy_candidates.append(candidate)
-
-            sorted_buy_candidates = sorted(
-                buy_candidates,
-                key=lambda candidate: candidate["signal"].momentum_score or 0.0,
-                reverse=True,
-            )
-            with self._state_lock:
-                self._last_ranked_candidates = [
-                    {
-                        "symbol": candidate["symbol"],
-                        "momentum_score": candidate["signal"].momentum_score,
-                        "reason": candidate["signal"].reason,
-                        "signal": candidate["signal"].signal.value,
-                    }
-                    for candidate in sorted_buy_candidates
-                ]
-
-            available_slots = max(0, self.settings.max_positions - len(self.portfolio.positions))
-            buy_queue = sorted_buy_candidates[:available_slots]
-            skipped_buys = sorted_buy_candidates[available_slots:]
-
-            for candidate in skipped_buys:
-                results.append(
-                    {
-                        "symbol": candidate["symbol"],
-                        "signal": candidate["signal"].signal.value,
-                        "action": "skipped_by_rank",
-                        "reason": "No available position slot",
-                    }
-                )
-
-            if not self._market_open and self.settings.is_alpaca_mode and self.settings.trading_enabled:
-                for candidate in buy_queue + sell_candidates:
-                    results.append(
-                        {
-                            "symbol": candidate["symbol"],
-                            "signal": candidate["signal"].signal.value,
-                            "action": "market_closed",
-                        }
-                    )
-                self._persist_run(results, error_message="Market closed")
-                return results
-
-            for candidate in buy_queue + sell_candidates:
-                execution = self.exec_service.process_signal(candidate["signal"])
-                action_result = self._build_execution_result(
-                    candidate["symbol"],
-                    candidate["signal"],
-                    execution,
-                )
-                results.append(action_result)
-                if execution.get("order"):
-                    self._record_order(candidate["symbol"], execution["order"], now)
-
-            self._persist_run(results)
-            return results
-
-    def _persist_run(self, results: List[Dict[str, Any]], error_message: str | None = None) -> None:
+    def _persist_run(self, results: List[Dict[str, Any]], run_type: str) -> None:
         try:
             with SessionLocal() as session:
                 session.add(
@@ -438,7 +367,24 @@ class AutoTrader:
                             [result.get("order") for result in results if result.get("order")],
                             default=str,
                         ),
-                        error_message=error_message,
+                        error_message=self._last_error,
+                    )
+                )
+                session.add(
+                    BotRunHistory(
+                        started_at=self._last_run_time or datetime.datetime.utcnow(),
+                        completed_at=datetime.datetime.utcnow(),
+                        run_type=run_type,
+                        status="success" if not self._last_error else "error",
+                        summary_json=json.dumps(
+                            {
+                                "signals": self._last_signals,
+                                "orders": [result.get("order") for result in results if result.get("order")],
+                                "scan_overview": self._last_scan_overview,
+                            },
+                            default=str,
+                        ),
+                        error_message=self._last_error,
                     )
                 )
                 session.commit()
@@ -446,7 +392,6 @@ class AutoTrader:
             logger.warning("Failed to persist auto-trader run record: %s", exc)
 
 
-# Global instance
 _auto_trader: Optional[AutoTrader] = None
 
 

@@ -2,42 +2,53 @@ from __future__ import annotations
 
 import datetime
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 
 from app.config.settings import Settings, get_settings
-from app.services.market_data import CSVMarketDataService
+from app.domain.models import AssetClass, AssetMetadata
+from app.monitoring.logger import get_logger
+from app.services.market_data import (
+    CSVMarketDataService,
+    MarketDataService,
+    canonicalize_symbol,
+    infer_asset_class,
+    normalize_asset_class,
+)
+
+logger = get_logger("broker")
 
 
 class BrokerError(Exception):
     """Base exception for broker-related errors."""
-    pass
 
 
 class BrokerAuthError(BrokerError):
     """Raised when authentication fails with the broker."""
-    pass
 
 
 class BrokerUpstreamError(BrokerError):
     """Raised when the broker API returns an error."""
-    pass
 
 
 class BrokerConnectionError(BrokerError):
     """Raised when there are network or connection issues."""
-    pass
 
 
 @dataclass
 class OrderRequest:
     symbol: str
     side: str
-    quantity: float
+    quantity: float | None = None
+    asset_class: AssetClass = AssetClass.UNKNOWN
+    notional: float | None = None
     price: float | None = None
+    time_in_force: str | None = None
+    order_type: str = "market"
     is_dry_run: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,12 +59,19 @@ class BrokerAccount:
     buying_power: float
     mode: str
     trading_enabled: bool
+    currency: str = "USD"
 
 
 class BrokerInterface:
     """Abstract interface for brokers."""
 
     def get_account(self) -> BrokerAccount:
+        raise NotImplementedError
+
+    def list_assets(self, asset_class: AssetClass | str | None = None) -> list[AssetMetadata]:
+        raise NotImplementedError
+
+    def get_asset(self, symbol: str, asset_class: AssetClass | str | None = None) -> AssetMetadata | None:
         raise NotImplementedError
 
     def get_positions(self) -> list[dict[str, Any]]:
@@ -68,10 +86,10 @@ class BrokerInterface:
     def list_orders(self) -> list[dict[str, Any]]:
         raise NotImplementedError
 
-    def get_latest_price(self, symbol: str) -> float:
+    def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
         raise NotImplementedError
 
-    def is_market_open(self) -> bool:
+    def is_market_open(self, asset_class: AssetClass | str | None = None) -> bool:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -84,7 +102,7 @@ class PaperBroker(BrokerInterface):
     def __init__(
         self,
         settings: Settings | None = None,
-        market_data_service: CSVMarketDataService | None = None,
+        market_data_service: MarketDataService | None = None,
     ):
         self.settings = settings or get_settings()
         self.market_data_service = market_data_service or CSVMarketDataService()
@@ -105,6 +123,23 @@ class PaperBroker(BrokerInterface):
                 trading_enabled=self.settings.trading_enabled,
             )
 
+    def list_assets(self, asset_class: AssetClass | str | None = None) -> list[AssetMetadata]:
+        assets = []
+        list_supported_assets = getattr(self.market_data_service, "list_supported_assets", None)
+        if callable(list_supported_assets):
+            assets = list_supported_assets()
+        resolved_class = normalize_asset_class(asset_class)
+        if resolved_class == AssetClass.UNKNOWN:
+            return assets
+        return [asset for asset in assets if asset.asset_class == resolved_class]
+
+    def get_asset(self, symbol: str, asset_class: AssetClass | str | None = None) -> AssetMetadata | None:
+        target_symbol = canonicalize_symbol(symbol, asset_class)
+        for asset in self.list_assets(asset_class):
+            if canonicalize_symbol(asset.symbol, asset.asset_class) == target_symbol:
+                return asset
+        return None
+
     def get_positions(self) -> list[dict[str, Any]]:
         with self._lock:
             return [
@@ -122,31 +157,53 @@ class PaperBroker(BrokerInterface):
             raise RuntimeError("PaperBroker only supports paper mode.")
 
         with self._lock:
-            price = order.price or self.get_latest_price(order.symbol)
-            filled_qty = order.quantity
-            self.orders.append(
-                {
-                    "symbol": order.symbol,
-                    "side": order.side,
-                    "quantity": filled_qty,
-                    "price": price,
-                    "status": "FILLED" if not order.is_dry_run else "DRY_RUN",
-                    "executed_at": datetime.datetime.utcnow().isoformat(),
-                    "is_dry_run": order.is_dry_run,
-                }
+            resolved_asset_class = (
+                order.asset_class
+                if order.asset_class != AssetClass.UNKNOWN
+                else infer_asset_class(order.symbol)
             )
+            price = order.price or self.get_latest_price(order.symbol, resolved_asset_class)
+            filled_qty = order.quantity or (
+                (order.notional / price) if order.notional is not None and price > 0 else 0.0
+            )
+            result = {
+                "id": f"paper-{len(self.orders) + 1}",
+                "symbol": canonicalize_symbol(order.symbol, resolved_asset_class),
+                "asset_class": resolved_asset_class.value,
+                "side": order.side.value if hasattr(order.side, "value") else str(order.side),
+                "quantity": filled_qty,
+                "notional": order.notional,
+                "price": price,
+                "status": "FILLED" if not order.is_dry_run else "DRY_RUN",
+                "executed_at": datetime.datetime.utcnow().isoformat(),
+                "is_dry_run": order.is_dry_run,
+                "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
+            }
+            self.orders.append(result)
 
             if not order.is_dry_run:
-                self.apply_trade(order.symbol, order.side, filled_qty, price)
+                self.apply_trade(result["symbol"], resolved_asset_class, result["side"], filled_qty, price)
 
-            return self.orders[-1]
+            return result
 
-    def is_market_open(self) -> bool:
-        return True
+    def _default_tif(self, asset_class: AssetClass) -> str:
+        return "gtc" if asset_class == AssetClass.CRYPTO else "day"
 
-    def apply_trade(self, symbol: str, side: str, quantity: float, price: float) -> None:
+    def is_market_open(self, asset_class: AssetClass | str | None = None) -> bool:
+        session = self.market_data_service.get_session_status(asset_class or AssetClass.EQUITY)
+        return session.is_open
+
+    def apply_trade(
+        self,
+        symbol: str,
+        asset_class: AssetClass,
+        side: str,
+        quantity: float,
+        price: float,
+    ) -> None:
         normalized_side = side.value if hasattr(side, "value") else str(side)
-        if normalized_side.upper() == "BUY":
+        normalized_side = normalized_side.upper()
+        if normalized_side == "BUY":
             existing = self.positions.get(symbol)
             if existing:
                 total_quantity = existing["quantity"] + quantity
@@ -160,6 +217,8 @@ class PaperBroker(BrokerInterface):
             self.cash -= quantity * price
             self.positions[symbol] = {
                 "symbol": symbol,
+                "asset_class": asset_class.value,
+                "exchange": "MOCK",
                 "quantity": total_quantity,
                 "entry_price": average_entry_price,
                 "side": normalized_side,
@@ -186,17 +245,21 @@ class PaperBroker(BrokerInterface):
                 return {"message": "No position to close", "symbol": symbol}
 
             position = self.positions[symbol]
-            price = self.get_latest_price(symbol)
+            price = self.get_latest_price(symbol, position.get("asset_class"))
             self.cash += position["quantity"] * price
             self.positions.pop(symbol, None)
-            return {"symbol": symbol, "closed_at": datetime.datetime.utcnow().isoformat(), "price": price}
+            return {
+                "symbol": symbol,
+                "closed_at": datetime.datetime.utcnow().isoformat(),
+                "price": price,
+            }
 
     def list_orders(self) -> list[dict[str, Any]]:
         with self._lock:
             return [order.copy() for order in self.orders]
 
-    def get_latest_price(self, symbol: str) -> float:
-        return self.market_data_service.get_latest_price(symbol)
+    def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
+        return self.market_data_service.get_latest_price(symbol, asset_class)
 
     def calculate_equity(self) -> float:
         total = self.cash
@@ -209,16 +272,14 @@ class PaperBroker(BrokerInterface):
 
 
 class AlpacaBroker(BrokerInterface):
-    """Adapter for Alpaca paper trading API."""
+    """Adapter for Alpaca paper and live trading APIs."""
 
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         if not self.settings.is_alpaca_mode:
             raise RuntimeError("AlpacaBroker is only available when BROKER_MODE=alpaca.")
         if not self.settings.has_alpaca_credentials:
-            raise ValueError(
-                "Alpaca paper trading requires ALPACA_API_KEY and ALPACA_SECRET_KEY."
-            )
+            raise ValueError("Alpaca trading requires ALPACA_API_KEY and ALPACA_SECRET_KEY.")
 
         self.base_url = str(self.settings.alpaca_base_url).rstrip("/")
         self.client = httpx.Client(
@@ -237,8 +298,15 @@ class AlpacaBroker(BrokerInterface):
             },
             timeout=10.0,
         )
+        self._asset_cache: dict[str, AssetMetadata] = {}
 
-    def _request(self, method: str, path: str, params: dict[str, Any] | None = None, json: dict[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        json: dict[str, Any] | None = None,
+    ) -> Any:
         try:
             response = self.client.request(method, path, params=params, json=json)
             response.raise_for_status()
@@ -246,23 +314,22 @@ class AlpacaBroker(BrokerInterface):
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code in (401, 403):
                 raise BrokerAuthError(
-                    f"Alpaca authentication failed. Check ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL. "
-                    f"Response: {exc.response.text}"
+                    "Alpaca authentication failed. Check ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL."
                 ) from exc
-            else:
-                raise BrokerUpstreamError(
-                    f"Alpaca API returned {exc.response.status_code}: {exc.response.text}"
-                ) from exc
+            raise BrokerUpstreamError(
+                f"Alpaca API returned {exc.response.status_code}: {exc.response.text}"
+            ) from exc
         except httpx.RequestError as exc:
             raise BrokerConnectionError(f"Failed to connect to Alpaca API: {exc}") from exc
 
-    def is_market_open(self) -> bool:
-        """Check if the market is currently open."""
+    def is_market_open(self, asset_class: AssetClass | str | None = None) -> bool:
+        resolved_class = normalize_asset_class(asset_class)
+        if resolved_class == AssetClass.CRYPTO:
+            return True
         try:
             data = self._request("GET", "/v2/clock")
-            return data.get("is_open", False)
+            return bool(data.get("is_open", False))
         except BrokerError:
-            # If clock check fails, assume closed for safety
             return False
 
     def get_account(self) -> BrokerAccount:
@@ -271,7 +338,6 @@ class AlpacaBroker(BrokerInterface):
             positions_data = self._request("GET", "/v2/positions")
             positions_count = len(positions_data) if isinstance(positions_data, list) else 0
         except BrokerError:
-            # If positions fetch fails, degrade gracefully
             positions_count = 0
         return BrokerAccount(
             cash=float(data.get("cash", 0.0)),
@@ -280,33 +346,134 @@ class AlpacaBroker(BrokerInterface):
             buying_power=float(data.get("buying_power", 0.0)),
             mode=self.settings.broker_mode,
             trading_enabled=self.settings.trading_enabled,
+            currency=str(data.get("currency", "USD")),
         )
+
+    def _map_asset(self, raw_asset: dict[str, Any]) -> AssetMetadata:
+        symbol = raw_asset.get("symbol", "")
+        raw_class = str(raw_asset.get("class") or raw_asset.get("asset_class") or "")
+        if raw_class.lower() == "crypto":
+            asset_class = AssetClass.CRYPTO
+        else:
+            asset_class = infer_asset_class(symbol, raw_asset.get("name"))
+        attributes = raw_asset.get("attributes") or []
+        if not isinstance(attributes, list):
+            attributes = [str(attributes)]
+        metadata = AssetMetadata(
+            symbol=canonicalize_symbol(symbol, asset_class),
+            name=str(raw_asset.get("name") or symbol),
+            asset_class=asset_class,
+            exchange=raw_asset.get("exchange"),
+            status=str(raw_asset.get("status", "active")),
+            tradable=bool(raw_asset.get("tradable", True)),
+            fractionable=bool(raw_asset.get("fractionable", False)),
+            shortable=bool(raw_asset.get("shortable", False)),
+            easy_to_borrow=bool(raw_asset.get("easy_to_borrow", False)),
+            marginable=bool(raw_asset.get("marginable", False)),
+            attributes=[str(item) for item in attributes],
+            raw=raw_asset,
+        )
+        self._asset_cache[metadata.symbol] = metadata
+        return metadata
+
+    def list_assets(self, asset_class: AssetClass | str | None = None) -> list[AssetMetadata]:
+        requested_class = normalize_asset_class(asset_class)
+        classes: list[AssetClass]
+        if requested_class == AssetClass.UNKNOWN:
+            classes = [AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO]
+        else:
+            classes = [requested_class]
+
+        assets: list[AssetMetadata] = []
+        fetched_symbols: set[str] = set()
+
+        for current_class in classes:
+            if current_class == AssetClass.OPTION:
+                continue
+            params = {"status": "active"}
+            if current_class == AssetClass.CRYPTO:
+                params["asset_class"] = "crypto"
+            else:
+                params["asset_class"] = "us_equity"
+            response = self._request("GET", "/v2/assets", params=params)
+            if not isinstance(response, list):
+                continue
+            for raw_asset in response:
+                metadata = self._map_asset(raw_asset)
+                if requested_class != AssetClass.UNKNOWN and metadata.asset_class != requested_class:
+                    continue
+                if metadata.symbol in fetched_symbols:
+                    continue
+                fetched_symbols.add(metadata.symbol)
+                assets.append(metadata)
+        return assets
+
+    def get_asset(self, symbol: str, asset_class: AssetClass | str | None = None) -> AssetMetadata | None:
+        resolved_symbol = canonicalize_symbol(symbol, asset_class)
+        cached = self._asset_cache.get(resolved_symbol)
+        if cached is not None:
+            return cached
+        try:
+            response = self._request("GET", f"/v2/assets/{resolved_symbol}")
+        except BrokerError:
+            return None
+        if not isinstance(response, dict):
+            return None
+        return self._map_asset(response)
 
     def get_positions(self) -> list[dict[str, Any]]:
         response = self._request("GET", "/v2/positions")
         if not isinstance(response, list):
             return []
-        return response
+        positions: list[dict[str, Any]] = []
+        for item in response:
+            symbol = canonicalize_symbol(item.get("symbol", ""), item.get("asset_class"))
+            asset = self._asset_cache.get(symbol) or self.get_asset(symbol, item.get("asset_class"))
+            positions.append(
+                {
+                    **item,
+                    "symbol": symbol,
+                    "asset_class": (asset.asset_class.value if asset else infer_asset_class(symbol).value),
+                    "exchange": asset.exchange if asset else None,
+                    "quantity": float(item.get("qty", item.get("quantity", 0.0))),
+                    "current_price": float(item.get("current_price", item.get("lastday_price", 0.0) or 0.0)),
+                    "entry_price": float(item.get("avg_entry_price", item.get("entry_price", 0.0))),
+                    "market_value": float(item.get("market_value", 0.0)),
+                }
+            )
+        return positions
 
     def submit_order(self, order: OrderRequest) -> dict[str, Any]:
+        resolved_asset_class = order.asset_class if order.asset_class != AssetClass.UNKNOWN else infer_asset_class(order.symbol)
         if order.is_dry_run:
             return {
-                "symbol": order.symbol,
-                "side": order.side,
+                "symbol": canonicalize_symbol(order.symbol, resolved_asset_class),
+                "asset_class": resolved_asset_class.value,
+                "side": order.side.value if hasattr(order.side, "value") else str(order.side),
                 "quantity": order.quantity,
+                "notional": order.notional,
                 "price": order.price,
                 "status": "DRY_RUN",
                 "is_dry_run": True,
+                "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
             }
 
-        payload = {
-            "symbol": order.symbol,
-            "qty": order.quantity,
-            "side": order.side.lower(),
-            "type": "market",
-            "time_in_force": "day",
+        payload: dict[str, Any] = {
+            "symbol": canonicalize_symbol(order.symbol, resolved_asset_class),
+            "side": str(order.side).lower(),
+            "type": order.order_type,
+            "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
         }
+        if order.notional is not None:
+            payload["notional"] = order.notional
+        elif order.quantity is not None:
+            payload["qty"] = order.quantity
+        else:
+            raise ValueError("OrderRequest must include quantity or notional.")
         return self._request("POST", "/v2/orders", json=payload)
+
+    def _default_tif(self, asset_class: AssetClass) -> str:
+        return "gtc" if asset_class == AssetClass.CRYPTO else "day"
 
     def close_position(self, symbol: str) -> dict[str, Any]:
         if not self.settings.trading_enabled:
@@ -314,23 +481,39 @@ class AlpacaBroker(BrokerInterface):
         return self._request("DELETE", f"/v2/positions/{symbol}")
 
     def list_orders(self) -> list[dict[str, Any]]:
-        response = self._request("GET", "/v2/orders", params={"status": "all", "limit": 50})
+        response = self._request("GET", "/v2/orders", params={"status": "all", "limit": 100})
         if not isinstance(response, list):
             return []
         return response
 
-    def get_latest_price(self, symbol: str) -> float:
+    def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.CRYPTO:
+            try:
+                response = self.market_data_client.get(
+                    f"/v1beta3/crypto/{self.settings.alpaca_crypto_location}/latest/trades",
+                    params={"symbols": canonicalize_symbol(symbol, AssetClass.CRYPTO)},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                trade = (payload.get("trades") or {}).get(canonicalize_symbol(symbol, AssetClass.CRYPTO)) or {}
+                return float(trade.get("p", 0.0))
+            except httpx.HTTPStatusError as exc:
+                raise BrokerUpstreamError(
+                    f"Alpaca crypto market data error {exc.response.status_code}: {exc.response.text}"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise BrokerConnectionError(f"Failed to connect to Alpaca market data: {exc}") from exc
+
         try:
             response = self.market_data_client.get(
-                f"/v2/stocks/{symbol}/bars",
-                params={"timeframe": self.settings.default_timeframe, "limit": 1},
+                f"/v2/stocks/{canonicalize_symbol(symbol, resolved_asset_class)}/trades/latest",
+                params={"feed": "iex"},
             )
             response.raise_for_status()
             payload = response.json()
-            bars = payload.get("bars") or []
-            if not bars:
-                raise RuntimeError(f"No bar data available for {symbol}")
-            return float(bars[-1].get("c", bars[-1].get("close", 0.0)))
+            trade = payload.get("trade") or {}
+            return float(trade.get("p", 0.0))
         except httpx.HTTPStatusError as exc:
             raise BrokerUpstreamError(
                 f"Alpaca market data error {exc.response.status_code}: {exc.response.text}"
@@ -345,12 +528,12 @@ class AlpacaBroker(BrokerInterface):
 
 def create_broker(
     settings: Settings | None = None,
-    market_data_service: CSVMarketDataService | None = None,
+    market_data_service: MarketDataService | None = None,
 ) -> BrokerInterface:
     settings = settings or get_settings()
     mode = settings.broker_mode.lower()
     if mode in {"paper", "mock"}:
-        return PaperBroker(settings, market_data_service=market_data_service)
+        return PaperBroker(settings, market_data_service=market_data_service or CSVMarketDataService())
     if mode == "alpaca":
         return AlpacaBroker(settings)
     raise ValueError(f"Unsupported broker mode '{settings.broker_mode}'.")
