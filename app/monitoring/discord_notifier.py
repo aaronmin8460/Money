@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import httpx
+import pytz
 
 from app.config.settings import Settings, get_settings
 from app.domain.models import AssetClass
@@ -66,11 +67,22 @@ def format_runtime_mode_label(settings: Settings) -> str:
     return "LIVE" if settings.is_alpaca_mode and settings.live_trading_enabled else "PAPER"
 
 
-def format_readable_notification_timestamp(value: datetime | str | None = None) -> str:
+def format_readable_notification_timestamp(value: datetime | str | None = None, settings: Settings | None = None) -> str:
     resolved = _resolve_timestamp(value)
     if resolved is None:
         return str(value)
-    return resolved.strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    # Apply configured timezone
+    configured_settings = settings or get_settings()
+    tz_name = configured_settings.discord_timezone or "America/Indiana/Indianapolis"
+    try:
+        local_tz = pytz.timezone(tz_name)
+        local_time = resolved.astimezone(local_tz)
+        tz_abbrev = local_time.strftime("%Z")
+        return local_time.strftime(f"%Y-%m-%d %H:%M:%S {tz_abbrev}")
+    except Exception:
+        # Fallback to UTC if timezone is invalid
+        return resolved.strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def sanitize_webhook_target(webhook_url: str | None) -> str:
@@ -337,7 +349,7 @@ def build_error_notification_payload(
     lines = [message, "", f"Error: {error_text}"]
     for key, value in (context or {}).items():
         _append_line(lines, _humanize(key), value)
-    lines.append(f"Time: {format_readable_notification_timestamp(timestamp)}")
+    lines.append(f"Time: {format_readable_notification_timestamp(timestamp, settings)}")
 
     return DiscordMessage(
         embeds=[
@@ -348,6 +360,60 @@ def build_error_notification_payload(
                 ),
                 "description": _truncate("\n".join(lines), _MAX_EMBED_DESCRIPTION),
                 "color": 0xE74C3C,
+            }
+        ]
+    ).to_payload()
+
+
+def build_scan_summary_notification_payload(
+    *,
+    settings: Settings,
+    symbols_scanned: list[str],
+    results: list[dict[str, Any]],
+    timestamp: datetime | None = None,
+) -> dict[str, Any]:
+    """Build a scan summary notification payload."""
+    ts = timestamp or datetime.now(timezone.utc)
+    timestamp_str = format_readable_notification_timestamp(ts, settings)
+    
+    scanned_count = len(symbols_scanned)
+    buy_signals = sum(1 for r in results if r.get("signal") == "BUY")
+    sell_signals = sum(1 for r in results if r.get("signal") == "SELL")
+    hold_signals = sum(1 for r in results if r.get("signal") == "HOLD")
+    
+    description_lines = [
+        f"**Scan Results**",
+        f"Symbols Scanned: {scanned_count}",
+        f"BUY Signals: {buy_signals}",
+        f"SELL Signals: {sell_signals}",
+        f"HOLD Signals: {hold_signals}",
+        "",
+    ]
+    
+    # Add top signals summary
+    if results:
+        description_lines.append("**Top Signals**")
+        for i, result in enumerate(results[:5]):
+            symbol = result.get("symbol", "?")
+            signal = result.get("signal", "?")
+            asset_class = result.get("asset_class", "?")
+            price = result.get("price", "?")
+            reason = result.get("reason", "")[:50]
+            description_lines.append(
+                f"{i+1}. {symbol} ({asset_class}): {signal} @ {price} - {reason}"
+            )
+    
+    description_lines.append(f"\nTime: {timestamp_str}")
+    
+    return DiscordMessage(
+        embeds=[
+            {
+                "title": _truncate(
+                    f"📊 {format_runtime_mode_label(settings)} | Scan Summary",
+                    _MAX_EMBED_TITLE,
+                ),
+                "description": _truncate("\n".join(description_lines), _MAX_EMBED_DESCRIPTION),
+                "color": 0x3498DB,
             }
         ]
     ).to_payload()
@@ -423,6 +489,25 @@ class DiscordNotifier:
             reason=reason,
             details=details,
             category=category,
+        )
+        return self._post_payload(payload)
+
+    def send_scan_summary_notification(
+        self,
+        *,
+        symbols_scanned: list[str],
+        results: list[dict[str, Any]],
+        timestamp: datetime | None = None,
+    ) -> bool:
+        """Send a scan summary notification with top results."""
+        if not self.enabled or not self.settings.discord_notify_scan_summary:
+            return False
+
+        payload = build_scan_summary_notification_payload(
+            settings=self.settings,
+            symbols_scanned=symbols_scanned,
+            results=results,
+            timestamp=timestamp or datetime.now(timezone.utc),
         )
         return self._post_payload(payload)
 

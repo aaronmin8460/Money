@@ -187,6 +187,16 @@ class Settings(BaseSettings):
     discord_notify_scan_summary: bool = Field(True, env="DISCORD_NOTIFY_SCAN_SUMMARY")
     discord_notify_crypto: bool = Field(True, env="DISCORD_NOTIFY_CRYPTO")
     discord_timezone: str = Field("America/Indiana/Indianapolis", env="DISCORD_TIMEZONE")
+    scan_universe_mode: str = Field("full", env="SCAN_UNIVERSE_MODE")
+    major_equity_symbols: list[str] = Field(
+        default_factory=lambda: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "SPY", "QQQ", "IWM"],
+        env="MAJOR_EQUITY_SYMBOLS",
+    )
+    major_crypto_symbols: list[str] = Field(
+        default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"],
+        env="MAJOR_CRYPTO_SYMBOLS",
+    )
+    prefer_primary_crypto_quotes: bool = Field(True, env="PREFER_PRIMARY_CRYPTO_QUOTES")
 
     class Config:
         env_file = ".env"

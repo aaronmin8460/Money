@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from app.config.settings import Settings, get_settings
 from app.db.models import AutoTraderRun, BotRunHistory
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot
+from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot, SessionState
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import get_logger
 from app.services.market_data import infer_asset_class, normalize_asset_class
@@ -414,6 +414,35 @@ class AutoTrader:
                     "asset_class": asset.asset_class.value,
                 },
             )
+
+        # Session eligibility check for equities/ETFs outside market hours
+        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
+            session_status = self.market_data_service.get_session_status(asset.asset_class)
+            is_regular_session = session_status.session_state in {SessionState.REGULAR.value, SessionState.REGULAR}
+            if not is_regular_session and not self.settings.allow_extended_hours:
+                return TradeSignal(
+                    symbol=asset.symbol,
+                    signal=Signal.HOLD,
+                    asset_class=asset.asset_class,
+                    strategy_name=strategy.name,
+                    reason=(
+                        f"{asset.asset_class.value} '{asset.symbol}' is outside regular market hours. "
+                        f"Session state: {getattr(session_status.session_state, 'value', session_status.session_state)}. "
+                        f"Enable ALLOW_EXTENDED_HOURS to trade in extended sessions."
+                    ),
+                    price=normalized_snapshot.evaluation_price,
+                    entry_price=normalized_snapshot.evaluation_price,
+                    metrics={
+                        "decision_code": "market_closed",
+                        "evaluation_mode": evaluation_mode,
+                        "session_state": getattr(session_status.session_state, 'value', str(session_status.session_state)),
+                        "is_regular_session": is_regular_session,
+                        "allow_extended_hours": self.settings.allow_extended_hours,
+                        "normalized_snapshot": normalized_snapshot.to_dict(),
+                        "strategy_selected": strategy.name,
+                        "asset_class": asset.asset_class.value,
+                    },
+                )
 
         # Fetch enough data for regime strategies (at least 250 bars for 200-day regime)
         min_bars = 250 if getattr(strategy, "name", "") == "equity_momentum_breakout" else 60

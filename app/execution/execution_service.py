@@ -156,6 +156,11 @@ class ExecutionService:
             }
 
         proposal = self._build_order_request(signal, asset_class, price)
+        
+        # Attempt quantity reduction if stop-based risk exceeds max_risk_per_trade
+        if signal.signal == Signal.BUY and signal.stop_price is not None:
+            proposal = self._attempt_risk_compliant_sizing(signal, proposal, price, asset_class)
+        
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
         self._persist_signal_event(signal, price, proposal.quantity or 0.0, risk_decision)
 
@@ -227,6 +232,82 @@ class ExecutionService:
             "action": action,
             "order": executed_order,
         }
+
+    def _attempt_risk_compliant_sizing(
+        self,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        price: float,
+        asset_class: AssetClass,
+    ) -> OrderRequest:
+        """
+        Attempt to reduce order quantity if it violates max_risk_per_trade.
+        
+        If the original quantity causes stop-based risk to exceed the limit,
+        but a smaller quantity would be compliant, reduce the quantity and 
+        record the reduction in metadata.
+        """
+        if proposal.quantity <= 0 or signal.stop_price is None:
+            return proposal
+        
+        account = self.risk_manager.get_account_snapshot()
+        max_trade_risk = self._round_money(
+            self._decimal(account["equity"]) * self._decimal(self.settings.max_risk_per_trade)
+        )
+        risk_per_share = price - signal.stop_price
+        if risk_per_share <= 0:
+            return proposal
+        
+        original_quantity = self._decimal(proposal.quantity)
+        trade_risk = self._round_money(original_quantity * self._decimal(risk_per_share))
+        
+        if trade_risk <= max_trade_risk:
+            return proposal
+        
+        # Calculate maximum compliant quantity
+        max_compliant_quantity = self._round_money(max_trade_risk / self._decimal(risk_per_share))
+        max_compliant_quantity = self._decimal(max_compliant_quantity)
+        
+        # Round down to whole/fractional quantity
+        asset = self.broker.get_asset(signal.symbol, asset_class)
+        fractionable = asset.fractionable if asset else asset_class == AssetClass.CRYPTO
+        reduced_quantity = self._round_quantity(max_compliant_quantity, fractionable=fractionable)
+        
+        if reduced_quantity <= 0:
+            return proposal
+        
+        # Create new rounded proposal with reduced quantity
+        reduced_price = self._round_price(
+            self._decimal(proposal.price or price),
+            asset_class,
+        )
+        reduced_notional = self._round_money(reduced_quantity * reduced_price)
+        
+        # Update metadata to record the reduction
+        updated_metadata = dict(proposal.metadata or {})
+        updated_sizing = dict(updated_metadata.get("sizing", {}))
+        updated_sizing.update({
+            "original_quantity": float(original_quantity),
+            "original_trade_risk": float(trade_risk),
+            "reduced_quantity": float(reduced_quantity),
+            "quantity_reduction_reason": "max_risk_per_trade",
+            "max_trade_risk": float(max_trade_risk),
+            "risk_per_share": float(risk_per_share),
+            "quantity_reduction_applied": True,
+        })
+        updated_metadata["sizing"] = updated_sizing
+        
+        return OrderRequest(
+            symbol=proposal.symbol,
+            side=proposal.side,
+            quantity=float(reduced_quantity),
+            notional=None,
+            asset_class=proposal.asset_class,
+            price=float(reduced_price),
+            time_in_force=proposal.time_in_force,
+            is_dry_run=proposal.is_dry_run,
+            metadata=updated_metadata,
+        )
 
     def _build_order_request(self, signal: TradeSignal, asset_class: AssetClass, price: float) -> OrderRequest:
         sizing = self._calculate_position_size(signal, asset_class, price)

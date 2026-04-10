@@ -214,6 +214,12 @@ class AssetCatalogService:
         exclude_symbols = {symbol.upper() for symbol in self.settings.excluded_symbols}
         watchlist_symbols = {symbol.upper() for symbol in self.settings.watchlist_symbols}
 
+        # Major symbols mode
+        major_symbols = set()
+        if self.settings.scan_universe_mode.lower() == "major":
+            for symbol in self.settings.major_equity_symbols + self.settings.major_crypto_symbols:
+                major_symbols.add(symbol.upper())
+
         assets = self.list_assets(limit=20_000, tradable=True)
         filtered: list[AssetMetadata] = []
         for asset in assets:
@@ -225,6 +231,8 @@ class AssetCatalogService:
             if include_symbols and symbol not in include_symbols:
                 continue
             if watchlist_symbols and symbol not in watchlist_symbols:
+                continue
+            if major_symbols and symbol not in major_symbols:
                 continue
             if not asset.tradable or asset.status.lower() != "active":
                 continue

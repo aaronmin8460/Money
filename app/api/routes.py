@@ -99,14 +99,14 @@ def risk() -> dict[str, Any]:
 
 
 @router.post("/run-once", response_model=RunOnceResult)
-def run_once(request: RunOnceRequest = Body(...)) -> dict[str, Any]:
+def run_once(request: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[str, Any]:
     runtime = get_runtime()
     if not request.symbol or not request.symbol.strip():
         raise HTTPException(
             status_code=400,
             detail=(
-                "symbol is required for /run-once. "
-                "This endpoint no longer falls back to a hidden default symbol."
+                "Symbol is required. Please provide a symbol in the request body, e.g., "
+                '{"symbol": "BTC/USD"} or {"symbol": "AAPL"} or as a query parameter ?symbol=AAPL'
             ),
         )
     symbol = request.symbol.strip().upper()
