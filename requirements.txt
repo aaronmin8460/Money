@@ -9,3 +9,4 @@ backtesting
 httpx
 python-dotenv
 pytest
+pytz
