@@ -146,6 +146,9 @@ class AutoTrader:
             return {
                 "running": self._running,
                 "last_run_time": self._last_run_time.isoformat() if self._last_run_time else None,
+                "active_symbols": self.settings.active_symbols,
+                "strategy_name": self.settings.strategy_name,
+                "dry_run": not self.settings.trading_enabled,
                 "last_scanned_symbols": self._last_scanned_symbols,
                 "last_signals": self._last_signals,
                 "last_order": self._last_order,
@@ -228,11 +231,13 @@ class AutoTrader:
         benchmark_bars = None
         if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != self.strategy.regime_symbol:
             try:
+                # Fetch enough benchmark data for regime strategies
+                benchmark_limit = 250 if self.settings.strategy_name == "regime_momentum_breakout" else max(30, self.strategy.regime_long_sma + 5)
                 benchmark_bars = self.market_data_service.fetch_bars(
                     self.strategy.regime_symbol,
                     asset_class=AssetClass.ETF,
                     timeframe=self.settings.default_timeframe,
-                    limit=max(30, self.strategy.regime_long_sma + 5),
+                    limit=benchmark_limit,
                 )
             except Exception as exc:
                 logger.warning("Failed to fetch benchmark bars: %s", exc)
@@ -245,11 +250,13 @@ class AutoTrader:
         )
 
     def _evaluate_asset(self, asset: AssetMetadata, prefer_primary_strategy: bool = False) -> TradeSignal:
+        # Fetch enough data for regime strategies (at least 250 bars for 200-day regime)
+        min_bars = 250 if self.settings.strategy_name == "regime_momentum_breakout" else 60
         bars = self.market_data_service.fetch_bars(
             asset.symbol,
             asset_class=asset.asset_class,
             timeframe=self.settings.default_timeframe,
-            limit=60,
+            limit=min_bars,
         )
         context = self._build_context(asset, bars)
         legacy_signals: list[TradeSignal] = []
@@ -296,12 +303,22 @@ class AutoTrader:
         results: List[Dict[str, Any]] = []
         now = datetime.datetime.utcnow()
 
+        logger.info(
+            "Starting scan",
+            extra={
+                "active_symbols": self.settings.active_symbols,
+                "strategy_name": self.settings.strategy_name,
+                "dry_run": not self.settings.trading_enabled,
+                "universe_scan_enabled": self.settings.universe_scan_enabled,
+            }
+        )
+
         with self._execution_lock:
             self._sync_portfolio_from_broker()
             if self.settings.universe_scan_enabled:
                 scan_result = self.scanner.scan(limit=max(10, self.settings.max_positions_total * 3))
             else:
-                scan_result = self.scanner.scan(symbols=self.settings.manual_symbols, limit=len(self.settings.manual_symbols))
+                scan_result = self.scanner.scan(symbols=self.settings.active_symbols, limit=len(self.settings.active_symbols))
 
             candidate_symbols = [item.symbol for item in scan_result.opportunities]
             open_symbols = list(self.portfolio.positions.keys())

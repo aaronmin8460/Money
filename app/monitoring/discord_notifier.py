@@ -515,12 +515,13 @@ def _trade_title(*, settings: Settings, action: str, side: str, symbol: str) -> 
         "dry_run": "🟡",
         "rejected": "🟠",
     }.get(action, "ℹ️")
+    mode_label = format_runtime_mode_label(settings)
     action_label = {
         "submitted": "submitted",
         "dry_run": "dry run",
         "rejected": "rejected",
     }.get(action, action.replace("_", " "))
-    return f"{emoji} {format_runtime_mode_label(settings)} | {side} {symbol} {action_label}"
+    return f"{emoji} {mode_label} | {side} {symbol} {action_label}"
 
 
 def _trade_color(action: str) -> int:

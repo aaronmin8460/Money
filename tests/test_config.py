@@ -24,6 +24,43 @@ def test_settings_defaults() -> None:
     assert "AAPL" in settings.default_symbols
 
 
+def test_active_symbols_uses_default_symbols_by_default() -> None:
+    """Test that active_symbols uses default_symbols when included_symbols is empty."""
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="paper",
+            trading_enabled=False,
+            default_symbols=["AAPL", "SPY"],
+            included_symbols=[],
+        )
+    assert settings.active_symbols == ["AAPL", "SPY"]
+
+
+def test_active_symbols_uses_included_symbols_when_set() -> None:
+    """Test that active_symbols uses included_symbols as backward-compatible alias."""
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="paper",
+            trading_enabled=False,
+            default_symbols=["AAPL", "SPY"],
+            included_symbols=["BTC/USD", "ETH/USD"],
+        )
+    assert settings.active_symbols == ["BTC/USD", "ETH/USD"]
+
+
+def test_strategy_name_defaults_to_regime_momentum_breakout() -> None:
+    """Test that strategy_name defaults to regime_momentum_breakout."""
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="paper",
+            trading_enabled=False,
+        )
+    assert settings.strategy_name == "regime_momentum_breakout"
+
+
 def test_discord_notifications_require_webhook_when_enabled() -> None:
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(ValueError, match="DISCORD_WEBHOOK_URL"):

@@ -83,6 +83,7 @@ class Settings(BaseSettings):
     )
     default_timeframe: str = Field("1D", env="DEFAULT_TIMEFRAME")
     default_symbols: List[str] = Field(default_factory=lambda: ["AAPL", "SPY"], env="DEFAULT_SYMBOLS")
+    strategy_name: str = Field("regime_momentum_breakout", env="STRATEGY_NAME")
     auto_trade_enabled: bool = Field(False, env="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(60, env="SCAN_INTERVAL_SECONDS")
     scan_interval_seconds_by_asset_class: dict[str, int] = Field(
@@ -188,6 +189,13 @@ class Settings(BaseSettings):
     @property
     def manual_symbols(self) -> list[str]:
         return self.default_symbols or self.watchlist_symbols
+
+    @property
+    def active_symbols(self) -> list[str]:
+        # Support INCLUDED_SYMBOLS as backward-compatible alias for DEFAULT_SYMBOLS
+        if self.included_symbols:
+            return sorted({symbol.strip().upper() for symbol in self.included_symbols if symbol.strip()})
+        return self.manual_symbols
 
     @field_validator("default_symbols", mode="before")
     def parse_default_symbols(cls, value: str | List[str]) -> List[str]:

@@ -145,7 +145,13 @@ class ExecutionService:
         existing_position = self.portfolio.get_position(signal.symbol)
         if signal.signal == Signal.SELL and existing_position is not None and existing_position.quantity > 0:
             requested_quantity = signal.position_size if signal.position_size is not None and signal.position_size > 0 else existing_position.quantity
-            return min(requested_quantity, existing_position.quantity), None
+            sell_quantity = min(requested_quantity, existing_position.quantity)
+            # For SELL orders, preserve fractional quantities without capping
+            asset = self.broker.get_asset(signal.symbol, asset_class)
+            fractionable = asset.fractionable if asset else asset_class == AssetClass.CRYPTO
+            if fractionable:
+                return round(sell_quantity, 6), None
+            return sell_quantity, None
 
         if signal.position_size is not None and signal.position_size > 0:
             return signal.position_size, None

@@ -3,8 +3,9 @@ from __future__ import annotations
 from app.config.settings import Settings
 from app.db.models import FillRecord, NormalizedSignalRecord
 from app.db.session import SessionLocal
+from app.domain.models import AssetClass
 from app.execution.execution_service import ExecutionService
-from app.portfolio.portfolio import Portfolio
+from app.portfolio.portfolio import Portfolio, Position
 from app.risk.risk_manager import RiskManager
 from app.services.broker import PaperBroker
 from app.services.market_data import CSVMarketDataService
@@ -55,3 +56,49 @@ def test_execution_persists_signal_and_fill_records(tmp_path) -> None:
 
     assert signal_rows
     assert fill_rows
+
+
+def test_sell_preserves_fractional_quantity(tmp_path) -> None:
+    """Test that SELL orders preserve fractional quantities for crypto positions."""
+    (tmp_path / "BTCUSD.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,40000,41000,39000,40500,100\n"
+        "2024-01-02,40500,42000,40000,41500,120\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    # Add a fractional crypto position
+    portfolio.positions["BTC/USD"] = Position(
+        symbol="BTC/USD",
+        quantity=0.123456,
+        entry_price=40000.0,
+        side="long",
+        current_price=41500.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="BTC/USD",
+            signal=Signal.SELL,
+            price=41500.0,
+            reason="fractional sell test",
+        )
+    )
+
+    # Check that the proposal quantity preserves the fractional amount
+    assert result["proposal"]["quantity"] == 0.123456
+    assert result["action"] == "dry_run"

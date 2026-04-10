@@ -96,7 +96,13 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
     scanner = ScannerService(asset_catalog=asset_catalog, market_data_service=market_data_service, settings=settings)
     market_overview = MarketOverviewService(scanner)
     strategy_registry = build_strategy_registry(settings)
-    strategy = RegimeMomentumBreakoutStrategy()
+    if settings.strategy_name == "regime_momentum_breakout":
+        strategy = RegimeMomentumBreakoutStrategy()
+    elif settings.strategy_name == "ema_crossover":
+        from app.strategies.ema_crossover import EMACrossoverStrategy
+        strategy = EMACrossoverStrategy()
+    else:
+        raise ValueError(f"Unknown strategy: {settings.strategy_name}")
     execution_service = ExecutionService(
         broker=broker,
         portfolio=portfolio,
