@@ -10,6 +10,7 @@ from app.config.settings import Settings, get_settings
 from app.db.models import AutoTraderRun, BotRunHistory
 from app.db.session import SessionLocal
 from app.domain.models import AssetClass, AssetMetadata
+from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import get_logger
 from app.services.market_data import infer_asset_class, normalize_asset_class
 from app.strategies.base import Signal, StrategyContext, TradeSignal
@@ -73,6 +74,15 @@ class AutoTrader:
             self._thread.start()
 
         logger.info("Auto-trader started")
+        self._notify_system_event(
+            title="Auto-Trader Started",
+            message="Background trading loop started.",
+            context={
+                "broker_mode": self.settings.broker_mode,
+                "trading_enabled": self.settings.trading_enabled,
+                "scan_interval_seconds": self.settings.scan_interval_seconds,
+            },
+        )
         return True
 
     def stop(self) -> bool:
@@ -91,6 +101,14 @@ class AutoTrader:
             self._thread = None
 
         logger.info("Auto-trader stopped")
+        self._notify_system_event(
+            title="Auto-Trader Stopped",
+            message="Background trading loop stopped.",
+            context={
+                "broker_mode": self.settings.broker_mode,
+                "trading_enabled": self.settings.trading_enabled,
+            },
+        )
         return True
 
     def run_now(self) -> Dict[str, Any]:
@@ -105,6 +123,7 @@ class AutoTrader:
             logger.error(error_msg)
             with self._state_lock:
                 self._last_error = error_msg
+            self._notify_cycle_failure(exc, context={"mode": "run_now"})
             return {"success": False, "error": error_msg}
 
     def run_symbol_now(self, symbol: str, asset_class: AssetClass | str | None = None) -> Dict[str, Any]:
@@ -165,6 +184,7 @@ class AutoTrader:
                 logger.error(error_msg)
                 with self._state_lock:
                     self._last_error = error_msg
+                self._notify_cycle_failure(exc, context={"mode": "background_loop"})
 
             time.sleep(self.settings.scan_interval_seconds)
 
@@ -390,6 +410,34 @@ class AutoTrader:
                 session.commit()
         except Exception as exc:
             logger.warning("Failed to persist auto-trader run record: %s", exc)
+
+    def _notify_system_event(
+        self,
+        *,
+        title: str,
+        message: str,
+        context: dict[str, Any] | None = None,
+    ) -> None:
+        notifier = get_discord_notifier(self.settings)
+        notifier.send_system_notification(
+            title=title,
+            message=message,
+            context=context,
+            category="start_stop",
+        )
+
+    def _notify_cycle_failure(self, error: Exception, context: dict[str, Any] | None = None) -> None:
+        notifier = get_discord_notifier(self.settings)
+        notifier.send_error_notification(
+            title="Auto-Trader Cycle Failed",
+            message="A trading cycle failed, but the service kept running.",
+            error=error,
+            context={
+                "broker_mode": self.settings.broker_mode,
+                "trading_enabled": self.settings.trading_enabled,
+                **(context or {}),
+            },
+        )
 
 
 _auto_trader: Optional[AutoTrader] = None

@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     trading_enabled: bool = Field(False, env="TRADING_ENABLED")
     live_trading_enabled: bool = Field(False, env="LIVE_TRADING_ENABLED")
     live_trading_ack: str | None = Field(None, env="LIVE_TRADING_ACK")
+    discord_notifications_enabled: bool = Field(False, env="DISCORD_NOTIFICATIONS_ENABLED")
+    discord_webhook_url: AnyHttpUrl | None = Field(None, env="DISCORD_WEBHOOK_URL")
+    discord_notify_dry_runs: bool = Field(False, env="DISCORD_NOTIFY_DRY_RUNS")
+    discord_notify_rejections: bool = Field(True, env="DISCORD_NOTIFY_REJECTIONS")
+    discord_notify_errors: bool = Field(True, env="DISCORD_NOTIFY_ERRORS")
+    discord_notify_start_stop: bool = Field(True, env="DISCORD_NOTIFY_START_STOP")
     max_risk_per_trade: float = Field(0.01, env="MAX_RISK_PER_TRADE")
     max_daily_loss: float = Field(2_000.0, env="MAX_DAILY_LOSS")
     max_daily_loss_pct: float = Field(0.02, env="MAX_DAILY_LOSS_PCT")
@@ -184,6 +190,12 @@ class Settings(BaseSettings):
     def parse_enabled_asset_classes(cls, value: str | list[str]) -> list[str]:
         return [item.lower() for item in _parse_json_list(value, "ENABLED_ASSET_CLASSES")]
 
+    @field_validator("discord_webhook_url", mode="before")
+    def parse_discord_webhook_url(cls, value: str | None) -> str | None:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("excluded_symbols", "included_symbols", mode="before")
     def parse_symbol_lists(cls, value: str | list[str], info: ValidationInfo) -> list[str]:
         return _parse_json_list(value, info.field_name.upper())
@@ -231,6 +243,10 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Set LIVE_TRADING_ACK=ENABLE_LIVE_TRADING to explicitly acknowledge live trading risk."
                 )
+        if self.discord_notifications_enabled and not self.discord_webhook_url:
+            raise ValueError(
+                "DISCORD_NOTIFICATIONS_ENABLED=true requires DISCORD_WEBHOOK_URL to be set."
+            )
         if self.max_notional_per_position != self.max_position_notional:
             self.max_position_notional = self.max_notional_per_position
         if self.max_positions_total != self.max_positions:

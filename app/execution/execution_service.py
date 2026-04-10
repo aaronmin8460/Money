@@ -15,6 +15,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.domain.models import AssetClass
+from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskDecision, RiskManager
@@ -67,6 +68,12 @@ class ExecutionService:
 
         if not risk_decision.approved:
             logger.warning("Order blocked by risk manager", extra={"reason": risk_decision.reason, "symbol": proposal.symbol})
+            self._notify_trade_event(
+                action="rejected",
+                signal=signal,
+                proposal=proposal,
+                risk_decision=risk_decision,
+            )
             return {
                 "symbol": proposal.symbol,
                 "signal": signal.signal.value,
@@ -98,6 +105,13 @@ class ExecutionService:
 
         action = "dry_run" if proposal.is_dry_run else "submitted"
         logger.info("Order processed", extra={"action": action, "order": executed_order})
+        self._notify_trade_event(
+            action=action,
+            signal=signal,
+            proposal=proposal,
+            risk_decision=risk_decision,
+            order=executed_order,
+        )
         return {
             "symbol": proposal.symbol,
             "signal": signal.signal.value,
@@ -294,6 +308,26 @@ class ExecutionService:
                 session.commit()
         except Exception as exc:
             logger.warning("Failed to persist order record: %s", exc)
+
+    def _notify_trade_event(
+        self,
+        *,
+        action: str,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        risk_decision: RiskDecision,
+        order: dict[str, Any] | None = None,
+    ) -> None:
+        notifier = get_discord_notifier(self.settings)
+        notifier.send_trade_notification(
+            action=action,
+            signal=signal,
+            proposal=proposal,
+            broker_mode=self.settings.broker_mode,
+            trading_enabled=self.settings.trading_enabled,
+            risk=risk_decision,
+            order=order,
+        )
 
     def run_once(self, symbol: str, strategy: BaseStrategy, data: Any) -> dict[str, Any]:
         signals = strategy.generate_signals(symbol, data)

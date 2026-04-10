@@ -93,12 +93,56 @@ Start from `.env.example`. Important categories:
 
 - broker mode and credentials
 - paper vs live gating
+- Discord webhook notifications
 - enabled asset classes
 - universe refresh cadence
 - watchlists and exclusions
 - liquidity and spread thresholds
 - risk and exposure caps
 - strategy enable switches
+
+Discord notification settings:
+
+- `DISCORD_NOTIFICATIONS_ENABLED=false`
+- `DISCORD_WEBHOOK_URL=` for the Discord webhook URL
+- `DISCORD_NOTIFY_DRY_RUNS=false` to keep paper and dry-run alerts optional
+- `DISCORD_NOTIFY_REJECTIONS=true`
+- `DISCORD_NOTIFY_ERRORS=true`
+- `DISCORD_NOTIFY_START_STOP=true`
+
+If Discord notifications are enabled without a webhook URL, startup and settings validation fail fast with a clear error.
+
+## Discord Notifications
+
+The bot can send targeted Discord webhook notifications for meaningful trading events:
+
+- submitted orders
+- optional dry-run orders
+- optional risk rejections
+- auto-trader start and stop events
+- auto-trader cycle failures
+
+It does not mirror the full application log to Discord, and it does not send notifications for `HOLD` signals or normal scan heartbeats.
+
+### Create a Webhook
+
+1. In Discord, open the channel where you want notifications.
+2. Open `Edit Channel`, then `Integrations`, then `Webhooks`.
+3. Create a webhook and copy the webhook URL.
+4. Set `DISCORD_WEBHOOK_URL` in `.env`.
+
+Example configuration:
+
+```env
+DISCORD_NOTIFICATIONS_ENABLED=true
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
+DISCORD_NOTIFY_DRY_RUNS=true
+DISCORD_NOTIFY_REJECTIONS=true
+DISCORD_NOTIFY_ERRORS=true
+DISCORD_NOTIFY_START_STOP=true
+```
+
+`DISCORD_NOTIFY_DRY_RUNS` is optional and defaults to `false` so local testing and paper-mode scans do not spam Discord unless you explicitly opt in.
 
 ## Running Locally
 
@@ -114,6 +158,26 @@ Run tests:
 ```bash
 source .venv/bin/activate
 pytest
+```
+
+Test Discord notifications locally:
+
+```bash
+source .venv/bin/activate
+export DISCORD_NOTIFICATIONS_ENABLED=true
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
+export DISCORD_NOTIFY_DRY_RUNS=true
+uvicorn main:app --reload
+```
+
+Then in another terminal:
+
+```bash
+source .venv/bin/activate
+curl -X POST http://127.0.0.1:8000/run-once -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
+curl -X POST http://127.0.0.1:8000/auto/start
+sleep 2
+curl -X POST http://127.0.0.1:8000/auto/stop
 ```
 
 ## Key Endpoints

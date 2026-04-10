@@ -20,3 +20,18 @@ def test_settings_defaults() -> None:
     assert settings.trading_enabled is False
     assert settings.max_risk_per_trade == 0.01
     assert "AAPL" in settings.default_symbols
+
+
+def test_discord_notifications_require_webhook_when_enabled() -> None:
+    with patch.dict(os.environ, {}, clear=False):
+        try:
+            Settings(
+                _env_file=None,
+                broker_mode="paper",
+                trading_enabled=False,
+                discord_notifications_enabled=True,
+            )
+        except ValueError as exc:
+            assert "DISCORD_WEBHOOK_URL" in str(exc)
+        else:
+            raise AssertionError("Expected Discord notification settings validation to fail without a webhook URL.")
