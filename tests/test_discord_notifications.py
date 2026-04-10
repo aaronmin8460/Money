@@ -9,8 +9,8 @@ from app.domain.models import AssetClass
 from app.execution.execution_service import ExecutionService
 from app.monitoring.discord_notifier import (
     DiscordNotifier,
-    build_system_notification_message,
-    build_trade_notification_message,
+    build_system_notification_payload,
+    build_trade_notification_payload,
 )
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskDecision, RiskManager
@@ -63,23 +63,35 @@ def build_response(status_code: int = 204, text: str = "") -> Mock:
     return response
 
 
-def test_build_system_notification_message_plain_text() -> None:
-    message = build_system_notification_message(
-        mode_label="PAPER",
+def test_build_system_notification_payload_start_stop_is_compact() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        auto_trade_enabled=True,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+    )
+
+    payload = build_system_notification_payload(
+        settings=settings,
         event="Bot started",
         reason="background loop started",
+        category="start_stop",
         timestamp="2026-04-10T13:55:57Z",
     )
+    embed = payload["embeds"][0]
 
-    assert message == (
-        "[Money Bot][PAPER]\n"
-        "Bot started\n"
-        "Reason: background loop started\n"
-        "Time: 2026-04-10T13:55:57Z"
+    assert "content" not in payload
+    assert embed["title"] == "🔵 PAPER | Bot started"
+    assert embed["description"] == (
+        "Mode: PAPER\n"
+        "Auto-trade: enabled\n"
+        "Time: 2026-04-10 13:55:57 UTC"
     )
 
 
-def test_build_trade_notification_message_plain_text() -> None:
+def test_build_trade_notification_payload_is_compact() -> None:
     settings = Settings(
         _env_file=None,
         broker_mode="paper",
@@ -93,6 +105,7 @@ def test_build_trade_notification_message_plain_text() -> None:
         asset_class=AssetClass.CRYPTO,
         strategy_name="regime_momentum_breakout",
         price=65000.0,
+        reason="Momentum breakout",
     )
     proposal = OrderRequest(
         symbol="BTC/USD",
@@ -111,7 +124,7 @@ def test_build_trade_notification_message_plain_text() -> None:
         "is_dry_run": False,
     }
 
-    message = build_trade_notification_message(
+    payload = build_trade_notification_payload(
         settings=settings,
         action="submitted",
         signal=signal,
@@ -119,20 +132,18 @@ def test_build_trade_notification_message_plain_text() -> None:
         risk=RiskDecision(True, "Order approved by risk manager.", rule="approved"),
         order=order,
     )
+    embed = payload["embeds"][0]
 
-    assert message == (
-        "[Money Bot][PAPER]\n"
-        "Trade executed\n"
-        "Symbol: BTC/USD\n"
-        "Asset Class: crypto\n"
-        "Side: BUY\n"
-        "Quantity: 0.001\n"
-        "Price: 65000\n"
+    assert "content" not in payload
+    assert embed["title"] == "🟢 PAPER | BUY BTC/USD submitted"
+    assert embed["description"] == (
+        "Momentum breakout\n\n"
+        "Qty: 0.001\n"
+        "Price: $65,000.00\n"
         "Strategy: regime_momentum_breakout\n"
-        "Action: SUBMITTED\n"
-        "Order Status: FILLED\n"
+        "Status: FILLED\n"
         "Order ID: order-123\n"
-        "Time: 2026-04-10T14:05:00Z"
+        "Time: 2026-04-10 14:05:00 UTC"
     )
 
 
@@ -147,7 +158,7 @@ def test_no_webhook_sent_when_notifications_disabled(mock_post: Mock) -> None:
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
-def test_submitted_trade_sends_plain_text_webhook(mock_post: Mock) -> None:
+def test_submitted_trade_sends_embed_webhook_without_duplicate_content(mock_post: Mock) -> None:
     mock_post.return_value = build_response()
     execution, _broker = build_execution_service()
 
@@ -156,9 +167,12 @@ def test_submitted_trade_sends_plain_text_webhook(mock_post: Mock) -> None:
     assert result["action"] == "submitted"
     mock_post.assert_called_once()
     payload = mock_post.call_args.kwargs["json"]
-    assert "embeds" not in payload
-    assert payload["content"].startswith("[Money Bot][PAPER]\nTrade executed\n")
-    assert "Symbol: AAPL" in payload["content"]
+    embed = payload["embeds"][0]
+    assert payload.get("content") is None
+    assert embed["title"] == "🟢 PAPER | BUY AAPL submitted"
+    assert embed["description"].startswith("test notification\n\nQty: ")
+    assert "Price: $150.00" in embed["description"]
+    assert "Strategy: test_strategy" in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -184,8 +198,11 @@ def test_dry_runs_send_only_when_enabled(mock_post: Mock) -> None:
     assert enabled_result["action"] == "dry_run"
     assert mock_post.call_count == 1
     payload = mock_post.call_args.kwargs["json"]
-    assert "[Money Bot][DRY_RUN]" in payload["content"]
-    assert "Dry run trade" in payload["content"]
+    embed = payload["embeds"][0]
+    assert payload.get("content") is None
+    assert embed["title"] == "🟡 PAPER | BUY AAPL dry run"
+    assert "test notification" in embed["description"]
+    assert "Price: $150.00" in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
@@ -211,8 +228,13 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
     assert enabled_result["action"] == "rejected"
     assert mock_post.call_count == 1
     payload = mock_post.call_args.kwargs["json"]
-    assert "Trade rejected" in payload["content"]
-    assert "Risk Reason:" in payload["content"]
+    embed = payload["embeds"][0]
+    assert payload.get("content") is None
+    assert embed["title"] == "🟠 PAPER | BUY AAPL rejected"
+    assert embed["description"].startswith("Maximum simultaneous positions (0) reached.")
+    assert "Rule: Position Count" in embed["description"]
+    assert "Risk Reason:" not in embed["description"]
+    assert "Asset Class:" not in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")

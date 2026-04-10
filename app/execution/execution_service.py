@@ -44,7 +44,7 @@ class ExecutionService:
                 "signal": signal.signal.value,
                 "latest_price": signal.price,
                 "proposal": {},
-                "risk": {"approved": False, "reason": "No trade signal", "rule": "hold"},
+                "risk": RiskDecision(False, "No trade signal", rule="hold").to_dict(),
                 "action": "hold",
                 "order": None,
             }
@@ -79,12 +79,7 @@ class ExecutionService:
                 "signal": signal.signal.value,
                 "latest_price": price,
                 "proposal": proposal_payload,
-                "risk": {
-                    "approved": False,
-                    "reason": risk_decision.reason,
-                    "rule": risk_decision.rule,
-                    "details": risk_decision.details,
-                },
+                "risk": risk_decision.to_dict(),
                 "action": "rejected",
                 "order": None,
             }
@@ -117,12 +112,7 @@ class ExecutionService:
             "signal": signal.signal.value,
             "latest_price": price,
             "proposal": proposal_payload,
-            "risk": {
-                "approved": True,
-                "reason": risk_decision.reason,
-                "rule": risk_decision.rule,
-                "details": risk_decision.details,
-            },
+            "risk": risk_decision.to_dict(),
             "action": action,
             "order": executed_order,
         }
@@ -152,6 +142,11 @@ class ExecutionService:
         asset_class: AssetClass,
         price: float,
     ) -> tuple[float | None, float | None]:
+        existing_position = self.portfolio.get_position(signal.symbol)
+        if signal.signal == Signal.SELL and existing_position is not None and existing_position.quantity > 0:
+            requested_quantity = signal.position_size if signal.position_size is not None and signal.position_size > 0 else existing_position.quantity
+            return min(requested_quantity, existing_position.quantity), None
+
         if signal.position_size is not None and signal.position_size > 0:
             return signal.position_size, None
 

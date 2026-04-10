@@ -22,6 +22,14 @@ class RiskDecision:
     rule: str = "general"
     details: dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "approved": self.approved,
+            "reason": self.reason,
+            "rule": self.rule,
+            "details": dict(self.details),
+        }
+
 
 class RiskManager:
     def __init__(
@@ -71,7 +79,7 @@ class RiskManager:
             "exposure_by_asset_class": self.portfolio.exposure_by_asset_class(),
             "risk_events": list(self.portfolio.risk_events),
             "drawdown_pct": self.portfolio.drawdown_pct(),
-            "daily_loss_pct": self.portfolio.daily_loss_pct(),
+            "daily_loss_pct": self.portfolio.current_daily_loss_pct(equity=account["equity"]),
         }
 
     def evaluate_order(
@@ -95,6 +103,7 @@ class RiskManager:
         resolved_asset_class = normalize_asset_class(asset_class)
         if resolved_asset_class == AssetClass.UNKNOWN:
             resolved_asset_class = AssetClass.EQUITY
+        reduces_exposure = self._is_risk_reducing_sell(symbol, normalized_side, quantity)
 
         if self.settings.kill_switch_enabled:
             return RiskDecision(False, "Hard kill switch is enabled.", rule="kill_switch")
@@ -116,30 +125,31 @@ class RiskManager:
                 rule="asset_class_disabled",
             )
 
-        drawdown_pct = self.portfolio.drawdown_pct()
-        if drawdown_pct >= self.settings.max_drawdown_pct:
-            return RiskDecision(
-                False,
-                f"Max drawdown ({drawdown_pct:.2%}) exceeded ({self.settings.max_drawdown_pct:.2%}).",
-                rule="drawdown_limit",
-            )
-
-        daily_loss_pct = self.portfolio.daily_loss_pct()
-        if daily_loss_pct >= self.settings.max_daily_loss_pct:
-            return RiskDecision(
-                False,
-                f"Max daily loss ({daily_loss_pct:.2%}) reached ({self.settings.max_daily_loss_pct:.2%}).",
-                rule="daily_loss_pct_limit",
-            )
-
         account = self.get_account_snapshot()
-        current_loss = max(0.0, self.portfolio.initial_equity - account["equity"])
-        if current_loss >= self.settings.max_daily_loss:
-            return RiskDecision(
-                False,
-                f"Max daily loss notional ({current_loss:.2f}) reached ({self.settings.max_daily_loss:.2f}).",
-                rule="daily_loss_limit",
-            )
+        if not reduces_exposure:
+            drawdown_pct = self.portfolio.drawdown_pct()
+            if drawdown_pct >= self.settings.max_drawdown_pct:
+                return RiskDecision(
+                    False,
+                    f"Max drawdown ({drawdown_pct:.2%}) exceeded ({self.settings.max_drawdown_pct:.2%}).",
+                    rule="drawdown_limit",
+                )
+
+            daily_loss_pct = self.portfolio.current_daily_loss_pct(equity=account["equity"])
+            if daily_loss_pct >= self.settings.max_daily_loss_pct:
+                return RiskDecision(
+                    False,
+                    f"Max daily loss ({daily_loss_pct:.2%}) reached ({self.settings.max_daily_loss_pct:.2%}).",
+                    rule="daily_loss_pct_limit",
+                )
+
+            current_loss = self.portfolio.current_daily_loss_amount(equity=account["equity"])
+            if current_loss >= self.settings.max_daily_loss:
+                return RiskDecision(
+                    False,
+                    f"Max daily loss notional ({current_loss:.2f}) reached ({self.settings.max_daily_loss:.2f}).",
+                    rule="daily_loss_limit",
+                )
 
         if data_age_seconds is not None and data_age_seconds > self.settings.data_stale_after_seconds:
             return RiskDecision(False, "Market data is stale.", rule="stale_data")
@@ -281,6 +291,20 @@ class RiskManager:
         if asset_class == AssetClass.OPTION:
             return self.settings.option_trading_enabled
         return False
+
+    def _is_risk_reducing_sell(self, symbol: str, side: str, quantity: float) -> bool:
+        if side != "SELL" or quantity <= 0:
+            return False
+
+        position = self.portfolio.get_position(symbol)
+        if position is None:
+            return False
+
+        position_side = str(position.side).upper()
+        if position_side in {"SELL", "SHORT"}:
+            return False
+
+        return quantity <= (position.quantity + 1e-9)
 
     def record_event(self, symbol: Optional[str], reason: str, details: Optional[str] = None) -> None:
         event_payload = {

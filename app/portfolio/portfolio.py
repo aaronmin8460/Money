@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List
 
 from app.domain.models import AssetClass
@@ -26,6 +26,8 @@ class Portfolio:
     unrealized_pnl: float = 0.0
     initial_equity: float = 100_000.0
     equity_history: List[float] = field(default_factory=list)
+    daily_baseline_equity: float | None = None
+    daily_baseline_date: date | None = None
     risk_events: List[Dict[str, str]] = field(default_factory=list)
     last_trade_time: datetime | None = None
 
@@ -84,11 +86,18 @@ class Portfolio:
             self.cash -= quantity * price
             self.last_trade_time = datetime.utcnow()
         elif side.upper() == "SELL" and symbol in self.positions:
-            position = self.positions.pop(symbol)
-            pnl = (price - position.entry_price) * position.quantity
+            position = self.positions[symbol]
+            sold_quantity = min(quantity, position.quantity)
+            pnl = (price - position.entry_price) * sold_quantity
             self.realized_pnl += pnl
-            self.cash += quantity * price
+            self.cash += sold_quantity * price
+            remaining_quantity = position.quantity - sold_quantity
             self.last_trade_time = datetime.utcnow()
+            if remaining_quantity <= 0:
+                self.positions.pop(symbol, None)
+            else:
+                position.quantity = remaining_quantity
+                position.current_price = price
 
         self._recalculate_equity()
 
@@ -103,23 +112,24 @@ class Portfolio:
             unrealized += (current_price - position.entry_price) * position.quantity
 
         self.unrealized_pnl = unrealized
-        self.equity_history.append(total)
+        self._record_equity_snapshot(total)
 
     def sync_account_state(self, cash: float, equity: float | None = None) -> None:
         self.cash = cash
         current_equity = equity if equity is not None else self.calculate_equity()
-        if not self.equity_history:
-            self.initial_equity = current_equity
-        self.equity_history.append(current_equity)
+        self._record_equity_snapshot(current_equity)
 
     def _recalculate_equity(self) -> None:
-        self.equity_history.append(self.calculate_equity())
+        self._record_equity_snapshot(self.calculate_equity())
 
     def calculate_equity(self) -> float:
         total = self.cash
         for position in self.positions.values():
             total += position.quantity * position.current_price
         return total
+
+    def get_position(self, symbol: str) -> Position | None:
+        return self.positions.get(symbol)
 
     def exposure(self) -> float:
         return sum(position.quantity * position.current_price for position in self.positions.values())
@@ -148,14 +158,55 @@ class Portfolio:
         return max(0.0, (peak - trough) / peak)
 
     def daily_loss_pct(self) -> float:
-        if not self.equity_history:
+        return self.current_daily_loss_pct()
+
+    def reset_daily_baseline(
+        self,
+        equity: float | None = None,
+        *,
+        as_of: datetime | None = None,
+    ) -> float:
+        baseline_time = self._normalize_timestamp(as_of)
+        baseline_equity = float(equity if equity is not None else self.calculate_equity())
+        self.daily_baseline_date = baseline_time.date()
+        self.daily_baseline_equity = baseline_equity
+        return baseline_equity
+
+    def maybe_reset_daily_baseline(
+        self,
+        equity: float | None = None,
+        *,
+        as_of: datetime | None = None,
+    ) -> bool:
+        baseline_time = self._normalize_timestamp(as_of)
+        if self.daily_baseline_equity is None or self.daily_baseline_date != baseline_time.date():
+            self.reset_daily_baseline(equity=equity, as_of=baseline_time)
+            return True
+        return False
+
+    def current_daily_loss_amount(
+        self,
+        *,
+        as_of: datetime | None = None,
+        equity: float | None = None,
+    ) -> float:
+        current_equity = float(equity if equity is not None else self.calculate_equity())
+        self.maybe_reset_daily_baseline(equity=current_equity, as_of=as_of)
+        baseline_equity = self.daily_baseline_equity if self.daily_baseline_equity is not None else current_equity
+        return max(0.0, baseline_equity - current_equity)
+
+    def current_daily_loss_pct(
+        self,
+        *,
+        as_of: datetime | None = None,
+        equity: float | None = None,
+    ) -> float:
+        current_equity = float(equity if equity is not None else self.calculate_equity())
+        self.maybe_reset_daily_baseline(equity=current_equity, as_of=as_of)
+        baseline_equity = self.daily_baseline_equity if self.daily_baseline_equity is not None else current_equity
+        if baseline_equity <= 0:
             return 0.0
-        start_equity = self.equity_history[0]
-        current_equity = self.calculate_equity()
-        if start_equity <= 0:
-            return 0.0
-        loss = max(0.0, start_equity - current_equity)
-        return loss / start_equity
+        return self.current_daily_loss_amount(as_of=as_of, equity=current_equity) / baseline_equity
 
     def reconcile_positions(self, broker_positions: List[Dict[str, Any]]) -> None:
         """Reconcile portfolio with broker positions."""
@@ -196,3 +247,16 @@ class Portfolio:
                 )
 
         self._recalculate_equity()
+
+    def _record_equity_snapshot(self, equity: float) -> None:
+        snapshot_equity = float(equity)
+        if not self.equity_history:
+            self.initial_equity = snapshot_equity
+        self.equity_history.append(snapshot_equity)
+        self.maybe_reset_daily_baseline(equity=snapshot_equity)
+
+    def _normalize_timestamp(self, value: datetime | None) -> datetime:
+        resolved = value or datetime.now(timezone.utc)
+        if resolved.tzinfo is None:
+            return resolved.replace(tzinfo=timezone.utc)
+        return resolved.astimezone(timezone.utc)

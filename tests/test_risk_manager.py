@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from dataclasses import dataclass
 
 from app.config.settings import Settings
@@ -72,3 +73,52 @@ def test_risk_manager_distinguishes_notional_limit_from_stop_risk() -> None:
     assert notional_decision.approved is False
     assert "max position notional" in notional_decision.reason.lower()
     assert approved_decision.approved is True
+
+
+def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        max_daily_loss=100_000.0,
+        max_daily_loss_pct=0.02,
+    )
+    portfolio = Portfolio(cash=97_000.0)
+    portfolio.reset_daily_baseline(
+        equity=100_000.0,
+        as_of=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    manager = RiskManager(portfolio, settings=settings)
+
+    decision = manager.evaluate_order("AAPL", "BUY", 1.0, 100.0)
+
+    assert decision.approved is False
+    assert decision.rule == "daily_loss_pct_limit"
+
+
+def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduced() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        max_daily_loss=1_000.0,
+        max_daily_loss_pct=0.02,
+    )
+    portfolio = Portfolio(cash=95_000.0)
+    portfolio.positions["QQQ"] = Position(
+        symbol="QQQ",
+        quantity=5.0,
+        entry_price=300.0,
+        side="BUY",
+        current_price=200.0,
+    )
+    portfolio.reset_daily_baseline(
+        equity=100_000.0,
+        as_of=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+    )
+    manager = RiskManager(portfolio, settings=settings)
+
+    decision = manager.evaluate_order("QQQ", "SELL", 2.0, 200.0)
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
