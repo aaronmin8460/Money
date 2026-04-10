@@ -11,7 +11,7 @@ The project is API-first, paper-trading safe by default, and designed for learni
 - Keeps options behind a feature flag and paper-only guardrail.
 - Normalizes bars, quotes, trades, snapshots, and session state across asset classes.
 - Scans the tradable universe for gainers, losers, breakouts, pullbacks, volatility, momentum, and overall opportunities.
-- Routes strategies by asset class and ranks generated signals.
+- Runs one explicitly configured active strategy at runtime.
 - Applies multi-asset risk controls before any order placement.
 - Persists catalog syncs, scanner runs, opportunities, signals, orders, fills, position snapshots, and bot runs in SQLite.
 
@@ -25,7 +25,7 @@ The project is API-first, paper-trading safe by default, and designed for learni
 - `app/services/market_data.py`: normalized bars, quotes, trades, snapshots, and session behavior.
 - `app/services/scanner.py`: multi-asset ranking engine and scanner persistence.
 - `app/services/market_overview.py`: overview summaries built from scanner output.
-- `app/strategies/`: asset-class-specific strategies plus registry/routing.
+- `app/strategies/`: strategy implementations plus active-strategy selection helpers.
 - `app/risk/`: exposure, liquidity, spread, drawdown, cooldown, and kill-switch controls.
 - `app/execution/`: normalized signal-to-order flow with dry-run and paper safety.
 - `app/services/auto_trader.py`: automation loop for scanning, signal ranking, and execution.
@@ -42,8 +42,8 @@ The project is API-first, paper-trading safe by default, and designed for learni
 
 `All markets` in this project means all tradable assets supported by the configured broker or data provider.
 
-- In `paper` / `mock` mode, the asset universe comes from local symbol CSVs in `data/`.
-- In `alpaca` mode, the asset catalog syncs from the broker asset list and caches the results in SQLite.
+- In `mock` mode, the asset universe comes from local symbol CSVs in `data/`.
+- In `paper` mode, the asset catalog syncs from Alpaca paper and caches the results in SQLite.
 - The catalog stores symbol, name, asset class, exchange, tradable flags, borrow flags, margin flags, and raw attributes.
 - Universe scanning can be narrowed with watchlists, inclusion lists, exclusion lists, and enabled asset-class switches.
 
@@ -60,7 +60,7 @@ The scanner produces ranked views for:
 - momentum
 - overall opportunities
 
-Strategies currently included:
+Available strategies:
 
 - equity/ETF momentum breakout
 - equity/ETF trend pullback
@@ -68,26 +68,34 @@ Strategies currently included:
 - mean reversion scanner
 - legacy EMA crossover support
 
+Only one strategy is active at runtime. Set it with `ACTIVE_STRATEGY`, inspect it with `GET /config`, `GET /auto/status`, or `GET /diagnostics/strategy`, and do not rely on stale `ema_crossover` alerts from older wiring.
+
 Signals are normalized with fields such as symbol, asset class, strategy name, direction, confidence score, entry, stop, target, ATR, momentum, liquidity, spread, regime, and reason.
 
 ## Paper Trading Safety
 
-- Default broker mode is paper/mock safe.
+- `BROKER_MODE=paper` means Alpaca paper trading.
+- `BROKER_MODE=mock` keeps everything local and CSV-backed.
 - `TRADING_ENABLED=false` is the default.
+- `AUTO_TRADE_ENABLED=false` is the default.
+- `TRADING_ENABLED=true` enables actual Alpaca paper order submission when `BROKER_MODE=paper`.
+- `AUTO_TRADE_ENABLED=true` starts the in-process auto-trader exactly once at API startup.
 - Live trading stays disabled unless `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_ACK=ENABLE_LIVE_TRADING`.
 - Alpaca live URLs are rejected unless live trading is explicitly enabled and acknowledged.
 - Options remain feature-flagged and paper-only.
 - `SHORT_SELLING_ENABLED=false` is the default.
 - When short selling is disabled, bearish `SELL` signals are exit-only. If there is no tracked long position, the bot will not place a sell and will surface `no_position_to_sell` diagnostics instead of behaving like a short-entry engine.
 - Daily loss and drawdown controls still block new exposure such as `BUY` orders, but real risk-reducing sells are allowed so the bot can exit losing longs.
+- Position sizing uses `Decimal` math plus `POSITION_NOTIONAL_BUFFER_PCT` so auto-sized orders land safely under the hard `MAX_POSITION_NOTIONAL` cap instead of right on the boundary.
 
 ## Why Repeated Rejects Happen
 
-Repeated paper-mode rejects usually mean the bot is still evaluating symbols after a loss threshold has already been crossed.
+Repeated paper-mode rejects usually mean the bot is still evaluating symbols after a loss threshold has already been crossed, or that the proposed size landed too close to a hard notional limit.
 
 - `BUY` orders are correctly rejected once the current daily loss exceeds `MAX_DAILY_LOSS_PCT` or `MAX_DAILY_LOSS`.
 - Before this fix, a bearish strategy could emit `SELL` for symbols with no tracked long position. Those looked like new exposure, so the risk manager rejected them under the daily-loss rule and Discord showed noisy `SELL ... rejected` alerts.
 - The bot now treats bearish sells as exit-only when short selling is disabled. If no tracked long exists, the strategy returns `HOLD` for scan flow and execution/risk still reject direct sell attempts with the explicit rule `no_position_to_sell`.
+- The bot now sizes `BUY` orders below the hard cap using `POSITION_NOTIONAL_BUFFER_PCT` and surfaces the raw qty, raw price, raw notional, rounded notional, and comparison operator in rejection diagnostics when a candidate still fails risk validation.
 
 ## Installation
 
@@ -103,7 +111,10 @@ cp .env.example .env
 Start from `.env.example`. Important categories:
 
 - broker mode and credentials
-- paper vs live gating
+- paper vs mock behavior
+- `TRADING_ENABLED` vs `AUTO_TRADE_ENABLED`
+- active strategy selection
+- position-notional sizing buffer
 - short-selling guardrails
 - Discord webhook notifications
 - enabled asset classes
@@ -126,10 +137,21 @@ If Discord notifications are enabled without a webhook URL, startup and settings
 
 Important trading behavior settings:
 
+- `BROKER_MODE=paper`
+- `ACTIVE_STRATEGY=equity_momentum_breakout`
 - `SHORT_SELLING_ENABLED=false`
+- `POSITION_NOTIONAL_BUFFER_PCT=0.995`
 - `MAX_DAILY_LOSS=2000`
 - `MAX_DAILY_LOSS_PCT=0.02`
 - `MAX_DRAWDOWN_PCT=0.10`
+
+Paper-mode setup:
+
+- Use `BROKER_MODE=paper` with Alpaca paper API keys in `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`.
+- Use `BROKER_MODE=mock` only for local CSV-backed testing without Alpaca.
+- `TRADING_ENABLED=true` submits Alpaca paper orders.
+- `AUTO_TRADE_ENABLED=true` starts the continuous in-process auto-trader loop.
+- `ACTIVE_STRATEGY` is the only runtime strategy selector. The old `STRATEGY_NAME` env var is accepted as a compatibility alias, but the app normalizes it to `ACTIVE_STRATEGY`.
 
 ## Discord Notifications
 
@@ -163,23 +185,29 @@ DISCORD_NOTIFY_START_STOP=true
 
 `DISCORD_NOTIFY_DRY_RUNS` is optional and defaults to `false` so local testing and paper-mode scans do not spam Discord unless you explicitly opt in.
 
-Rejected trade notifications now include the exact risk rule, whether the symbol had a tracked position, whether a rejected sell was risk-reducing, and the current equity vs daily baseline context.
+Rejected trade notifications now include the exact risk rule, whether the symbol had a tracked position, whether a rejected sell was risk-reducing, the active strategy, current equity vs daily baseline context, and the raw/rounded notional sizing details when the candidate failed on exposure rules.
 
 ## Diagnostics
 
-Use the diagnostics routes to understand why the bot is blocking new exposure and whether local portfolio tracking matches the broker:
+Use the diagnostics routes to understand why the bot is blocking new exposure, whether the auto-trader is really running, and whether local portfolio tracking matches the broker:
 
+- `GET /diagnostics/auto`
 - `GET /diagnostics/risk`
+- `GET /diagnostics/strategy`
 - `GET /diagnostics/portfolio`
 - `GET /diagnostics/rejections/latest`
 
 These routes expose:
 
+- trading enabled, auto-trade enabled, broker mode, broker backend, and active strategy
+- market-open status and extended-hours allowance
 - account cash, equity, and buying power
 - daily baseline equity and date
 - current daily loss amount and percent
 - drawdown percent
 - active symbol and strategy cooldowns
+- latest evaluated symbols and latest signals
+- latest accepted and rejected order candidates
 - local tracked positions with `is_long` and `sellable`
 - broker-reported positions
 - latest risk events
@@ -220,23 +248,38 @@ Local bot reset and Alpaca paper-account reset are separate operations.
 - The app can reset its own local runtime state and local SQLite history.
 - The app does not claim to erase Alpaca's remote paper-trading history through the API.
 - If you want a truly fresh Alpaca paper account, use the Alpaca dashboard to create a fresh paper account or remove the old paper account, then generate new paper API credentials for that paper account.
+- A practical workflow is:
+  1. Open the Alpaca dashboard.
+  2. Create a new paper account or delete the old paper account there.
+  3. Generate fresh paper API keys for the new paper account.
+  4. Update `.env` with the new `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `BROKER_MODE=paper`.
+  5. Restart the API so the runtime reconnects to the new paper account.
 - After creating the fresh paper account, update `.env` with the new `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and keep `ALPACA_BASE_URL=https://paper-api.alpaca.markets`.
 - Restart the app after updating credentials so the runtime picks up the new paper account.
 
 ## Running Locally
 
-Initialize and run:
+Recommended stable run path for continuous paper auto-trading:
 
 ```bash
 source .venv/bin/activate
-uvicorn main:app --reload
+python scripts/run_paper_api.py
+```
+
+This starts Uvicorn in a single process so the in-process auto-trader runs once. The logs now make startup and shutdown explicit with lines such as `Paper auto-trader is running` and `Paper auto-trader stopped`.
+
+Direct Uvicorn run:
+
+```bash
+source .venv/bin/activate
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
 Run tests:
 
 ```bash
 source .venv/bin/activate
-pytest
+uv run pytest
 ```
 
 Test Discord notifications locally:
@@ -246,7 +289,7 @@ source .venv/bin/activate
 export DISCORD_NOTIFICATIONS_ENABLED=true
 export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
 export DISCORD_NOTIFY_DRY_RUNS=true
-uvicorn main:app --reload
+python scripts/run_paper_api.py
 ```
 
 Then in another terminal:
@@ -313,6 +356,8 @@ Diagnostics:
 - `GET /config`
 - `GET /diagnostics/universe`
 - `GET /diagnostics/data-feed`
+- `GET /diagnostics/auto`
+- `GET /diagnostics/strategy`
 - `GET /diagnostics/strategies`
 - `GET /diagnostics/risk`
 - `GET /diagnostics/portfolio`
@@ -331,8 +376,12 @@ Legacy compatibility:
 Assuming the API is running on `127.0.0.1:8000`:
 
 ```bash
+uv run pytest
+python scripts/run_paper_api.py
+uvicorn main:app --host 127.0.0.1 --port 8000
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/config
+curl http://127.0.0.1:8000/auto/status
 curl http://127.0.0.1:8000/assets/stats
 curl "http://127.0.0.1:8000/assets/search?q=BTC"
 curl "http://127.0.0.1:8000/market/snapshot?symbol=AAPL&asset_class=equity"
@@ -340,9 +389,12 @@ curl "http://127.0.0.1:8000/market/snapshot?symbol=BTC/USD&asset_class=crypto"
 curl "http://127.0.0.1:8000/scanner/overview?limit=5"
 curl "http://127.0.0.1:8000/scanner/asset-class/crypto?limit=5"
 curl -X POST http://127.0.0.1:8000/signals/run -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
+curl -X POST http://127.0.0.1:8000/auto/start
 curl -X POST http://127.0.0.1:8000/auto/run-now
 curl http://127.0.0.1:8000/signals/top
 curl http://127.0.0.1:8000/risk
+curl http://127.0.0.1:8000/diagnostics/auto
+curl http://127.0.0.1:8000/diagnostics/strategy
 curl http://127.0.0.1:8000/diagnostics/risk
 curl http://127.0.0.1:8000/diagnostics/portfolio
 curl http://127.0.0.1:8000/diagnostics/rejections/latest
@@ -359,7 +411,7 @@ The repository includes local mock CSVs for:
 - `BTC/USD`
 - `ETH/USD`
 
-In mock mode, the catalog and scanner treat those as the supported universe.
+In mock mode, the catalog and scanner treat those as the supported universe, and `TRADING_ENABLED=true` only affects the local in-memory broker. Use `BROKER_MODE=paper` when you want real Alpaca paper orders instead of the mock broker.
 
 ## Broker Limitations
 

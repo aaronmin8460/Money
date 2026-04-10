@@ -28,10 +28,12 @@ def config() -> dict[str, Any]:
     return {
         "app_env": settings.app_env,
         "broker_mode": settings.broker_mode,
+        "broker_backend": settings.broker_backend,
         "trading_enabled": settings.trading_enabled,
         "live_trading_enabled": settings.live_trading_enabled,
         "short_selling_enabled": settings.short_selling_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
+        "active_strategy": settings.active_strategy,
         "default_symbols": settings.default_symbols,
         "enabled_asset_classes": sorted(item.value for item in settings.enabled_asset_class_set),
         "universe_scan_enabled": settings.universe_scan_enabled,
@@ -42,6 +44,9 @@ def config() -> dict[str, Any]:
         "max_total_exposure": settings.max_total_exposure,
         "max_positions_total": settings.max_positions_total,
         "max_positions_per_asset_class": settings.max_positions_per_asset_class,
+        "max_position_notional": settings.max_position_notional,
+        "position_notional_buffer_pct": settings.position_notional_buffer_pct,
+        "effective_max_position_notional": settings.effective_max_position_notional,
         "max_notional_per_position": settings.max_notional_per_position,
         "max_notional_per_asset_class": settings.max_notional_per_asset_class,
         "max_daily_loss": settings.max_daily_loss,
@@ -82,17 +87,75 @@ def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = N
 
 @router.get("/diagnostics/strategies")
 def diagnostics_strategies() -> dict[str, Any]:
-    registry = get_runtime().strategy_registry
+    runtime = get_runtime()
+    registry = runtime.strategy_registry
     strategies = []
-    for strategy in registry._strategies:
+    for strategy in registry.list_available():
         strategies.append(
             {
                 "name": strategy.name,
                 "supported_asset_classes": sorted(item.value for item in strategy.supported_asset_classes),
                 "signal_only": strategy.signal_only,
+                "active": strategy.name == runtime.settings.active_strategy,
             }
         )
     return {"strategies": strategies}
+
+
+@router.get("/diagnostics/strategy")
+def diagnostics_strategy() -> dict[str, Any]:
+    runtime = get_runtime()
+    strategy = runtime.strategy
+    trader_status = runtime.get_auto_trader().get_status()
+    return {
+        "active_strategy": runtime.settings.active_strategy,
+        "broker_mode": runtime.settings.broker_mode,
+        "broker_backend": runtime.settings.broker_backend,
+        "supported_asset_classes": sorted(item.value for item in strategy.supported_asset_classes),
+        "signal_only": strategy.signal_only,
+        "latest_signals": trader_status["last_signals"],
+        "latest_scanned_symbols": trader_status["last_scanned_symbols"],
+        "available_strategies": diagnostics_strategies()["strategies"],
+    }
+
+
+@router.get("/diagnostics/auto")
+def diagnostics_auto() -> dict[str, Any]:
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    trader = runtime.get_auto_trader()
+    status = trader.get_status()
+    account = runtime.broker.get_account()
+    return {
+        "trading_enabled": runtime.settings.trading_enabled,
+        "auto_trade_enabled": runtime.settings.auto_trade_enabled,
+        "enabled": status["enabled"],
+        "running": status["running"],
+        "broker_mode": runtime.settings.broker_mode,
+        "broker_backend": runtime.settings.broker_backend,
+        "active_strategy": runtime.settings.active_strategy,
+        "market_open": status["market_open"],
+        "allow_extended_hours": runtime.settings.allow_extended_hours,
+        "scan_interval_seconds": runtime.settings.scan_interval_seconds,
+        "last_run_time": status["last_run_time"],
+        "last_run_result": status["last_run_result"],
+        "cooldown_status": runtime.risk_manager.get_active_cooldowns(),
+        "open_positions": runtime.portfolio.positions_diagnostics(),
+        "account": {
+            "cash": account.cash,
+            "equity": account.equity,
+            "buying_power": account.buying_power,
+            "positions": account.positions,
+            "mode": account.mode,
+            "trading_enabled": account.trading_enabled,
+        },
+        "latest_evaluated_symbols": status["last_scanned_symbols"],
+        "latest_signals": status["last_signals"],
+        "latest_accepted_order_candidate": status["last_accepted_candidate"],
+        "latest_rejected_order_candidate": status["last_rejected_candidate"],
+        "latest_rejection": status["last_rejection"],
+        "last_rejection_reason": status["last_rejection_reason"],
+    }
 
 
 @router.get("/diagnostics/risk")
@@ -178,7 +241,7 @@ def admin_notifications_test() -> dict[str, Any]:
         symbol="BTC/USD",
         signal=Signal.BUY,
         asset_class=AssetClass.CRYPTO,
-        strategy_name="regime_momentum_breakout",
+        strategy_name="equity_momentum_breakout",
         price=65000.0,
         reason="debug notification test",
     )

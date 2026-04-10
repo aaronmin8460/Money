@@ -83,7 +83,8 @@ class Settings(BaseSettings):
     )
     default_timeframe: str = Field("1D", env="DEFAULT_TIMEFRAME")
     default_symbols: List[str] = Field(default_factory=lambda: ["AAPL", "SPY"], env="DEFAULT_SYMBOLS")
-    strategy_name: str = Field("regime_momentum_breakout", env="STRATEGY_NAME")
+    active_strategy: str = Field("equity_momentum_breakout", env="ACTIVE_STRATEGY")
+    strategy_name: str | None = Field(None, env="STRATEGY_NAME", exclude=True, repr=False)
     auto_trade_enabled: bool = Field(False, env="AUTO_TRADE_ENABLED")
     scan_interval_seconds: int = Field(60, env="SCAN_INTERVAL_SECONDS")
     scan_interval_seconds_by_asset_class: dict[str, int] = Field(
@@ -96,6 +97,7 @@ class Settings(BaseSettings):
     )
     alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
     max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
+    position_notional_buffer_pct: float = Field(0.995, env="POSITION_NOTIONAL_BUFFER_PCT")
     max_total_exposure: float = Field(50_000.0, env="MAX_TOTAL_EXPOSURE")
     max_notional_per_position: float = Field(10_000.0, env="MAX_NOTIONAL_PER_POSITION")
     max_notional_per_asset_class: dict[str, float] = Field(
@@ -147,11 +149,19 @@ class Settings(BaseSettings):
 
     @property
     def is_paper_mode(self) -> bool:
-        return self.broker_mode.lower() in {"paper", "mock"}
+        return self.broker_mode.lower() == "paper"
+
+    @property
+    def is_mock_mode(self) -> bool:
+        return self.broker_mode.lower() == "mock"
 
     @property
     def is_alpaca_mode(self) -> bool:
-        return self.broker_mode.lower() == "alpaca"
+        return self.broker_mode.lower() == "paper"
+
+    @property
+    def is_simulated_mode(self) -> bool:
+        return self.broker_mode.lower() in {"paper", "mock"}
 
     @property
     def has_alpaca_credentials(self) -> bool:
@@ -160,6 +170,14 @@ class Settings(BaseSettings):
     @property
     def is_live_enabled(self) -> bool:
         return self.trading_enabled and self.is_alpaca_mode and self.live_trading_enabled
+
+    @property
+    def broker_backend(self) -> str:
+        return "alpaca_paper" if self.is_alpaca_mode else "local_mock"
+
+    @property
+    def effective_max_position_notional(self) -> float:
+        return float(self.max_position_notional * self.position_notional_buffer_pct)
 
     @property
     def enabled_asset_class_set(self) -> set[AssetClass]:
@@ -238,15 +256,31 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_settings(self) -> "Settings":
         mode = self.broker_mode.lower()
-        supported_modes = {"paper", "mock", "alpaca"}
+        if mode == "alpaca":
+            mode = "paper"
+        supported_modes = {"paper", "mock"}
         if mode not in supported_modes:
             raise ValueError(
-                f"BROKER_MODE must be one of {sorted(supported_modes)}; got '{self.broker_mode}'."
+                "BROKER_MODE must be one of ['mock', 'paper']; "
+                f"got '{self.broker_mode}'. The legacy alias 'alpaca' is still accepted."
             )
+        self.broker_mode = mode
 
-        if mode == "alpaca" and not self.has_alpaca_credentials:
+        if self.strategy_name:
+            self.active_strategy = self.strategy_name
+        self.active_strategy = {
+            "regime_momentum_breakout": "equity_momentum_breakout",
+        }.get(self.active_strategy.strip().lower(), self.active_strategy.strip().lower())
+        if not self.active_strategy:
+            raise ValueError("ACTIVE_STRATEGY must not be empty.")
+        self.strategy_name = self.active_strategy
+
+        if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
+            raise ValueError("POSITION_NOTIONAL_BUFFER_PCT must be greater than 0 and less than or equal to 1.")
+
+        if self.is_paper_mode and not self.has_alpaca_credentials:
             raise ValueError(
-                "BROKER_MODE=alpaca requires ALPACA_API_KEY and ALPACA_SECRET_KEY to be set."
+                "BROKER_MODE=paper requires ALPACA_API_KEY and ALPACA_SECRET_KEY to be set."
             )
         if not self.live_trading_enabled and self.is_alpaca_mode and "paper-api" not in str(self.alpaca_base_url):
             raise ValueError(
@@ -254,7 +288,7 @@ class Settings(BaseSettings):
             )
         if self.live_trading_enabled:
             if not self.is_alpaca_mode:
-                raise ValueError("LIVE_TRADING_ENABLED is only supported with BROKER_MODE=alpaca.")
+                raise ValueError("LIVE_TRADING_ENABLED is only supported with BROKER_MODE=paper.")
             if self.live_trading_ack != "ENABLE_LIVE_TRADING":
                 raise ValueError(
                     "Set LIVE_TRADING_ACK=ENABLE_LIVE_TRADING to explicitly acknowledge live trading risk."
@@ -269,7 +303,9 @@ class Settings(BaseSettings):
                 "'your_webhook_id/your_webhook_token'."
             )
         if self.max_notional_per_position != self.max_position_notional:
-            self.max_position_notional = self.max_notional_per_position
+            resolved_notional_cap = min(self.max_notional_per_position, self.max_position_notional)
+            self.max_notional_per_position = resolved_notional_cap
+            self.max_position_notional = resolved_notional_cap
         if self.max_positions_total != self.max_positions:
             self.max_positions = self.max_positions_total
         return self

@@ -160,8 +160,8 @@ class PaperBroker(BrokerInterface):
             ]
 
     def submit_order(self, order: OrderRequest) -> dict[str, Any]:
-        if not self.settings.is_paper_mode:
-            raise RuntimeError("PaperBroker only supports paper mode.")
+        if not self.settings.is_mock_mode:
+            raise RuntimeError("PaperBroker only supports BROKER_MODE=mock.")
 
         with self._lock:
             resolved_asset_class = (
@@ -311,7 +311,7 @@ class AlpacaBroker(BrokerInterface):
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
         if not self.settings.is_alpaca_mode:
-            raise RuntimeError("AlpacaBroker is only available when BROKER_MODE=alpaca.")
+            raise RuntimeError("AlpacaBroker is only available when BROKER_MODE=paper.")
         if not self.settings.has_alpaca_credentials:
             raise ValueError("Alpaca trading requires ALPACA_API_KEY and ALPACA_SECRET_KEY.")
 
@@ -594,8 +594,8 @@ def create_broker(
 ) -> BrokerInterface:
     settings = settings or get_settings()
     mode = settings.broker_mode.lower()
-    if mode in {"paper", "mock"}:
+    if mode == "mock":
         return PaperBroker(settings, market_data_service=market_data_service or CSVMarketDataService())
-    if mode == "alpaca":
+    if mode == "paper":
         return AlpacaBroker(settings)
     raise ValueError(f"Unsupported broker mode '{settings.broker_mode}'.")

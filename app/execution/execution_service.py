@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from app.config.settings import Settings, get_settings
@@ -20,11 +21,24 @@ from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskDecision, RiskManager
 from app.services.broker import BrokerInterface, OrderRequest
-from app.services.market_data import MarketDataService
+from app.services.market_data import MarketDataService, infer_asset_class
 from app.strategies.base import BaseStrategy, Signal, TradeSignal
 
 
 logger = get_logger("execution")
+
+MONEY_QUANTUM = Decimal("0.01")
+PRICE_QUANTUM = Decimal("0.0001")
+FRACTIONAL_QTY_QUANTUM = Decimal("0.000001")
+WHOLE_QTY_QUANTUM = Decimal("1")
+
+
+@dataclass
+class OrderSizing:
+    quantity: float | None
+    notional: float | None
+    price: float
+    metadata: dict[str, Any]
 
 
 @dataclass
@@ -51,7 +65,7 @@ class ExecutionService:
             }
 
         price = signal.entry_price or signal.price or self._latest_price(signal)
-        asset_class = signal.asset_class if signal.asset_class != AssetClass.UNKNOWN else AssetClass.EQUITY
+        asset_class = signal.asset_class if signal.asset_class != AssetClass.UNKNOWN else infer_asset_class(signal.symbol)
         proposal = self._build_order_request(signal, asset_class, price)
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
         self._persist_signal_event(signal, price, proposal.quantity or 0.0, risk_decision)
@@ -119,17 +133,18 @@ class ExecutionService:
         }
 
     def _build_order_request(self, signal: TradeSignal, asset_class: AssetClass, price: float) -> OrderRequest:
-        quantity, notional = self._calculate_position_size(signal, asset_class, price)
+        sizing = self._calculate_position_size(signal, asset_class, price)
         tif = "gtc" if asset_class == AssetClass.CRYPTO else "day"
         return OrderRequest(
             symbol=signal.symbol,
             side=signal.signal.value,
-            quantity=quantity,
-            notional=notional,
+            quantity=sizing.quantity,
+            notional=sizing.notional,
             asset_class=asset_class,
-            price=price,
+            price=sizing.price,
             time_in_force=tif,
             is_dry_run=self.dry_run or not self.settings.trading_enabled,
+            metadata=sizing.metadata,
         )
 
     def _latest_price(self, signal: TradeSignal) -> float:
@@ -142,48 +157,97 @@ class ExecutionService:
         signal: TradeSignal,
         asset_class: AssetClass,
         price: float,
-    ) -> tuple[float | None, float | None]:
+    ) -> OrderSizing:
+        raw_price = self._decimal(price)
+        rounded_price = self._round_price(raw_price, asset_class)
+        hard_max_notional = self._decimal(self.settings.max_position_notional)
+        effective_max_notional = self._decimal(self.settings.effective_max_position_notional)
+        asset = self.broker.get_asset(signal.symbol, asset_class)
+        fractionable = asset.fractionable if asset else asset_class == AssetClass.CRYPTO
+
+        sizing_details: dict[str, Any] = {
+            "raw_price": float(raw_price),
+            "rounded_price": float(rounded_price),
+            "hard_max_position_notional": float(self._round_money(hard_max_notional)),
+            "effective_max_order_notional": float(self._round_money(effective_max_notional)),
+            "comparison_operator": ">",
+            "buffer_pct": float(self.settings.position_notional_buffer_pct),
+            "fractionable": fractionable,
+        }
         existing_position = self.portfolio.get_position(signal.symbol)
         if signal.signal == Signal.SELL and self.portfolio.is_sellable_long_position(signal.symbol):
             requested_quantity = signal.position_size if signal.position_size is not None and signal.position_size > 0 else existing_position.quantity
             sell_quantity = min(requested_quantity, existing_position.quantity)
-            # For SELL orders, preserve fractional quantities without capping
-            asset = self.broker.get_asset(signal.symbol, asset_class)
-            fractionable = asset.fractionable if asset else asset_class == AssetClass.CRYPTO
-            if fractionable:
-                return round(sell_quantity, 6), None
-            return sell_quantity, None
+            raw_quantity = self._decimal(sell_quantity)
+            rounded_quantity = self._round_quantity(raw_quantity, fractionable=fractionable)
+            rounded_notional = self._round_money(rounded_quantity * rounded_price)
+            sizing_details.update(
+                {
+                    "raw_calculated_qty": float(raw_quantity),
+                    "raw_notional_before_rounding": float(raw_quantity * raw_price),
+                    "rounded_quantity": float(rounded_quantity),
+                    "rounded_notional": float(rounded_notional),
+                }
+            )
+            return OrderSizing(
+                quantity=float(rounded_quantity),
+                notional=None,
+                price=float(rounded_price),
+                metadata={"sizing": sizing_details},
+            )
 
         if signal.signal == Signal.SELL:
-            return 0.0, None
+            sizing_details.update(
+                {
+                    "raw_calculated_qty": 0.0,
+                    "raw_notional_before_rounding": 0.0,
+                    "rounded_quantity": 0.0,
+                    "rounded_notional": 0.0,
+                }
+            )
+            return OrderSizing(
+                quantity=0.0,
+                notional=None,
+                price=float(rounded_price),
+                metadata={"sizing": sizing_details},
+            )
 
         if signal.position_size is not None and signal.position_size > 0:
-            return signal.position_size, None
-
-        try:
-            account = self.broker.get_account()
-            equity = float(account.equity)
-            risk_budget = equity * self.settings.max_risk_per_trade
-            if signal.stop_price:
-                stop_distance = price - signal.stop_price
-                if stop_distance > 0:
-                    quantity = max(1.0, risk_budget / stop_distance)
+            raw_quantity = self._decimal(signal.position_size)
+        else:
+            try:
+                account = self.broker.get_account()
+                equity = self._decimal(account.equity)
+                risk_budget = equity * self._decimal(self.settings.max_risk_per_trade)
+                if signal.stop_price:
+                    stop_distance = rounded_price - self._decimal(signal.stop_price)
+                    if stop_distance > 0:
+                        raw_quantity = risk_budget / stop_distance
+                    else:
+                        raw_quantity = effective_max_notional / max(rounded_price, Decimal("0.000001"))
                 else:
-                    quantity = max(1.0, self.settings.max_notional_per_position / max(price, 1.0))
-            else:
-                quantity = max(1.0, self.settings.max_notional_per_position / max(price, 1.0))
-        except Exception:
-            quantity = max(1.0, self.settings.max_notional_per_position / max(price, 1.0))
+                    raw_quantity = effective_max_notional / max(rounded_price, Decimal("0.000001"))
+            except Exception:
+                raw_quantity = effective_max_notional / max(rounded_price, Decimal("0.000001"))
 
-        asset = self.broker.get_asset(signal.symbol, asset_class)
-        fractionable = asset.fractionable if asset else asset_class == AssetClass.CRYPTO
-        capped_quantity = min(quantity, self.settings.max_notional_per_position / max(price, 1.0))
-        if fractionable:
-            rounded = round(capped_quantity, 6)
-            if asset_class == AssetClass.CRYPTO:
-                return None, round(rounded * price, 2)
-            return rounded, None
-        return max(1, int(capped_quantity)), None
+        max_quantity = effective_max_notional / max(rounded_price, Decimal("0.000001"))
+        capped_quantity = min(raw_quantity, max_quantity)
+        rounded_quantity = self._round_quantity(capped_quantity, fractionable=fractionable)
+        rounded_notional = self._round_money(rounded_quantity * rounded_price)
+        sizing_details.update(
+            {
+                "raw_calculated_qty": float(raw_quantity),
+                "raw_notional_before_rounding": float(raw_quantity * raw_price),
+                "rounded_quantity": float(rounded_quantity),
+                "rounded_notional": float(rounded_notional),
+            }
+        )
+        return OrderSizing(
+            quantity=float(rounded_quantity),
+            notional=None,
+            price=float(rounded_price),
+            metadata={"sizing": sizing_details},
+        )
 
     def _evaluate_signal_risk(
         self,
@@ -215,7 +279,25 @@ class ExecutionService:
             dollar_volume=dollar_volume,
             data_age_seconds=data_age_seconds,
             exchange=exchange,
+            sizing=proposal.metadata.get("sizing") if proposal.metadata else None,
         )
+
+    def _decimal(self, value: Any) -> Decimal:
+        return Decimal(str(value))
+
+    def _round_money(self, value: Decimal) -> Decimal:
+        return value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+    def _round_price(self, value: Decimal, asset_class: AssetClass) -> Decimal:
+        quantum = Decimal("0.000001") if asset_class == AssetClass.CRYPTO else PRICE_QUANTUM
+        return value.quantize(quantum, rounding=ROUND_HALF_UP)
+
+    def _round_quantity(self, value: Decimal, *, fractionable: bool) -> Decimal:
+        quantum = FRACTIONAL_QTY_QUANTUM if fractionable else WHOLE_QTY_QUANTUM
+        rounded = value.quantize(quantum, rounding=ROUND_DOWN)
+        if not fractionable:
+            rounded = Decimal(int(rounded))
+        return max(Decimal("0"), rounded)
 
     def _annotate_signal_context(self, signal: TradeSignal) -> None:
         if signal.metrics is None:

@@ -18,7 +18,7 @@ def test_asset_catalog_sync_persists_assets(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False)
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
     market_data = CSVMarketDataService(data_dir=tmp_path)
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     service = AssetCatalogService(broker=broker, settings=settings)

@@ -30,10 +30,11 @@ def broker_status() -> BrokerStatus:
     settings = get_runtime().settings
     return BrokerStatus(
         broker_mode=settings.broker_mode,
+        broker_backend=settings.broker_backend,
         trading_enabled=settings.trading_enabled,
         has_credentials=settings.has_alpaca_credentials,
         safe_dry_run=not settings.trading_enabled,
-        broker_label="Alpaca" if settings.is_alpaca_mode else "Paper Mock",
+        broker_label="Alpaca Paper" if settings.is_alpaca_mode else "Local Mock",
         live_trading_enabled=settings.live_trading_enabled,
     )
 

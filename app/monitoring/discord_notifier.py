@@ -212,6 +212,7 @@ def build_system_notification_payload(
             [
                 f"Mode: {mode_label}",
                 f"Auto-trade: {_enabled_label(settings.auto_trade_enabled)}",
+                f"Strategy: {settings.active_strategy}",
                 f"Time: {format_readable_notification_timestamp(timestamp)}",
             ]
         )
@@ -269,6 +270,8 @@ def build_trade_notification_payload(
         detail_lines.append(f"Notional: {_format_money(notional)}")
     if price is not None:
         detail_lines.append(f"Price: {_format_price(price, asset_class)}")
+    if settings.active_strategy:
+        detail_lines.append(f"Active Strategy: {settings.active_strategy}")
     if strategy:
         detail_lines.append(f"Strategy: {strategy}")
     relevant_rule = _format_relevant_rule(risk)
@@ -587,6 +590,27 @@ def _format_rejection_context_lines(risk: RiskDecision) -> list[str]:
         if daily_loss_amount is not None:
             loss_parts.append(_format_money(daily_loss_amount))
         lines.append(f"Daily Loss: {' / '.join(loss_parts)}")
+    raw_calculated_qty = details.get("raw_calculated_qty")
+    if raw_calculated_qty is not None:
+        lines.append(f"Raw Qty: {_format_decimal(float(raw_calculated_qty), min_decimals=0, max_decimals=6)}")
+    raw_price = details.get("raw_price")
+    if raw_price is not None:
+        lines.append(f"Raw Price: {_format_money(raw_price, max_decimals=6)}")
+    raw_notional_before_rounding = details.get("raw_notional_before_rounding")
+    if raw_notional_before_rounding is not None:
+        lines.append(f"Raw Notional: {_format_money(raw_notional_before_rounding, max_decimals=6)}")
+    rounded_notional = details.get("rounded_notional")
+    if rounded_notional is not None:
+        lines.append(f"Rounded Notional: {_format_money(rounded_notional)}")
+    max_allowed_notional = details.get("max_allowed_notional")
+    if max_allowed_notional is not None:
+        lines.append(f"Max Allowed Notional: {_format_money(max_allowed_notional)}")
+    hard_max_position_notional = details.get("hard_max_position_notional")
+    if hard_max_position_notional is not None:
+        lines.append(f"Hard Max Notional: {_format_money(hard_max_position_notional)}")
+    comparison_operator = details.get("comparison_operator")
+    if comparison_operator:
+        lines.append(f"Comparison: {comparison_operator}")
     return lines
 
 

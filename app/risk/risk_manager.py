@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Optional
 
 from app.config.settings import Settings, get_settings
@@ -72,10 +73,14 @@ class RiskManager:
         current_daily_loss_pct = self.portfolio.current_daily_loss_pct(equity=account["equity"])
         return {
             "trading_enabled": self.settings.trading_enabled,
+            "auto_trade_enabled": self.settings.auto_trade_enabled,
             "live_trading_enabled": self.settings.live_trading_enabled,
             "kill_switch_enabled": self.settings.kill_switch_enabled,
             "short_selling_enabled": self.settings.short_selling_enabled,
             "broker_mode": self.settings.broker_mode,
+            "broker_backend": self.settings.broker_backend,
+            "active_strategy": self.settings.active_strategy,
+            "allow_extended_hours": self.settings.allow_extended_hours,
             "cash": account["cash"],
             "equity": account["equity"],
             "buying_power": account["buying_power"],
@@ -166,6 +171,7 @@ class RiskManager:
         dollar_volume: float | None = None,
         data_age_seconds: float | None = None,
         exchange: str | None = None,
+        sizing: dict[str, Any] | None = None,
     ) -> RiskDecision:
         normalized_side = side.value if hasattr(side, "value") else str(side)
         normalized_side = normalized_side.upper()
@@ -174,6 +180,8 @@ class RiskManager:
             resolved_asset_class = AssetClass.EQUITY
         reduces_exposure = self._is_risk_reducing_sell(symbol, normalized_side, quantity)
         account = self.get_account_snapshot()
+        quantity_decimal = self._decimal(quantity)
+        price_decimal = self._decimal(price)
         decision_details = self._build_decision_details(
             symbol=symbol,
             side=normalized_side,
@@ -188,6 +196,7 @@ class RiskManager:
             data_age_seconds=data_age_seconds,
             exchange=exchange,
             reduces_exposure=reduces_exposure,
+            sizing=sizing,
         )
 
         if self.settings.kill_switch_enabled:
@@ -224,7 +233,7 @@ class RiskManager:
                 details=decision_details,
             )
 
-        if quantity <= 0 or price <= 0:
+        if quantity_decimal <= 0 or price_decimal <= 0:
             return RiskDecision(False, "Invalid order quantity or price.", rule="input_validation", details=decision_details)
 
         if not reduces_exposure:
@@ -280,7 +289,7 @@ class RiskManager:
             if strategy_cooldown and datetime.utcnow() < strategy_cooldown:
                 return RiskDecision(False, "Strategy cooldown is active.", rule="strategy_cooldown", details=decision_details)
 
-        order_notional = quantity * price
+        order_notional = self._round_money(quantity_decimal * price_decimal)
         if normalized_side == "BUY":
             if symbol in self.portfolio.positions:
                 return RiskDecision(
@@ -314,11 +323,14 @@ class RiskManager:
                     details=decision_details,
                 )
 
-            class_exposure = self.portfolio.exposure_by_asset_class().get(resolved_asset_class.value, 0.0)
-            if class_exposure + order_notional > self.settings.max_notional_per_asset_class.get(
-                resolved_asset_class.value,
-                self.settings.max_total_exposure,
-            ):
+            class_exposure = self._decimal(self.portfolio.exposure_by_asset_class().get(resolved_asset_class.value, 0.0))
+            class_limit = self._decimal(
+                self.settings.max_notional_per_asset_class.get(
+                    resolved_asset_class.value,
+                    self.settings.max_total_exposure,
+                )
+            )
+            if class_exposure + order_notional > class_limit:
                 return RiskDecision(
                     False,
                     "Asset-class notional limit would be exceeded.",
@@ -326,13 +338,20 @@ class RiskManager:
                     details=decision_details,
                 )
 
-            if self.portfolio.exposure() + order_notional > self.settings.max_total_exposure:
+            total_exposure = self._decimal(self.portfolio.exposure())
+            max_total_exposure = self._decimal(self.settings.max_total_exposure)
+            if total_exposure + order_notional > max_total_exposure:
                 return RiskDecision(False, "Max total exposure would be exceeded.", rule="total_exposure", details=decision_details)
 
-            if order_notional > self.settings.max_notional_per_position:
+            max_position_notional = self._decimal(self.settings.max_position_notional)
+            comparison_operator = decision_details.get("comparison_operator", ">")
+            if order_notional > max_position_notional:
                 return RiskDecision(
                     False,
-                    f"Order notional ({order_notional:.2f}) exceeds max position notional ({self.settings.max_notional_per_position:.2f}).",
+                    (
+                        f"Order notional ({float(order_notional):.2f}) exceeds max position notional "
+                        f"({float(max_position_notional):.2f}) using comparison '{comparison_operator}'."
+                    ),
                     rule="position_notional",
                     details=decision_details,
                 )
@@ -351,18 +370,18 @@ class RiskManager:
                     details=decision_details,
                 )
 
-            if self.settings.is_paper_mode and order_notional > account["cash"]:
+            if self.settings.is_simulated_mode and order_notional > self._decimal(account["cash"]):
                 return RiskDecision(
                     False,
-                    f"Order notional ({order_notional:.2f}) exceeds available cash ({account['cash']:.2f}).",
+                    f"Order notional ({float(order_notional):.2f}) exceeds available cash ({account['cash']:.2f}).",
                     rule="cash_limit",
                     details=decision_details,
                 )
 
-            if order_notional > account["buying_power"]:
+            if order_notional > self._decimal(account["buying_power"]):
                 return RiskDecision(
                     False,
-                    f"Order notional ({order_notional:.2f}) exceeds buying power ({account['buying_power']:.2f}).",
+                    f"Order notional ({float(order_notional):.2f}) exceeds buying power ({account['buying_power']:.2f}).",
                     rule="buying_power",
                     details=decision_details,
                 )
@@ -377,12 +396,14 @@ class RiskManager:
                         details=decision_details,
                     )
 
-                trade_risk = quantity * risk_per_share
-                max_trade_risk = account["equity"] * self.settings.max_risk_per_trade
+                trade_risk = self._round_money(quantity_decimal * self._decimal(risk_per_share))
+                max_trade_risk = self._round_money(
+                    self._decimal(account["equity"]) * self._decimal(self.settings.max_risk_per_trade)
+                )
                 if trade_risk > max_trade_risk:
                     return RiskDecision(
                         False,
-                        f"Stop-based trade risk ({trade_risk:.2f}) exceeds max risk per trade ({max_trade_risk:.2f}).",
+                        f"Stop-based trade risk ({float(trade_risk):.2f}) exceeds max risk per trade ({float(max_trade_risk):.2f}).",
                         rule="trade_risk",
                         details=decision_details,
                     )
@@ -500,17 +521,20 @@ class RiskManager:
         data_age_seconds: float | None,
         exchange: str | None,
         reduces_exposure: bool,
+        sizing: dict[str, Any] | None,
     ) -> dict[str, Any]:
         position = self.portfolio.get_position(symbol)
         current_daily_loss_amount = self.portfolio.current_daily_loss_amount(equity=account["equity"])
         current_daily_loss_pct = self.portfolio.current_daily_loss_pct(equity=account["equity"])
         has_tracked_position = position is not None
         has_tracked_long_position = self.portfolio.is_sellable_long_position(symbol)
-        return {
+        details = {
             "symbol": symbol,
             "side": side,
             "quantity": quantity,
             "price": price,
+            "rounded_price": sizing.get("rounded_price") if sizing else price,
+            "order_notional": float(self._round_money(self._decimal(quantity) * self._decimal(price))),
             "asset_class": asset_class.value,
             "strategy_name": strategy_name,
             "short_selling_enabled": self.settings.short_selling_enabled,
@@ -541,6 +565,16 @@ class RiskManager:
             "data_age_seconds": data_age_seconds,
             "exchange": exchange,
         }
+        if sizing:
+            details.update(sizing)
+            details.setdefault(
+                "max_allowed_notional",
+                sizing.get("effective_max_order_notional", self.settings.effective_max_position_notional),
+            )
+        else:
+            details["max_allowed_notional"] = self.settings.effective_max_position_notional
+            details["comparison_operator"] = ">"
+        return details
 
     def _remember_rejection(self, symbol: str, side: str, decision: RiskDecision) -> None:
         rejection_payload = {
@@ -554,3 +588,9 @@ class RiskManager:
         self._latest_rejection = rejection_payload
         self._recent_rejections.append(rejection_payload)
         self._recent_rejections = self._recent_rejections[-50:]
+
+    def _decimal(self, value: Any) -> Decimal:
+        return Decimal(str(value))
+
+    def _round_money(self, value: Decimal) -> Decimal:
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)

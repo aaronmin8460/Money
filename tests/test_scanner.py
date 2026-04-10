@@ -31,7 +31,7 @@ def test_scanner_ranks_multi_asset_opportunities(tmp_path) -> None:
 
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         scanner_limit_per_asset_class=10,
         min_avg_volume=1,

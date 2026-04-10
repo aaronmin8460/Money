@@ -9,7 +9,7 @@ from app.strategies.registry import build_strategy_registry
 
 
 def test_strategy_registry_routes_by_asset_class() -> None:
-    registry = build_strategy_registry(Settings(_env_file=None, broker_mode="paper"))
+    registry = build_strategy_registry(Settings(_env_file=None, broker_mode="mock"))
 
     equity_asset = AssetMetadata(symbol="AAPL", name="Apple", asset_class=AssetClass.EQUITY)
     crypto_asset = AssetMetadata(symbol="BTC/USD", name="Bitcoin", asset_class=AssetClass.CRYPTO)
@@ -24,7 +24,7 @@ def test_strategy_registry_routes_by_asset_class() -> None:
 
 
 def test_strategy_registry_selects_best_signal_for_crypto() -> None:
-    registry = build_strategy_registry(Settings(_env_file=None, broker_mode="paper"))
+    registry = build_strategy_registry(Settings(_env_file=None, broker_mode="mock"))
     asset = AssetMetadata(symbol="BTC/USD", name="Bitcoin", asset_class=AssetClass.CRYPTO)
     data = pd.DataFrame(
         {

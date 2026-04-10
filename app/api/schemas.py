@@ -30,6 +30,7 @@ class ResetLocalStateRequest(BaseModel):
 
 class BrokerStatus(BaseModel):
     broker_mode: str
+    broker_backend: str
     trading_enabled: bool
     has_credentials: bool
     safe_dry_run: bool

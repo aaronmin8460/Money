@@ -48,12 +48,16 @@ class AutoTrader:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._wake_event = threading.Event()
         self._state_lock = threading.RLock()
         self._last_run_time: Optional[datetime.datetime] = None
         self._last_scanned_symbols: List[str] = []
         self._last_signals: Dict[str, Any] = {}
         self._last_order: Optional[Dict[str, Any]] = None
         self._last_error: Optional[str] = None
+        self._last_run_result: Optional[Dict[str, Any]] = None
+        self._last_accepted_candidate: Optional[Dict[str, Any]] = None
+        self._last_rejected_candidate: Optional[Dict[str, Any]] = None
         self._last_ranked_candidates: List[Dict[str, Any]] = []
         self._last_regime_snapshot: Dict[str, Any] = {}
         self._last_scan_overview: Dict[str, Any] = {}
@@ -62,10 +66,11 @@ class AutoTrader:
     def start(self) -> bool:
         with self._state_lock:
             if self._running or (self._thread and self._thread.is_alive()):
-                logger.warning("Auto-trader is already running")
+                logger.info("Paper auto-trader start skipped because it is already running")
                 return False
 
             self._running = True
+            self._wake_event.clear()
             self._thread = threading.Thread(
                 target=self._run_loop,
                 daemon=True,
@@ -73,10 +78,24 @@ class AutoTrader:
             )
             self._thread.start()
 
-        logger.info("Auto-trader started")
+        logger.info(
+            "Paper auto-trader is running",
+            extra={
+                "broker_mode": self.settings.broker_mode,
+                "broker_backend": self.settings.broker_backend,
+                "active_strategy": self.settings.active_strategy,
+                "scan_interval_seconds": self.settings.scan_interval_seconds,
+                "trading_enabled": self.settings.trading_enabled,
+            },
+        )
         self._notify_system_event(
             event="Bot started",
             reason="background loop started",
+            details={
+                "broker_mode": self.settings.broker_mode,
+                "active_strategy": self.settings.active_strategy,
+                "scan_interval_seconds": self.settings.scan_interval_seconds,
+            },
         )
         return True
 
@@ -84,10 +103,11 @@ class AutoTrader:
         with self._state_lock:
             thread = self._thread
             if not self._running and not (thread and thread.is_alive()):
-                logger.warning("Auto-trader is not running")
+                logger.info("Paper auto-trader stop skipped because it is not running")
                 self._thread = None
                 return False
             self._running = False
+            self._wake_event.set()
 
         if thread:
             thread.join(timeout=5.0)
@@ -95,10 +115,20 @@ class AutoTrader:
         with self._state_lock:
             self._thread = None
 
-        logger.info("Auto-trader stopped")
+        logger.info(
+            "Paper auto-trader stopped",
+            extra={
+                "broker_mode": self.settings.broker_mode,
+                "active_strategy": self.settings.active_strategy,
+            },
+        )
         self._notify_system_event(
             event="Bot stopped",
             reason="background loop stopped",
+            details={
+                "broker_mode": self.settings.broker_mode,
+                "active_strategy": self.settings.active_strategy,
+            },
         )
         return True
 
@@ -108,12 +138,18 @@ class AutoTrader:
             with self._state_lock:
                 self._last_run_time = datetime.datetime.utcnow()
                 self._last_error = None
+                self._last_run_result = self._summarize_results("manual_run_now", results)
             return {"success": True, "results": results}
         except Exception as exc:
             error_msg = f"Run-now failed: {exc}"
             logger.error(error_msg)
             with self._state_lock:
                 self._last_error = error_msg
+                self._last_run_result = {
+                    "mode": "manual_run_now",
+                    "status": "error",
+                    "error": error_msg,
+                }
             self._notify_cycle_failure(exc, context={"mode": "run_now"})
             return {"success": False, "error": error_msg}
 
@@ -128,6 +164,7 @@ class AutoTrader:
                 result = self._build_execution_result(asset.symbol, signal, execution)
                 if execution.get("order"):
                     self._record_order(execution["order"])
+                self._track_execution_result(result)
                 self._persist_run([result], run_type="manual_symbol")
 
             with self._state_lock:
@@ -135,30 +172,48 @@ class AutoTrader:
                 self._last_error = None
                 self._last_scanned_symbols = [asset.symbol]
                 self._last_signals[asset.symbol] = signal.to_dict()
+                self._last_run_result = self._summarize_results("manual_symbol", [result])
             return result
         except Exception as exc:
             with self._state_lock:
                 self._last_error = f"Run-once failed for {asset.symbol}: {exc}"
+                self._last_run_result = {
+                    "mode": "manual_symbol",
+                    "status": "error",
+                    "symbol": asset.symbol,
+                    "error": self._last_error,
+                }
             raise
 
     def get_status(self) -> Dict[str, Any]:
+        latest_rejection = self.risk_manager.get_rejection_snapshot(limit=1)["latest"]
         with self._state_lock:
             return {
+                "enabled": self.settings.auto_trade_enabled,
                 "running": self._running,
+                "broker_mode": self.settings.broker_mode,
+                "broker_backend": self.settings.broker_backend,
+                "trading_enabled": self.settings.trading_enabled,
+                "active_strategy": self.settings.active_strategy,
+                "scan_interval_seconds": self.settings.scan_interval_seconds,
                 "last_run_time": self._last_run_time.isoformat() if self._last_run_time else None,
                 "active_symbols": self.settings.active_symbols,
-                "strategy_name": self.settings.strategy_name,
+                "strategy_name": self.settings.active_strategy,
                 "dry_run": not self.settings.trading_enabled,
                 "last_scanned_symbols": self._last_scanned_symbols,
                 "last_signals": self._last_signals,
                 "last_order": self._last_order,
                 "last_error": self._last_error,
+                "last_run_result": self._last_run_result,
+                "last_rejection": latest_rejection,
+                "last_rejection_reason": latest_rejection.get("reason") if latest_rejection else None,
+                "last_accepted_candidate": self._last_accepted_candidate,
+                "last_rejected_candidate": self._last_rejected_candidate,
                 "last_ranked_candidates": self._last_ranked_candidates,
                 "last_regime_snapshot": self._last_regime_snapshot,
                 "last_scan_overview": self._last_scan_overview,
                 "market_open": self._market_open,
-                "broker_mode": self.settings.broker_mode,
-                "trading_enabled": self.settings.trading_enabled,
+                "allow_extended_hours": self.settings.allow_extended_hours,
                 "open_positions_count": len(self.portfolio.positions),
             }
 
@@ -178,9 +233,15 @@ class AutoTrader:
                 logger.error(error_msg)
                 with self._state_lock:
                     self._last_error = error_msg
+                    self._last_run_result = {
+                        "mode": "background_loop",
+                        "status": "error",
+                        "error": error_msg,
+                    }
                 self._notify_cycle_failure(exc, context={"mode": "background_loop"})
 
-            time.sleep(self.settings.scan_interval_seconds)
+            if self._wake_event.wait(self.settings.scan_interval_seconds):
+                self._wake_event.clear()
 
     def _resolve_asset(
         self,
@@ -234,7 +295,11 @@ class AutoTrader:
             try:
                 # Fetch enough benchmark data for regime strategies
                 regime_long_sma = getattr(self.strategy, "regime_long_sma", 25)
-                benchmark_limit = 250 if self.settings.strategy_name == "regime_momentum_breakout" else max(30, regime_long_sma + 5)
+                benchmark_limit = (
+                    250
+                    if getattr(self.strategy, "name", "") == "equity_momentum_breakout"
+                    else max(30, regime_long_sma + 5)
+                )
                 benchmark_bars = self.market_data_service.fetch_bars(
                     regime_symbol,
                     asset_class=AssetClass.ETF,
@@ -271,8 +336,20 @@ class AutoTrader:
         )
 
     def _evaluate_asset(self, asset: AssetMetadata, prefer_primary_strategy: bool = False) -> TradeSignal:
+        if not self.strategy.supports(asset.asset_class):
+            return TradeSignal(
+                symbol=asset.symbol,
+                signal=Signal.HOLD,
+                asset_class=asset.asset_class,
+                strategy_name=self.strategy.name,
+                reason=(
+                    f"Active strategy '{self.settings.active_strategy}' does not support "
+                    f"asset class '{asset.asset_class.value}'."
+                ),
+            )
+
         # Fetch enough data for regime strategies (at least 250 bars for 200-day regime)
-        min_bars = 250 if self.settings.strategy_name == "regime_momentum_breakout" else 60
+        min_bars = 250 if getattr(self.strategy, "name", "") == "equity_momentum_breakout" else 60
         bars = self.market_data_service.fetch_bars(
             asset.symbol,
             asset_class=asset.asset_class,
@@ -280,30 +357,25 @@ class AutoTrader:
             limit=min_bars,
         )
         context = self._build_context(asset, bars)
-        legacy_signals: list[TradeSignal] = []
-        strategy_input: Any = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
-        if getattr(self.strategy, "name", "") == "ema_crossover":
-            strategy_input = bars
-        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
-            try:
-                legacy_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input, context=context))
-            except TypeError as exc:
-                if "unexpected keyword argument 'context'" not in str(exc):
-                    raise
-                legacy_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input))
-            except Exception as exc:
-                logger.warning("Legacy strategy evaluation failed for %s: %s", asset.symbol, exc)
-        if prefer_primary_strategy and legacy_signals:
-            candidate_signals = legacy_signals
-        else:
-            candidate_signals = legacy_signals + self.strategy_registry.generate_signals(asset, bars, context)
+        candidate_signals: list[TradeSignal] = []
+        strategy_input: Any = bars
+        if getattr(self.strategy, "name", "") == "equity_momentum_breakout":
+            strategy_input = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
+        try:
+            candidate_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input, context=context))
+        except TypeError as exc:
+            if "unexpected keyword argument 'context'" not in str(exc):
+                raise
+            candidate_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input))
+        except Exception as exc:
+            logger.warning("Strategy evaluation failed for %s: %s", asset.symbol, exc)
         if not candidate_signals:
             return TradeSignal(
                 symbol=asset.symbol,
                 signal=Signal.HOLD,
                 asset_class=asset.asset_class,
-                strategy_name="none",
-                reason="No strategy generated a signal.",
+                strategy_name=self.strategy.name,
+                reason=f"Active strategy '{self.settings.active_strategy}' generated no signal.",
             )
         signal = sorted(
             candidate_signals,
@@ -385,7 +457,7 @@ class AutoTrader:
             "Starting scan",
             extra={
                 "active_symbols": self.settings.active_symbols,
-                "strategy_name": self.settings.strategy_name,
+                "strategy_name": self.settings.active_strategy,
                 "dry_run": not self.settings.trading_enabled,
                 "universe_scan_enabled": self.settings.universe_scan_enabled,
             }
@@ -429,6 +501,7 @@ class AutoTrader:
                 results.append(action_result)
                 if execution.get("order"):
                     self._record_order(execution["order"])
+                self._track_execution_result(action_result)
 
             with self._state_lock:
                 self._last_run_time = now
@@ -436,6 +509,7 @@ class AutoTrader:
                 self._last_ranked_candidates = [item.to_dict() for item in scan_result.opportunities]
                 self._last_regime_snapshot = scan_result.regime_status
                 self._last_scan_overview = scan_result.to_dict()
+                self._last_run_result = self._summarize_results("auto", results)
 
             self._persist_run(results, run_type="auto")
             return results
@@ -461,6 +535,26 @@ class AutoTrader:
     def _record_order(self, order: Dict[str, Any]) -> None:
         with self._state_lock:
             self._last_order = order
+
+    def _track_execution_result(self, result: Dict[str, Any]) -> None:
+        with self._state_lock:
+            if result.get("action") == "rejected":
+                self._last_rejected_candidate = result
+            elif result.get("action") in {"submitted", "dry_run"}:
+                self._last_accepted_candidate = result
+
+    def _summarize_results(self, mode: str, results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        action_counts: Dict[str, int] = {}
+        for item in results:
+            action = str(item.get("action", "unknown"))
+            action_counts[action] = action_counts.get(action, 0) + 1
+        return {
+            "mode": mode,
+            "status": "success",
+            "results_count": len(results),
+            "action_counts": action_counts,
+            "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
 
     def _persist_run(self, results: List[Dict[str, Any]], run_type: str) -> None:
         try:
@@ -532,6 +626,9 @@ class AutoTrader:
             self._last_signals = {}
             self._last_order = None
             self._last_error = None
+            self._last_run_result = None
+            self._last_accepted_candidate = None
+            self._last_rejected_candidate = None
             self._last_ranked_candidates = []
             self._last_regime_snapshot = {}
             self._last_scan_overview = {}

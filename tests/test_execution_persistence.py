@@ -20,7 +20,7 @@ def test_execution_persists_signal_and_fill_records(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
     market_data = CSVMarketDataService(data_dir=tmp_path)
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     portfolio = Portfolio()
@@ -67,7 +67,7 @@ def test_sell_preserves_fractional_quantity(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
     market_data = CSVMarketDataService(data_dir=tmp_path)
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     portfolio = Portfolio()
@@ -114,7 +114,7 @@ def test_sell_without_tracked_long_is_rejected_in_execution_when_short_selling_d
 
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         short_selling_enabled=False,
         min_avg_volume=1,
@@ -148,3 +148,54 @@ def test_sell_without_tracked_long_is_rejected_in_execution_when_short_selling_d
     assert result["action"] == "rejected"
     assert result["risk"]["rule"] == "no_position_to_sell"
     assert result["proposal"]["quantity"] == 0.0
+
+
+def test_position_sizing_stays_under_buffered_hard_notional_cap(tmp_path) -> None:
+    (tmp_path / "AAPL.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,100,101,99,100,10000\n"
+        "2024-01-02,100,101,99,100,10000\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        max_position_notional=10_000.0,
+        position_notional_buffer_pct=0.995,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            signal=Signal.BUY,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            price=100.0,
+            stop_price=95.0,
+            reason="buffer sizing test",
+        )
+    )
+
+    proposal = result["proposal"]
+    notional = proposal["quantity"] * proposal["price"]
+    assert result["action"] == "dry_run"
+    assert proposal["quantity"] == 99.0
+    assert notional < settings.max_position_notional
+    assert notional <= settings.effective_max_position_notional

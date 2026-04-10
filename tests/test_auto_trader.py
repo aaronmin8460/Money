@@ -6,7 +6,7 @@ from app.services.auto_trader import AutoTrader
 def test_auto_trader_run_now_returns_result() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         default_symbols=["AAPL", "SPY"],
         max_positions=2,
@@ -23,7 +23,7 @@ def test_auto_trader_run_now_returns_result() -> None:
 def test_auto_trader_prevents_duplicate_start() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         default_symbols=["AAPL"],
         max_positions=1,
@@ -38,7 +38,7 @@ def test_auto_trader_prevents_duplicate_start() -> None:
 def test_auto_trader_start_stop_send_notifications(monkeypatch) -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",

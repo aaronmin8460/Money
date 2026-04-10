@@ -14,8 +14,8 @@ from app.services.broker import BrokerInterface, create_broker
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, MarketDataService
 from app.services.market_overview import MarketOverviewService
 from app.services.scanner import ScannerService
+from app.strategies.base import BaseStrategy
 from app.strategies.registry import StrategyRegistry, build_strategy_registry
-from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
 
 if TYPE_CHECKING:
     from app.services.auto_trader import AutoTrader
@@ -35,7 +35,7 @@ class RuntimeContainer:
     market_overview: MarketOverviewService
     strategy_registry: StrategyRegistry
     execution_service: ExecutionService
-    strategy: RegimeMomentumBreakoutStrategy
+    strategy: BaseStrategy
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _auto_trader: AutoTrader | None = field(default=None, init=False, repr=False)
 
@@ -96,13 +96,7 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
     scanner = ScannerService(asset_catalog=asset_catalog, market_data_service=market_data_service, settings=settings)
     market_overview = MarketOverviewService(scanner)
     strategy_registry = build_strategy_registry(settings)
-    if settings.strategy_name == "regime_momentum_breakout":
-        strategy = RegimeMomentumBreakoutStrategy()
-    elif settings.strategy_name == "ema_crossover":
-        from app.strategies.ema_crossover import EMACrossoverStrategy
-        strategy = EMACrossoverStrategy(short_selling_enabled=settings.short_selling_enabled)
-    else:
-        raise ValueError(f"Unknown strategy: {settings.strategy_name}")
+    strategy = strategy_registry.get(settings.active_strategy)
     execution_service = ExecutionService(
         broker=broker,
         portfolio=portfolio,
@@ -125,6 +119,16 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         strategy=strategy,
     )
     runtime.sync_with_broker()
+    logger.info(
+        "Runtime initialized",
+        extra={
+            "broker_mode": settings.broker_mode,
+            "broker_backend": settings.broker_backend,
+            "active_strategy": settings.active_strategy,
+            "trading_enabled": settings.trading_enabled,
+            "auto_trade_enabled": settings.auto_trade_enabled,
+        },
+    )
     return runtime
 
 

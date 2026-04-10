@@ -21,7 +21,7 @@ from app.strategies.base import Signal, TradeSignal
 def build_execution_service(**setting_overrides: object) -> tuple[ExecutionService, PaperBroker]:
     values = {
         "_env_file": None,
-        "broker_mode": "paper",
+        "broker_mode": "mock",
         "trading_enabled": True,
         "discord_notifications_enabled": True,
         "discord_webhook_url": "https://discord.com/api/webhooks/test-id/test-token",
@@ -66,7 +66,7 @@ def build_response(status_code: int = 204, text: str = "") -> Mock:
 def test_build_system_notification_payload_start_stop_is_compact() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         auto_trade_enabled=True,
         discord_notifications_enabled=True,
@@ -87,6 +87,7 @@ def test_build_system_notification_payload_start_stop_is_compact() -> None:
     assert embed["description"] == (
         "Mode: PAPER\n"
         "Auto-trade: enabled\n"
+        "Strategy: equity_momentum_breakout\n"
         "Time: 2026-04-10 13:55:57 UTC"
     )
 
@@ -94,7 +95,7 @@ def test_build_system_notification_payload_start_stop_is_compact() -> None:
 def test_build_trade_notification_payload_is_compact() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
@@ -103,7 +104,7 @@ def test_build_trade_notification_payload_is_compact() -> None:
         symbol="BTC/USD",
         signal=Signal.BUY,
         asset_class=AssetClass.CRYPTO,
-        strategy_name="regime_momentum_breakout",
+        strategy_name="equity_momentum_breakout",
         price=65000.0,
         reason="Momentum breakout",
     )
@@ -140,7 +141,8 @@ def test_build_trade_notification_payload_is_compact() -> None:
         "Momentum breakout\n\n"
         "Qty: 0.001\n"
         "Price: $65,000.00\n"
-        "Strategy: regime_momentum_breakout\n"
+        "Active Strategy: equity_momentum_breakout\n"
+        "Strategy: equity_momentum_breakout\n"
         "Status: FILLED\n"
         "Order ID: order-123\n"
         "Time: 2026-04-10 14:05:00 UTC"
@@ -172,6 +174,7 @@ def test_submitted_trade_sends_embed_webhook_without_duplicate_content(mock_post
     assert embed["title"] == "🟢 PAPER | BUY AAPL submitted"
     assert embed["description"].startswith("test notification\n\nQty: ")
     assert "Price: $150.00" in embed["description"]
+    assert "Active Strategy: equity_momentum_breakout" in embed["description"]
     assert "Strategy: test_strategy" in embed["description"]
 
 
@@ -242,7 +245,7 @@ def test_non_2xx_webhook_logs_sanitized_target(mock_post: Mock, caplog) -> None:
     mock_post.return_value = build_response(status_code=400, text="bad webhook request")
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/1234567890/super-secret-token",

@@ -10,7 +10,7 @@ from app.config.settings import Settings
 def test_multi_asset_endpoints_return_data() -> None:
     settings_module._settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=False,
         auto_trade_enabled=False,
         default_symbols=["AAPL", "BTC/USD"],

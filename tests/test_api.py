@@ -17,7 +17,7 @@ routes_admin_module = importlib.import_module("app.api.routes_admin")
 def build_settings(**overrides: object) -> Settings:
     values = {
         "_env_file": None,
-        "broker_mode": "paper",
+        "broker_mode": "mock",
         "trading_enabled": False,
         "auto_trade_enabled": False,
         "default_symbols": ["AAPL", "SPY"],
@@ -36,7 +36,8 @@ def test_broker_status_route() -> None:
         response = client.get("/broker/status")
     assert response.status_code == 200
     data = response.json()
-    assert data["broker_mode"] == "paper"
+    assert data["broker_mode"] == "mock"
+    assert data["broker_backend"] == "local_mock"
 
 
 def test_broker_account_route() -> None:
@@ -87,13 +88,13 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     signals = strategy_signals_response.json()["signals"]
     auto_status = auto_status_response.json()
 
-    assert account["cash"] == 90000.0
+    assert account["cash"] == 90100.0
     assert account["positions"] == 1
     assert len(positions) == 1
     assert positions[0]["symbol"] == "AAPL"
     assert len(orders) == 1
     assert orders[0]["status"] == "FILLED"
-    assert risk["cash"] == 90000.0
+    assert risk["cash"] == 90100.0
     assert risk["equity"] == 100000.0
     assert risk["open_positions_count"] == 1
     assert risk["trading_enabled"] is True
@@ -101,6 +102,7 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     assert signals["AAPL"]["signal"] == "BUY"
     assert auto_status["last_scanned_symbols"] == ["AAPL"]
     assert auto_status["open_positions_count"] == 1
+    assert auto_status["active_strategy"] == "equity_momentum_breakout"
     assert auto_status["last_order"]["symbol"] == "AAPL"
 
 
@@ -113,6 +115,8 @@ def test_auto_trade_enabled_starts_on_startup() -> None:
 
     assert status_response.status_code == 200
     assert status_response.json()["running"] is True
+    assert status_response.json()["enabled"] is True
+    assert status_response.json()["active_strategy"] == "equity_momentum_breakout"
     assert start_response.status_code == 200
     assert "already running" in start_response.json()["message"].lower()
     assert stop_response.status_code == 200
@@ -202,6 +206,8 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
         runtime.risk_manager.guard_against("TSLA", "SELL", 1.0, 250.0, asset_class=AssetClass.EQUITY)
 
         risk_response = client.get("/diagnostics/risk")
+        auto_response = client.get("/diagnostics/auto")
+        strategy_response = client.get("/diagnostics/strategy")
         portfolio_response = client.get("/diagnostics/portfolio")
         rejections_response = client.get("/diagnostics/rejections/latest")
 
@@ -211,6 +217,20 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert "current_daily_loss_pct" in risk_data
     assert "active_cooldowns" in risk_data
     assert "latest_risk_events" in risk_data
+    assert risk_data["active_strategy"] == "equity_momentum_breakout"
+
+    assert auto_response.status_code == 200
+    auto_data = auto_response.json()
+    assert auto_data["broker_mode"] == "mock"
+    assert auto_data["broker_backend"] == "local_mock"
+    assert auto_data["active_strategy"] == "equity_momentum_breakout"
+    assert "latest_signals" in auto_data
+    assert "latest_rejected_order_candidate" in auto_data
+
+    assert strategy_response.status_code == 200
+    strategy_data = strategy_response.json()
+    assert strategy_data["active_strategy"] == "equity_momentum_breakout"
+    assert "available_strategies" in strategy_data
 
     assert portfolio_response.status_code == 200
     portfolio_data = portfolio_response.json()

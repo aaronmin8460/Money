@@ -47,7 +47,7 @@ def reset_local_state(
     if resolved_options.close_positions:
         closed_positions = runtime.broker.close_all_positions()
 
-    if settings.is_paper_mode and hasattr(runtime.broker, "reset_state"):
+    if settings.is_mock_mode and hasattr(runtime.broker, "reset_state"):
         runtime.broker.reset_state(
             clear_orders=True,
             clear_positions=resolved_options.close_positions,

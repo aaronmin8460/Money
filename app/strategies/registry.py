@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import pandas as pd
 
@@ -14,21 +15,48 @@ from app.strategies.mean_reversion import MeanReversionScannerStrategy
 from app.strategies.options_liquidity import OptionsLiquidityStrategy
 from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
 
+StrategyFactory = Callable[[], object]
+
+STRATEGY_NAME_ALIASES = {
+    "regime_momentum_breakout": "equity_momentum_breakout",
+}
+
 
 @dataclass
 class StrategyRegistry:
     settings: Settings
 
     def __post_init__(self) -> None:
-        self._strategies = [
-            RegimeMomentumBreakoutStrategy(),
-            EquityTrendPullbackStrategy(),
-            CryptoMomentumTrendStrategy(),
-            MeanReversionScannerStrategy(),
-            EMACrossoverStrategy(short_selling_enabled=self.settings.short_selling_enabled),
-        ]
+        self._strategy_factories: dict[str, StrategyFactory] = {
+            "equity_momentum_breakout": RegimeMomentumBreakoutStrategy,
+            "equity_trend_pullback": EquityTrendPullbackStrategy,
+            "crypto_momentum_trend": CryptoMomentumTrendStrategy,
+            "mean_reversion_scanner": MeanReversionScannerStrategy,
+            "ema_crossover": lambda: EMACrossoverStrategy(
+                short_selling_enabled=self.settings.short_selling_enabled
+            ),
+        }
         if self.settings.option_trading_enabled:
-            self._strategies.append(OptionsLiquidityStrategy())
+            self._strategy_factories["options_liquidity"] = OptionsLiquidityStrategy
+        self._strategies = {
+            name: factory()
+            for name, factory in self._strategy_factories.items()
+        }
+
+    def resolve_name(self, name: str | None) -> str:
+        candidate = (name or "").strip().lower()
+        return STRATEGY_NAME_ALIASES.get(candidate, candidate)
+
+    def get(self, name: str | None) -> object:
+        resolved_name = self.resolve_name(name)
+        strategy = self._strategies.get(resolved_name)
+        if strategy is None:
+            available = ", ".join(sorted(self._strategies))
+            raise ValueError(f"Unknown strategy '{name}'. Available strategies: {available}")
+        return strategy
+
+    def list_available(self) -> list[object]:
+        return [self._strategies[name] for name in sorted(self._strategies)]
 
     def list_for_asset(self, asset: AssetMetadata) -> list[object]:
         enabled_switches = {
@@ -37,7 +65,7 @@ class StrategyRegistry:
         }
         return [
             strategy
-            for strategy in self._strategies
+            for strategy in self.list_available()
             if strategy.supports(asset.asset_class)
             and enabled_switches.get(strategy.name.lower(), True)
         ]

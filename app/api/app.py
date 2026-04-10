@@ -31,6 +31,16 @@ def on_startup() -> None:
     init_db()
     logger = get_logger("api.startup")
     runtime = get_runtime(settings)
+    logger.info(
+        "Application startup configuration",
+        extra={
+            "broker_mode": settings.broker_mode,
+            "broker_backend": settings.broker_backend,
+            "active_strategy": settings.active_strategy,
+            "trading_enabled": settings.trading_enabled,
+            "auto_trade_enabled": settings.auto_trade_enabled,
+        },
+    )
     notifier = get_discord_notifier(settings)
     notifier.send_system_notification(
         event="Bot started",
@@ -41,9 +51,21 @@ def on_startup() -> None:
         started = runtime.get_auto_trader().start()
         logger.info(
             "AUTO_TRADE_ENABLED processed on startup",
-            extra={"started": started, "broker_mode": settings.broker_mode},
+            extra={
+                "started": started,
+                "broker_mode": settings.broker_mode,
+                "broker_backend": settings.broker_backend,
+                "active_strategy": settings.active_strategy,
+            },
         )
-    logger.info("API startup complete", extra={"broker_mode": settings.broker_mode})
+    logger.info(
+        "API startup complete",
+        extra={
+            "broker_mode": settings.broker_mode,
+            "broker_backend": settings.broker_backend,
+            "active_strategy": settings.active_strategy,
+        },
+    )
 
 
 @app.on_event("shutdown")
@@ -53,6 +75,15 @@ def on_shutdown() -> None:
     try:
         close_runtime()
     finally:
+        logger = get_logger("api.shutdown")
+        logger.info(
+            "Application shutdown complete",
+            extra={
+                "broker_mode": settings.broker_mode,
+                "broker_backend": settings.broker_backend,
+                "active_strategy": settings.active_strategy,
+            },
+        )
         notifier.send_system_notification(
             event="Bot stopped",
             reason="application shutdown completed",

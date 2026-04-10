@@ -14,7 +14,7 @@ from app.strategies.base import Signal, TradeSignal
 def build_settings(**overrides: object) -> Settings:
     values = {
         "_env_file": None,
-        "broker_mode": "paper",
+        "broker_mode": "mock",
         "trading_enabled": True,
         "auto_trade_enabled": False,
         "default_symbols": ["AAPL"],

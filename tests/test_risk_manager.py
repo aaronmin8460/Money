@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 
 from app.config.settings import Settings
+from app.domain.models import AssetClass
 from app.portfolio.portfolio import Portfolio, Position
 from app.risk.risk_manager import RiskManager
 
@@ -42,7 +43,7 @@ class FakeBroker:
 def test_risk_manager_blocks_stop_based_risk_when_it_exceeds_budget() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         max_risk_per_trade=0.01,
         max_position_notional=100000.0,
@@ -59,7 +60,7 @@ def test_risk_manager_blocks_stop_based_risk_when_it_exceeds_budget() -> None:
 def test_risk_manager_distinguishes_notional_limit_from_stop_risk() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         max_risk_per_trade=0.01,
         max_position_notional=10000.0,
@@ -78,7 +79,7 @@ def test_risk_manager_distinguishes_notional_limit_from_stop_risk() -> None:
 def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         max_daily_loss=100_000.0,
         max_daily_loss_pct=0.02,
@@ -99,7 +100,7 @@ def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
 def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduced() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         max_daily_loss=1_000.0,
         max_daily_loss_pct=0.02,
@@ -127,7 +128,7 @@ def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduc
 def test_sell_without_tracked_long_position_is_rejected_when_short_selling_disabled() -> None:
     settings = Settings(
         _env_file=None,
-        broker_mode="paper",
+        broker_mode="mock",
         trading_enabled=True,
         short_selling_enabled=False,
     )
@@ -140,3 +141,68 @@ def test_sell_without_tracked_long_position_is_rejected_when_short_selling_disab
     assert decision.rule == "no_position_to_sell"
     assert decision.details["has_tracked_position"] is False
     assert decision.details["tracked_position_sellable"] is False
+
+
+def test_order_under_buffered_threshold_is_accepted() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        max_position_notional=10_000.0,
+        position_notional_buffer_pct=0.995,
+    )
+    manager = RiskManager(Portfolio(), settings=settings, broker=FakeBroker())
+
+    decision = manager.evaluate_order(
+        "QQQ",
+        "BUY",
+        99.5,
+        100.0,
+        asset_class=AssetClass.ETF,
+        sizing={
+            "raw_calculated_qty": 99.5,
+            "raw_price": 100.0,
+            "raw_notional_before_rounding": 9950.0,
+            "rounded_notional": 9950.0,
+            "effective_max_order_notional": 9950.0,
+            "hard_max_position_notional": 10000.0,
+            "comparison_operator": ">",
+        },
+    )
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
+
+
+def test_order_above_hard_cap_is_rejected_with_sizing_details() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        max_position_notional=10_000.0,
+        position_notional_buffer_pct=0.995,
+    )
+    manager = RiskManager(Portfolio(), settings=settings, broker=FakeBroker())
+
+    decision = manager.evaluate_order(
+        "AAPL",
+        "BUY",
+        100.01,
+        100.0,
+        asset_class=AssetClass.EQUITY,
+        sizing={
+            "raw_calculated_qty": 100.01,
+            "raw_price": 100.0,
+            "raw_notional_before_rounding": 10001.0,
+            "rounded_notional": 10001.0,
+            "effective_max_order_notional": 9950.0,
+            "hard_max_position_notional": 10000.0,
+            "comparison_operator": ">",
+        },
+    )
+
+    assert decision.approved is False
+    assert decision.rule == "position_notional"
+    assert "comparison '>'" in decision.reason
+    assert decision.details["raw_calculated_qty"] == 100.01
+    assert decision.details["rounded_notional"] == 10001.0
