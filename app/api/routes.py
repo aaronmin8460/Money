@@ -13,21 +13,14 @@ from app.api.schemas import (
     RunOnceResult,
 )
 from app.config.settings import get_settings
-from app.data.historical import load_csv_data
-from app.execution.execution_service import ExecutionService
 from app.monitoring.logger import get_logger
-from app.portfolio.portfolio import Portfolio
-from app.risk.risk_manager import RiskManager
 from app.services.backtest import run_backtest
-from app.services.auto_trader import get_auto_trader
-from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
 from app.services.broker import (
     BrokerAuthError,
     BrokerConnectionError,
     BrokerUpstreamError,
-    create_broker,
 )
-from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
+from app.services.runtime import get_runtime
 
 logger = get_logger("api")
 router = APIRouter()
@@ -45,6 +38,7 @@ def config() -> dict[str, Any]:
         "app_env": settings.app_env,
         "broker_mode": settings.broker_mode,
         "trading_enabled": settings.trading_enabled,
+        "auto_trade_enabled": settings.auto_trade_enabled,
         "default_symbols": settings.default_symbols,
         "max_risk_per_trade": settings.max_risk_per_trade,
         "max_daily_loss_pct": settings.max_daily_loss_pct,
@@ -67,10 +61,10 @@ def broker_status() -> BrokerStatus:
 
 @router.get("/broker/account", response_model=AccountSummary)
 def broker_account() -> AccountSummary:
-    settings = get_settings()
+    runtime = get_runtime()
     try:
-        broker = create_broker(settings)
-        return broker.get_account()
+        runtime.sync_with_broker()
+        return runtime.broker.get_account()
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except BrokerAuthError as exc:
@@ -83,16 +77,15 @@ def broker_account() -> AccountSummary:
 
 @router.get("/positions")
 def positions() -> list[dict[str, Any]]:
-    settings = get_settings()
-    broker = create_broker(settings)
-    return broker.get_positions()
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    return runtime.broker.get_positions()
 
 
 @router.get("/orders")
 def orders() -> list[dict[str, Any]]:
-    settings = get_settings()
-    broker = create_broker(settings)
-    return broker.list_orders()
+    runtime = get_runtime()
+    return runtime.broker.list_orders()
 
 
 @router.get("/trades")
@@ -102,62 +95,32 @@ def trades() -> list[Any]:
 
 @router.get("/risk")
 def risk() -> dict[str, Any]:
-    portfolio = Portfolio()
-    risk_manager = RiskManager(portfolio)
-    return {
-        "risk_events": portfolio.risk_events,
-        "allowed": bool(risk_manager.settings.trading_enabled),
-    }
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    return runtime.risk_manager.get_runtime_snapshot()
 
 
 @router.post("/run-once", response_model=RunOnceResult)
 def run_once(request: RunOnceRequest = Body(...)) -> dict[str, Any]:
-    settings = get_settings()
+    runtime = get_runtime()
+    settings = runtime.settings
+    symbol = request.symbol or (settings.default_symbols[0] if settings.default_symbols else "AAPL")
+    trader = runtime.get_auto_trader()
     try:
-        broker = create_broker(settings)
+        result = trader.run_symbol_now(symbol)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except BrokerAuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    except BrokerUpstreamError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except BrokerConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Run-once failed for {symbol}: {exc}")
 
-    symbol = request.symbol or (settings.default_symbols[0] if settings.default_symbols else "AAPL")
-    portfolio = Portfolio()
-    risk_manager = RiskManager(portfolio)
-    strategy = RegimeMomentumBreakoutStrategy()
-    market_data_service = (
-        AlpacaMarketDataService(settings)
-        if settings.is_alpaca_mode
-        else CSVMarketDataService()
-    )
-    exec_service = ExecutionService(
-        broker=broker,
-        portfolio=portfolio,
-        risk_manager=risk_manager,
-        dry_run=not settings.trading_enabled,
-        market_data_service=market_data_service,
-    )
-
-    symbol_data: Any | None = None
-    if settings.is_alpaca_mode:
-        try:
-            symbol_data = market_data_service.fetch_bars(symbol, limit=50)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to load Alpaca market data for {symbol}: {exc}",
-            )
-    else:
-        sample_path = Path("data/sample.csv")
-        fallback_path = Path("data/sample-fallback.csv")
-        if sample_path.exists():
-            symbol_data = load_csv_data(sample_path)
-        elif fallback_path.exists():
-            symbol_data = load_csv_data(fallback_path)
-        else:
-            raise HTTPException(
-                status_code=404,
-                detail="No local sample CSV data available for run-once.",
-            )
-
-    result = exec_service.run_once(symbol, strategy, symbol_data)
     logger.info("Run once completed", extra={"result": result})
     return result
 
@@ -180,13 +143,13 @@ def backtest(request: BacktestRequest) -> dict[str, Any]:
 
 @router.get("/auto/status")
 def auto_status() -> dict[str, Any]:
-    trader = get_auto_trader()
+    trader = get_runtime().get_auto_trader()
     return trader.get_status()
 
 
 @router.post("/auto/start")
 def auto_start() -> dict[str, str]:
-    trader = get_auto_trader()
+    trader = get_runtime().get_auto_trader()
     if trader.start():
         return {"message": "Auto-trader started"}
     else:
@@ -195,7 +158,7 @@ def auto_start() -> dict[str, str]:
 
 @router.post("/auto/stop")
 def auto_stop() -> dict[str, str]:
-    trader = get_auto_trader()
+    trader = get_runtime().get_auto_trader()
     if trader.stop():
         return {"message": "Auto-trader stopped"}
     else:
@@ -204,19 +167,18 @@ def auto_stop() -> dict[str, str]:
 
 @router.post("/auto/run-now")
 def auto_run_now() -> dict[str, Any]:
-    trader = get_auto_trader()
+    trader = get_runtime().get_auto_trader()
     return trader.run_now()
 
 
 @router.get("/strategy/signals")
 def strategy_signals() -> dict[str, Any]:
-    trader = get_auto_trader()
+    trader = get_runtime().get_auto_trader()
     return {"signals": trader._last_signals}
 
 
 @router.get("/strategy/positions")
 def strategy_positions() -> dict[str, Any]:
-    settings = get_settings()
-    broker = create_broker(settings)
-    positions = broker.get_positions()
-    return {"positions": positions}
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    return {"positions": runtime.portfolio.positions_snapshot()}

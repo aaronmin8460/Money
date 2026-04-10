@@ -12,25 +12,25 @@ from app.strategies.base import Signal, TradeSignal
 
 def test_alpaca_broker_requires_credentials() -> None:
     with pytest.raises(ValueError, match="ALPACA_API_KEY"):
-        settings = Settings(broker_mode="alpaca", alpaca_api_key=None, alpaca_secret_key=None, trading_enabled=False)
+        settings = Settings(_env_file=None, broker_mode="alpaca", alpaca_api_key=None, alpaca_secret_key=None, trading_enabled=False)
         create_broker(settings)
 
 
 def test_alpaca_market_data_requires_credentials() -> None:
     with pytest.raises(ValueError, match="ALPACA_API_KEY"):
-        settings = Settings(broker_mode="alpaca", alpaca_api_key=None, alpaca_secret_key=None, trading_enabled=False)
+        settings = Settings(_env_file=None, broker_mode="alpaca", alpaca_api_key=None, alpaca_secret_key=None, trading_enabled=False)
         AlpacaMarketDataService(settings)
 
 
 def test_paper_broker_status_safe_fallback() -> None:
-    settings = Settings(broker_mode="paper", trading_enabled=False)
+    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False)
     broker = create_broker(settings)
     assert isinstance(broker, PaperBroker)
     assert broker.settings.broker_mode == "paper"
 
 
 def test_run_once_dry_run_behavior() -> None:
-    settings = Settings(broker_mode="paper", trading_enabled=False)
+    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=False)
     broker = create_broker(settings)
     portfolio = Portfolio()
     risk_manager = RiskManager(portfolio)
@@ -72,6 +72,7 @@ def test_alpaca_broker_get_account_success(mock_request) -> None:
     mock_request.side_effect = mock_request_side_effect
     
     settings = Settings(
+        _env_file=None,
         broker_mode="alpaca",
         alpaca_api_key="test_key",
         alpaca_secret_key="test_secret",
@@ -106,6 +107,7 @@ def test_alpaca_broker_get_account_positions_fail_gracefully(mock_request) -> No
     mock_request.side_effect = mock_request_side_effect
     
     settings = Settings(
+        _env_file=None,
         broker_mode="alpaca",
         alpaca_api_key="test_key",
         alpaca_secret_key="test_secret",
@@ -125,6 +127,7 @@ def test_alpaca_broker_auth_error(mock_request) -> None:
     mock_request.side_effect = BrokerAuthError("Auth failed")
     
     settings = Settings(
+        _env_file=None,
         broker_mode="alpaca",
         alpaca_api_key="test_key",
         alpaca_secret_key="test_secret",

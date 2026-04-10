@@ -17,6 +17,7 @@ class TestAlpacaMarketDataService:
         """Create test settings with Alpaca credentials (no env file)."""
         # Create settings with explicit test values to avoid .env leakage
         s = Settings(
+            _env_file=None,
             alpaca_api_key="test_key",
             alpaca_secret_key="test_secret",
             alpaca_data_base_url="https://data.alpaca.markets",
@@ -221,13 +222,40 @@ class TestCSVMarketDataService:
     """Test suite for CSVMarketDataService."""
 
     def test_csv_service_fetch_bars(self):
-        """Verify CSVMarketDataService behavior is unchanged."""
+        """Verify CSVMarketDataService loads symbol-specific files."""
         service = CSVMarketDataService()
         df = service.fetch_bars("AAPL", limit=10)
         
         # Should return a DataFrame with expected columns
         assert "Date" in df.columns or "Close" in df.columns
         assert len(df) <= 10
+
+    def test_csv_service_uses_symbol_specific_files(self, tmp_path):
+        aapl_path = tmp_path / "AAPL.csv"
+        spy_path = tmp_path / "SPY.csv"
+        aapl_path.write_text(
+            "Date,Open,High,Low,Close,Volume\n2024-01-01,1,2,0,10,100\n",
+            encoding="utf-8",
+        )
+        spy_path.write_text(
+            "Date,Open,High,Low,Close,Volume\n2024-01-01,1,2,0,20,100\n",
+            encoding="utf-8",
+        )
+
+        service = CSVMarketDataService(data_dir=tmp_path)
+
+        aapl = service.fetch_bars("AAPL", limit=1)
+        spy = service.fetch_bars("SPY", limit=1)
+
+        assert float(aapl.iloc[-1]["Close"]) == 10.0
+        assert float(spy.iloc[-1]["Close"]) == 20.0
+        assert service.get_latest_price("SPY") == 20.0
+
+    def test_csv_service_rejects_unsupported_symbols(self, tmp_path):
+        service = CSVMarketDataService(data_dir=tmp_path)
+
+        with pytest.raises(FileNotFoundError, match="MSFT"):
+            service.fetch_bars("MSFT", limit=1)
 
 
 class TestMarketDataProtocol:
@@ -242,9 +270,11 @@ class TestMarketDataProtocol:
 
     def test_alpaca_service_implements_protocol(self):
         """Verify AlpacaMarketDataService implements the protocol."""
-        settings = Settings()
-        settings.alpaca_api_key = "test"
-        settings.alpaca_secret_key = "test"
+        settings = Settings(
+            _env_file=None,
+            alpaca_api_key="test",
+            alpaca_secret_key="test",
+        )
         service = AlpacaMarketDataService(settings)
         assert hasattr(service, "fetch_bars")
         assert hasattr(service, "get_latest_price")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.config.settings import get_settings
@@ -24,7 +24,7 @@ class ExecutionService:
     portfolio: Portfolio
     risk_manager: RiskManager
     dry_run: bool = True
-    market_data_service: CSVMarketDataService = CSVMarketDataService()
+    market_data_service: CSVMarketDataService = field(default_factory=CSVMarketDataService)
 
     def process_signal(self, signal: TradeSignal) -> dict[str, Any]:
         settings = get_settings()
@@ -72,7 +72,13 @@ class ExecutionService:
                 "order": None,
             }
 
-        decision = self.risk_manager.guard_against(order.symbol, order.side, order.quantity, order.price)
+        decision = self.risk_manager.guard_against(
+            order.symbol,
+            order.side,
+            order.quantity,
+            order.price,
+            stop_price=signal.stop_price,
+        )
         proposal = {
             "symbol": order.symbol,
             "side": order.side,

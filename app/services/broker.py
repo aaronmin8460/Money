@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import datetime
+import threading
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from app.config.settings import Settings, get_settings
+from app.services.market_data import CSVMarketDataService
 
 
 class BrokerError(Exception):
@@ -72,93 +74,138 @@ class BrokerInterface:
     def is_market_open(self) -> bool:
         raise NotImplementedError
 
+    def close(self) -> None:
+        return None
+
 
 class PaperBroker(BrokerInterface):
     """Simple in-memory broker for paper trading and testing."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        market_data_service: CSVMarketDataService | None = None,
+    ):
         self.settings = settings or get_settings()
+        self.market_data_service = market_data_service or CSVMarketDataService()
         self.cash = 100_000.0
         self.positions: dict[str, dict[str, Any]] = {}
         self.orders: list[dict[str, Any]] = []
+        self._lock = threading.RLock()
 
     def get_account(self) -> BrokerAccount:
-        equity = self.calculate_equity()
-        return BrokerAccount(
-            cash=self.cash,
-            equity=equity,
-            positions=len(self.positions),
-            buying_power=self.cash,
-            mode=self.settings.broker_mode,
-            trading_enabled=self.settings.trading_enabled,
-        )
+        with self._lock:
+            equity = self.calculate_equity()
+            return BrokerAccount(
+                cash=self.cash,
+                equity=equity,
+                positions=len(self.positions),
+                buying_power=self.cash,
+                mode=self.settings.broker_mode,
+                trading_enabled=self.settings.trading_enabled,
+            )
 
     def get_positions(self) -> list[dict[str, Any]]:
-        return [pos.copy() for pos in self.positions.values()]
+        with self._lock:
+            return [
+                {
+                    **pos.copy(),
+                    "qty": pos["quantity"],
+                    "avg_entry_price": pos["entry_price"],
+                    "market_value": pos["quantity"] * pos["current_price"],
+                }
+                for pos in self.positions.values()
+            ]
 
     def submit_order(self, order: OrderRequest) -> dict[str, Any]:
         if not self.settings.is_paper_mode:
             raise RuntimeError("PaperBroker only supports paper mode.")
 
-        price = order.price or self.get_latest_price(order.symbol)
-        filled_qty = order.quantity
-        self.orders.append(
-            {
-                "symbol": order.symbol,
-                "side": order.side,
-                "quantity": filled_qty,
-                "price": price,
-                "status": "FILLED" if not order.is_dry_run else "DRY_RUN",
-                "executed_at": datetime.datetime.utcnow().isoformat(),
-                "is_dry_run": order.is_dry_run,
-            }
-        )
+        with self._lock:
+            price = order.price or self.get_latest_price(order.symbol)
+            filled_qty = order.quantity
+            self.orders.append(
+                {
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "quantity": filled_qty,
+                    "price": price,
+                    "status": "FILLED" if not order.is_dry_run else "DRY_RUN",
+                    "executed_at": datetime.datetime.utcnow().isoformat(),
+                    "is_dry_run": order.is_dry_run,
+                }
+            )
 
-        if not order.is_dry_run:
-            self.apply_trade(order.symbol, order.side, filled_qty, price)
+            if not order.is_dry_run:
+                self.apply_trade(order.symbol, order.side, filled_qty, price)
 
-        return self.orders[-1]
+            return self.orders[-1]
 
     def is_market_open(self) -> bool:
         return True
 
     def apply_trade(self, symbol: str, side: str, quantity: float, price: float) -> None:
-        if side.upper() == "BUY":
+        normalized_side = side.value if hasattr(side, "value") else str(side)
+        if normalized_side.upper() == "BUY":
+            existing = self.positions.get(symbol)
+            if existing:
+                total_quantity = existing["quantity"] + quantity
+                average_entry_price = (
+                    (existing["quantity"] * existing["entry_price"]) + (quantity * price)
+                ) / total_quantity
+            else:
+                total_quantity = quantity
+                average_entry_price = price
+
             self.cash -= quantity * price
             self.positions[symbol] = {
                 "symbol": symbol,
-                "quantity": quantity,
-                "entry_price": price,
-                "side": side,
+                "quantity": total_quantity,
+                "entry_price": average_entry_price,
+                "side": normalized_side,
                 "current_price": price,
             }
-        else:
-            if symbol in self.positions:
-                self.cash += quantity * price
-                self.positions.pop(symbol, None)
+            return
 
-    def close_position(self, symbol: str) -> dict[str, Any]:
         if symbol not in self.positions:
-            return {"message": "No position to close", "symbol": symbol}
+            return
 
         position = self.positions[symbol]
-        price = self.get_latest_price(symbol)
-        self.cash += position["quantity"] * price
-        self.positions.pop(symbol, None)
-        return {"symbol": symbol, "closed_at": datetime.datetime.utcnow().isoformat(), "price": price}
+        remaining_quantity = position["quantity"] - quantity
+        self.cash += quantity * price
+        if remaining_quantity <= 0:
+            self.positions.pop(symbol, None)
+            return
+
+        position["quantity"] = remaining_quantity
+        position["current_price"] = price
+
+    def close_position(self, symbol: str) -> dict[str, Any]:
+        with self._lock:
+            if symbol not in self.positions:
+                return {"message": "No position to close", "symbol": symbol}
+
+            position = self.positions[symbol]
+            price = self.get_latest_price(symbol)
+            self.cash += position["quantity"] * price
+            self.positions.pop(symbol, None)
+            return {"symbol": symbol, "closed_at": datetime.datetime.utcnow().isoformat(), "price": price}
 
     def list_orders(self) -> list[dict[str, Any]]:
-        return [order.copy() for order in self.orders]
+        with self._lock:
+            return [order.copy() for order in self.orders]
 
     def get_latest_price(self, symbol: str) -> float:
-        base_prices = {"AAPL": 170.0, "SPY": 470.0, "QQQ": 380.0}
-        return base_prices.get(symbol.upper(), 100.0)
+        return self.market_data_service.get_latest_price(symbol)
 
     def calculate_equity(self) -> float:
         total = self.cash
         for position in self.positions.values():
             total += position["quantity"] * position["current_price"]
         return total
+
+    def close(self) -> None:
+        return None
 
 
 class AlpacaBroker(BrokerInterface):
@@ -291,12 +338,19 @@ class AlpacaBroker(BrokerInterface):
         except httpx.RequestError as exc:
             raise BrokerConnectionError(f"Failed to connect to Alpaca market data: {exc}") from exc
 
+    def close(self) -> None:
+        self.client.close()
+        self.market_data_client.close()
 
-def create_broker(settings: Settings | None = None) -> BrokerInterface:
+
+def create_broker(
+    settings: Settings | None = None,
+    market_data_service: CSVMarketDataService | None = None,
+) -> BrokerInterface:
     settings = settings or get_settings()
     mode = settings.broker_mode.lower()
     if mode in {"paper", "mock"}:
-        return PaperBroker(settings)
+        return PaperBroker(settings, market_data_service=market_data_service)
     if mode == "alpaca":
         return AlpacaBroker(settings)
     raise ValueError(f"Unsupported broker mode '{settings.broker_mode}'.")

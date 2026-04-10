@@ -4,6 +4,7 @@ from app.services.auto_trader import AutoTrader
 
 def test_auto_trader_run_now_returns_result() -> None:
     settings = Settings(
+        _env_file=None,
         broker_mode="paper",
         trading_enabled=False,
         default_symbols=["AAPL", "SPY"],
@@ -20,6 +21,7 @@ def test_auto_trader_run_now_returns_result() -> None:
 
 def test_auto_trader_prevents_duplicate_start() -> None:
     settings = Settings(
+        _env_file=None,
         broker_mode="paper",
         trading_enabled=False,
         default_symbols=["AAPL"],

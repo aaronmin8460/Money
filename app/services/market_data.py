@@ -22,9 +22,41 @@ class MarketDataService(Protocol):
 
 
 class CSVMarketDataService:
+    def __init__(self, data_dir: str | Path = "data"):
+        self.data_dir = Path(data_dir)
+
+    def list_supported_symbols(self) -> list[str]:
+        symbols: list[str] = []
+        if not self.data_dir.exists():
+            return symbols
+
+        for csv_path in sorted(self.data_dir.glob("*.csv")):
+            stem = csv_path.stem.upper()
+            if stem == "SAMPLE":
+                continue
+            symbols.append(stem)
+        return symbols
+
+    def resolve_csv_path(self, symbol: str) -> Path:
+        normalized_symbol = symbol.strip().upper()
+        candidates = [
+            self.data_dir / f"{normalized_symbol}.csv",
+            self.data_dir / f"{normalized_symbol.lower()}.csv",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
+
+        supported = self.list_supported_symbols()
+        supported_text = ", ".join(supported) if supported else "no symbol CSV files are available"
+        raise FileNotFoundError(
+            f"Mock market data for symbol '{normalized_symbol}' was not found. "
+            f"Add '{self.data_dir / f'{normalized_symbol}.csv'}' or choose one of: {supported_text}."
+        )
+
     def get_latest_price(self, symbol: str) -> float:
-        sample_prices = {"AAPL": 170.0, "SPY": 470.0, "QQQ": 380.0}
-        return sample_prices.get(symbol.upper(), 100.0)
+        bars = self.fetch_bars(symbol, limit=1)
+        return float(bars.iloc[-1]["Close"])
 
     def load_historical(self, csv_path: Path) -> pd.DataFrame:
         if not csv_path.exists():
@@ -35,11 +67,8 @@ class CSVMarketDataService:
         return df
 
     def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50) -> pd.DataFrame:
-        sample_path = Path("data/sample.csv")
-        if not sample_path.exists():
-            raise FileNotFoundError("Sample CSV data not found for CSVMarketDataService.")
-
-        df = self.load_historical(sample_path)
+        csv_path = self.resolve_csv_path(symbol)
+        df = self.load_historical(csv_path)
         if limit and len(df) > limit:
             df = df.tail(limit)
         return df.reset_index(drop=True)

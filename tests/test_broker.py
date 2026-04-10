@@ -3,7 +3,7 @@ from app.services.broker import OrderRequest, PaperBroker
 
 
 def test_paper_broker_submits_dry_run_order() -> None:
-    settings = Settings(broker_mode="paper")
+    settings = Settings(_env_file=None, broker_mode="paper")
     broker = PaperBroker(settings)
     order = OrderRequest(symbol="AAPL", side="BUY", quantity=1.0, price=150.0, is_dry_run=True)
     result = broker.submit_order(order)
@@ -12,13 +12,13 @@ def test_paper_broker_submits_dry_run_order() -> None:
 
 
 def test_paper_broker_calculates_equity() -> None:
-    settings = Settings(broker_mode="paper")
+    settings = Settings(_env_file=None, broker_mode="paper")
     broker = PaperBroker(settings)
     assert broker.get_account().equity == 100_000.0
 
 
 def test_paper_broker_get_account() -> None:
-    settings = Settings(broker_mode="paper")
+    settings = Settings(_env_file=None, broker_mode="paper")
     broker = PaperBroker(settings)
     account = broker.get_account()
     assert account.cash == 100_000.0
@@ -30,6 +30,6 @@ def test_paper_broker_get_account() -> None:
 
 
 def test_paper_broker_market_open_true() -> None:
-    settings = Settings(broker_mode="paper")
+    settings = Settings(_env_file=None, broker_mode="paper")
     broker = PaperBroker(settings)
     assert broker.is_market_open() is True

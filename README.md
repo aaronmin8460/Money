@@ -57,6 +57,7 @@ LOG_LEVEL=INFO
 DATABASE_URL=sqlite:///./trading.db
 BROKER_MODE=paper
 TRADING_ENABLED=false
+AUTO_TRADE_ENABLED=false
 ALPACA_API_KEY=your_key
 ALPACA_SECRET_KEY=your_secret
 ALPACA_BASE_URL=https://paper-api.alpaca.markets
@@ -73,6 +74,7 @@ ALLOW_EXTENDED_HOURS=false
 
 - `ALPACA_BASE_URL` is used for trading/account/order endpoints.
 - `ALPACA_DATA_BASE_URL` is used for Alpaca market data bar requests.
+- `AUTO_TRADE_ENABLED=true` starts the in-process auto-trader once during FastAPI startup.
 - The system runs in paper trading mode only and does not guarantee profits.
 
 ## Running the API
@@ -94,12 +96,90 @@ uvicorn main:app --reload
 - `GET /broker/account`
 - `GET /positions`
 - `GET /orders`
+- `GET /risk`
+- `POST /run-once`
 - `GET /strategy/signals`
 - `GET /strategy/positions`
+
+## Shared runtime state
+
+In `paper` and `mock` mode, the API uses one shared in-process runtime container for:
+
+- broker state
+- portfolio state
+- risk state
+- auto-trader state
+
+That means these endpoints now observe the same runtime inside one app process:
+
+- `GET /broker/account`
+- `GET /positions`
+- `GET /orders`
+- `GET /risk`
+- `POST /run-once`
+- `GET /strategy/positions`
+- `GET /strategy/signals`
+- `GET /auto/status`
+
+If the process restarts, mock state resets. This is intentional and keeps paper/mock behavior explicit.
 
 ## Dry-run vs paper order submission
 
 When `TRADING_ENABLED=false`, the bot will still evaluate signals and position size but will not submit real Alpaca paper orders. This is the safe default for testing.
+
+When `TRADING_ENABLED=true` in `paper` or `mock` mode, filled mock orders persist in memory for the lifetime of the app process and remain visible through the API endpoints above.
+
+## AUTO_TRADE_ENABLED
+
+- `AUTO_TRADE_ENABLED=true` calls the same `POST /auto/start` logic automatically during FastAPI startup.
+- Startup is idempotent inside a single process, so repeated startup hooks do not create duplicate auto-trader threads.
+- `POST /auto/start` and `POST /auto/stop` still work normally.
+- With `uvicorn --reload`, a new worker process gets a fresh in-memory runtime after each reload.
+- For predictable behavior, use a single app worker when relying on in-process paper/mock state or the background auto-trader.
+
+## Mock market data files
+
+Mock mode now resolves symbols from symbol-specific CSV files instead of silently reusing generic sample data.
+
+- `data/AAPL.csv`
+- `data/SPY.csv`
+- `data/QQQ.csv`
+
+Resolution rules are explicit:
+
+1. `CSVMarketDataService.fetch_bars("AAPL")` looks for `data/AAPL.csv`.
+2. If that file is missing, it also checks the lowercase filename variant.
+3. If no symbol file exists, mock mode returns a clear error telling you which file to add and which symbols are currently available.
+
+`PaperBroker.get_latest_price()` uses the same symbol-specific CSV source, so prices and bars stay aligned in mock mode.
+
+`data/sample.csv` remains useful for backtests and examples, but mock API calls no longer treat it as a catch-all fallback for arbitrary symbols.
+
+## Risk semantics
+
+Risk checks now distinguish between separate concepts:
+
+- maximum position notional
+- maximum simultaneous positions
+- stop-based dollar risk when a stop price is available
+- available cash / buying power
+- daily loss and drawdown guardrails
+
+`MAX_RISK_PER_TRADE` now refers to actual stop-based trade risk when a stop is present, instead of acting like a mislabeled notional multiplier.
+
+## Risk endpoint
+
+`GET /risk` now returns a live runtime snapshot including:
+
+- `trading_enabled`
+- `broker_mode`
+- `cash`
+- `equity`
+- `buying_power`
+- `open_positions_count`
+- `risk_events`
+- `drawdown_pct`
+- `daily_loss_pct`
 
 ## Testing
 
@@ -164,7 +244,7 @@ curl -X POST http://127.0.0.1:8000/auto/stop
 The bot can run automated trading cycles:
 
 1. **Manual Run**: Use `POST /auto/run-now` to execute one scan cycle immediately.
-2. **Automated**: Set `AUTO_TRADE_ENABLED=true` and use `POST /auto/start` to begin periodic scanning.
+2. **Automated**: Set `AUTO_TRADE_ENABLED=true` to auto-start on API startup, or use `POST /auto/start` to begin periodic scanning manually.
 3. **Status**: Use `GET /auto/status` to check the current state.
 
 ### Safety Features
@@ -179,6 +259,7 @@ The bot can run automated trading cycles:
 
 - Start with `BROKER_MODE=paper` and `TRADING_ENABLED=false`.
 - Use `POST /auto/run-now` to test signal generation without orders.
+- Use `POST /run-once` for a single-symbol execution path that updates the same in-process runtime state used by `/risk`, `/strategy/*`, and `/auto/status`.
 - Enable `TRADING_ENABLED=true` only for paper orders.
 - Monitor logs and `/auto/status` for activity.
 

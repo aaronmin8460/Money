@@ -25,6 +25,21 @@ class Portfolio:
     risk_events: List[Dict[str, str]] = field(default_factory=list)
     last_trade_time: datetime | None = None
 
+    def positions_snapshot(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "symbol": position.symbol,
+                "quantity": position.quantity,
+                "qty": position.quantity,
+                "entry_price": position.entry_price,
+                "avg_entry_price": position.entry_price,
+                "side": position.side,
+                "current_price": position.current_price,
+                "market_value": position.quantity * position.current_price,
+            }
+            for position in self.positions.values()
+        ]
+
     def update_position(self, symbol: str, side: str, quantity: float, price: float) -> None:
         if side.upper() == "BUY":
             self.positions[symbol] = Position(symbol, quantity, price, side.upper(), price)
@@ -51,6 +66,13 @@ class Portfolio:
 
         self.unrealized_pnl = unrealized
         self.equity_history.append(total)
+
+    def sync_account_state(self, cash: float, equity: float | None = None) -> None:
+        self.cash = cash
+        current_equity = equity if equity is not None else self.calculate_equity()
+        if not self.equity_history:
+            self.initial_equity = current_equity
+        self.equity_history.append(current_equity)
 
     def _recalculate_equity(self) -> None:
         self.equity_history.append(self.calculate_equity())
@@ -97,13 +119,15 @@ class Portfolio:
         
         # Update existing positions
         for symbol, pos in broker_symbols.items():
-            qty = float(pos.get("qty", 0))
+            qty = float(pos.get("qty", pos.get("quantity", 0)))
             if qty == 0:
                 self.positions.pop(symbol, None)
             else:
-                entry_price = float(pos.get("avg_entry_price", 0))
-                current_price = float(pos.get("current_price", pos.get("last_price", 0)))
+                entry_price = float(pos.get("avg_entry_price", pos.get("entry_price", 0)))
+                current_price = float(
+                    pos.get("current_price", pos.get("last_price", pos.get("price", entry_price)))
+                )
                 side = pos.get("side", "long")
                 self.positions[symbol] = Position(symbol, qty, entry_price, side, current_price)
-        
+
         self._recalculate_equity()
