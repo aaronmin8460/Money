@@ -274,6 +274,8 @@ def build_trade_notification_payload(
     relevant_rule = _format_relevant_rule(risk)
     if relevant_rule:
         detail_lines.append(f"Rule: {relevant_rule}")
+    if action == "rejected" and risk is not None:
+        detail_lines.extend(_format_rejection_context_lines(risk))
     if order_status:
         detail_lines.append(f"Status: {order_status}")
     if order_id:
@@ -464,6 +466,10 @@ def _enabled_label(value: bool) -> str:
     return "enabled" if value else "disabled"
 
 
+def _yes_no(value: Any) -> str:
+    return "yes" if bool(value) else "no"
+
+
 def _coalesce(*values: Any) -> Any:
     for value in values:
         if value is not None:
@@ -554,7 +560,34 @@ def _resolve_trade_summary(
 def _format_relevant_rule(risk: RiskDecision | None) -> str | None:
     if risk is None or not risk.rule or risk.rule in {"approved", "general", "dry_run"}:
         return None
-    return _humanize(risk.rule)
+    return risk.rule
+
+
+def _format_rejection_context_lines(risk: RiskDecision) -> list[str]:
+    details = risk.details or {}
+    lines: list[str] = []
+    if str(details.get("side", "")).upper() == "SELL" and "is_risk_reducing_sell" in details:
+        lines.append(f"Risk-Reducing Sell: {_yes_no(details.get('is_risk_reducing_sell'))}")
+    if "has_tracked_position" in details:
+        lines.append(f"Tracked Position: {_yes_no(details.get('has_tracked_position'))}")
+    if str(details.get("side", "")).upper() == "SELL" and "tracked_position_sellable" in details:
+        lines.append(f"Sellable Long: {_yes_no(details.get('tracked_position_sellable'))}")
+    equity = details.get("equity")
+    if equity is not None:
+        lines.append(f"Equity: {_format_money(equity)}")
+    daily_baseline_equity = details.get("daily_baseline_equity")
+    if daily_baseline_equity is not None:
+        lines.append(f"Daily Baseline: {_format_money(daily_baseline_equity)}")
+    daily_loss_pct = details.get("current_daily_loss_pct")
+    daily_loss_amount = details.get("current_daily_loss_amount")
+    if daily_loss_pct is not None or daily_loss_amount is not None:
+        loss_parts: list[str] = []
+        if daily_loss_pct is not None:
+            loss_parts.append(f"{float(daily_loss_pct):.2%}")
+        if daily_loss_amount is not None:
+            loss_parts.append(_format_money(daily_loss_amount))
+        lines.append(f"Daily Loss: {' / '.join(loss_parts)}")
+    return lines
 
 
 def _system_title(*, settings: Settings, event: str) -> str:

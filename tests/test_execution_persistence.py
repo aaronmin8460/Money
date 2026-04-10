@@ -102,3 +102,49 @@ def test_sell_preserves_fractional_quantity(tmp_path) -> None:
     # Check that the proposal quantity preserves the fractional amount
     assert result["proposal"]["quantity"] == 0.123456
     assert result["action"] == "dry_run"
+
+
+def test_sell_without_tracked_long_is_rejected_in_execution_when_short_selling_disabled(tmp_path) -> None:
+    (tmp_path / "AAPL.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,100,101,99,100,10000\n"
+        "2024-01-02,100,101,99,100,10000\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        short_selling_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=False,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            signal=Signal.SELL,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="ema_crossover",
+            price=100.0,
+            reason="bearish crossover",
+        )
+    )
+
+    assert result["action"] == "rejected"
+    assert result["risk"]["rule"] == "no_position_to_sell"
+    assert result["proposal"]["quantity"] == 0.0

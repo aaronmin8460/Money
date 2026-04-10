@@ -114,6 +114,7 @@ class Settings(BaseSettings):
     stop_loss_atr_multiplier: float = Field(2.0, env="STOP_LOSS_ATR_MULTIPLIER")
     allow_extended_hours: bool = Field(False, env="ALLOW_EXTENDED_HOURS")
     kill_switch_enabled: bool = Field(False, env="KILL_SWITCH_ENABLED")
+    short_selling_enabled: bool = Field(False, env="SHORT_SELLING_ENABLED")
     universe_scan_enabled: bool = Field(True, env="UNIVERSE_SCAN_ENABLED")
     universe_refresh_minutes: int = Field(60, env="UNIVERSE_REFRESH_MINUTES")
     enabled_asset_classes: list[str] = Field(

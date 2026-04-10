@@ -21,6 +21,13 @@ class SignalRunRequest(BaseModel):
     limit: int = Field(10, ge=1, le=100)
 
 
+class ResetLocalStateRequest(BaseModel):
+    close_positions: bool = True
+    cancel_open_orders: bool = True
+    wipe_local_db: bool = False
+    reset_daily_baseline_to_current_equity: bool = True
+
+
 class BrokerStatus(BaseModel):
     broker_mode: str
     trading_enabled: bool

@@ -83,7 +83,13 @@ class BrokerInterface:
     def close_position(self, symbol: str) -> dict[str, Any]:
         raise NotImplementedError
 
+    def close_all_positions(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
     def list_orders(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def cancel_open_orders(self) -> list[dict[str, Any]]:
         raise NotImplementedError
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
@@ -106,6 +112,7 @@ class PaperBroker(BrokerInterface):
     ):
         self.settings = settings or get_settings()
         self.market_data_service = market_data_service or CSVMarketDataService()
+        self.starting_cash = 100_000.0
         self.cash = 100_000.0
         self.positions: dict[str, dict[str, Any]] = {}
         self.orders: list[dict[str, Any]] = []
@@ -254,9 +261,36 @@ class PaperBroker(BrokerInterface):
                 "price": price,
             }
 
+    def close_all_positions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            symbols = list(self.positions.keys())
+        return [self.close_position(symbol) for symbol in symbols]
+
     def list_orders(self) -> list[dict[str, Any]]:
         with self._lock:
             return [order.copy() for order in self.orders]
+
+    def cancel_open_orders(self) -> list[dict[str, Any]]:
+        canceled_orders: list[dict[str, Any]] = []
+        with self._lock:
+            for order in self.orders:
+                if str(order.get("status", "")).upper() in {"NEW", "OPEN", "ACCEPTED", "PENDING"}:
+                    order["status"] = "CANCELED"
+                    canceled_orders.append(order.copy())
+        return canceled_orders
+
+    def reset_state(
+        self,
+        *,
+        clear_orders: bool = True,
+        clear_positions: bool = False,
+    ) -> None:
+        with self._lock:
+            if clear_positions:
+                self.positions.clear()
+                self.cash = self.starting_cash
+            if clear_orders:
+                self.orders.clear()
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
         return self.market_data_service.get_latest_price(symbol, asset_class)
@@ -321,6 +355,10 @@ class AlpacaBroker(BrokerInterface):
             ) from exc
         except httpx.RequestError as exc:
             raise BrokerConnectionError(f"Failed to connect to Alpaca API: {exc}") from exc
+
+    def _ensure_paper_admin_action_allowed(self) -> None:
+        if self.settings.is_live_enabled:
+            raise BrokerError("Administrative broker reset actions are blocked while live trading is enabled.")
 
     def is_market_open(self, asset_class: AssetClass | str | None = None) -> bool:
         resolved_class = normalize_asset_class(asset_class)
@@ -476,15 +514,39 @@ class AlpacaBroker(BrokerInterface):
         return "gtc" if asset_class == AssetClass.CRYPTO else "day"
 
     def close_position(self, symbol: str) -> dict[str, Any]:
-        if not self.settings.trading_enabled:
-            return {"symbol": symbol, "status": "DRY_RUN", "is_dry_run": True}
+        self._ensure_paper_admin_action_allowed()
         return self._request("DELETE", f"/v2/positions/{symbol}")
+
+    def close_all_positions(self) -> list[dict[str, Any]]:
+        self._ensure_paper_admin_action_allowed()
+        return [self.close_position(position["symbol"]) for position in self.get_positions()]
 
     def list_orders(self) -> list[dict[str, Any]]:
         response = self._request("GET", "/v2/orders", params={"status": "all", "limit": 100})
         if not isinstance(response, list):
             return []
         return response
+
+    def cancel_open_orders(self) -> list[dict[str, Any]]:
+        self._ensure_paper_admin_action_allowed()
+        response = self._request("GET", "/v2/orders", params={"status": "open", "limit": 100})
+        if not isinstance(response, list):
+            return []
+
+        canceled_orders: list[dict[str, Any]] = []
+        for order in response:
+            order_id = order.get("id")
+            if not order_id:
+                continue
+            self._request("DELETE", f"/v2/orders/{order_id}")
+            canceled_orders.append(
+                {
+                    "id": order_id,
+                    "symbol": order.get("symbol"),
+                    "status": "CANCELED",
+                }
+            )
+        return canceled_orders
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
         resolved_asset_class = normalize_asset_class(asset_class)

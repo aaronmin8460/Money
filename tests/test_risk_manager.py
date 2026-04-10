@@ -122,3 +122,21 @@ def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduc
 
     assert decision.approved is True
     assert decision.rule == "approved"
+
+
+def test_sell_without_tracked_long_position_is_rejected_when_short_selling_disabled() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="paper",
+        trading_enabled=True,
+        short_selling_enabled=False,
+    )
+    portfolio = Portfolio(cash=100_000.0)
+    manager = RiskManager(portfolio, settings=settings)
+
+    decision = manager.evaluate_order("TSLA", "SELL", 1.0, 250.0)
+
+    assert decision.approved is False
+    assert decision.rule == "no_position_to_sell"
+    assert decision.details["has_tracked_position"] is False
+    assert decision.details["tracked_position_sellable"] is False

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Body, HTTPException
 
+from app.api.schemas import ResetLocalStateRequest
 from app.domain.models import AssetClass
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.risk.risk_manager import RiskDecision
 from app.services.broker import OrderRequest
+from app.services.local_state_reset import LocalStateResetOptions, reset_local_state
 from app.services.runtime import get_runtime
 from app.strategies.base import Signal, TradeSignal
 
@@ -28,6 +30,7 @@ def config() -> dict[str, Any]:
         "broker_mode": settings.broker_mode,
         "trading_enabled": settings.trading_enabled,
         "live_trading_enabled": settings.live_trading_enabled,
+        "short_selling_enabled": settings.short_selling_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
         "default_symbols": settings.default_symbols,
         "enabled_asset_classes": sorted(item.value for item in settings.enabled_asset_class_set),
@@ -90,6 +93,76 @@ def diagnostics_strategies() -> dict[str, Any]:
             }
         )
     return {"strategies": strategies}
+
+
+@router.get("/diagnostics/risk")
+def diagnostics_risk(limit: int = 10) -> dict[str, Any]:
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    return runtime.risk_manager.get_diagnostics(limit=limit)
+
+
+@router.get("/diagnostics/portfolio")
+def diagnostics_portfolio() -> dict[str, Any]:
+    runtime = get_runtime()
+    runtime.sync_with_broker()
+    broker_positions = []
+    for position in runtime.broker.get_positions():
+        position_side = str(position.get("side", "")).upper()
+        quantity = float(position.get("qty", position.get("quantity", 0.0)) or 0.0)
+        is_long = quantity > 0 and position_side not in {"SELL", "SHORT"}
+        broker_positions.append(
+            {
+                **position,
+                "is_long": is_long,
+                "sellable": is_long and quantity > 0,
+            }
+        )
+    broker_account = runtime.broker.get_account()
+    return {
+        "broker_account": {
+            "cash": broker_account.cash,
+            "equity": broker_account.equity,
+            "buying_power": broker_account.buying_power,
+            "positions": broker_account.positions,
+            "mode": broker_account.mode,
+            "trading_enabled": broker_account.trading_enabled,
+        },
+        "daily_baseline_equity": runtime.portfolio.daily_baseline_equity,
+        "daily_baseline_date": (
+            runtime.portfolio.daily_baseline_date.isoformat()
+            if runtime.portfolio.daily_baseline_date is not None
+            else None
+        ),
+        "tracked_local_positions": runtime.portfolio.positions_diagnostics(),
+        "broker_positions": broker_positions,
+    }
+
+
+@router.get("/diagnostics/rejections/latest")
+def diagnostics_rejections_latest(limit: int = 10) -> dict[str, Any]:
+    runtime = get_runtime()
+    return runtime.risk_manager.get_rejection_snapshot(limit=limit)
+
+
+@router.post("/admin/reset-local-state")
+def admin_reset_local_state(
+    request: ResetLocalStateRequest | None = Body(default=None),
+) -> dict[str, Any]:
+    runtime = get_runtime()
+    payload = request or ResetLocalStateRequest()
+    try:
+        return reset_local_state(
+            LocalStateResetOptions(
+                close_positions=payload.close_positions,
+                cancel_open_orders=payload.cancel_open_orders,
+                wipe_local_db=payload.wipe_local_db,
+                reset_daily_baseline_to_current_equity=payload.reset_daily_baseline_to_current_equity,
+            ),
+            runtime=runtime,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/admin/notifications/test")

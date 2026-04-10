@@ -229,24 +229,45 @@ class AutoTrader:
 
     def _build_context(self, asset: AssetMetadata, bars: Any) -> StrategyContext:
         benchmark_bars = None
-        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != self.strategy.regime_symbol:
+        regime_symbol = getattr(self.strategy, "regime_symbol", "SPY")
+        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != regime_symbol:
             try:
                 # Fetch enough benchmark data for regime strategies
-                benchmark_limit = 250 if self.settings.strategy_name == "regime_momentum_breakout" else max(30, self.strategy.regime_long_sma + 5)
+                regime_long_sma = getattr(self.strategy, "regime_long_sma", 25)
+                benchmark_limit = 250 if self.settings.strategy_name == "regime_momentum_breakout" else max(30, regime_long_sma + 5)
                 benchmark_bars = self.market_data_service.fetch_bars(
-                    self.strategy.regime_symbol,
+                    regime_symbol,
                     asset_class=AssetClass.ETF,
                     timeframe=self.settings.default_timeframe,
                     limit=benchmark_limit,
                 )
             except Exception as exc:
                 logger.warning("Failed to fetch benchmark bars: %s", exc)
+        tracked_position = self.portfolio.get_position(asset.symbol)
         return StrategyContext(
             asset=asset,
             session=self.market_data_service.get_session_status(asset.asset_class),
             quote=self.market_data_service.get_latest_quote(asset.symbol, asset.asset_class),
             timeframe=self.settings.default_timeframe,
-            metadata={"benchmark_bars": benchmark_bars},
+            metadata={
+                "benchmark_bars": benchmark_bars,
+                "short_selling_enabled": self.settings.short_selling_enabled,
+                "has_tracked_position": tracked_position is not None,
+                "has_sellable_long_position": self.portfolio.is_sellable_long_position(asset.symbol),
+                "tracked_position": (
+                    {
+                        "symbol": tracked_position.symbol,
+                        "quantity": tracked_position.quantity,
+                        "side": tracked_position.side,
+                        "entry_price": tracked_position.entry_price,
+                        "current_price": tracked_position.current_price,
+                        "asset_class": tracked_position.asset_class.value,
+                        "exchange": tracked_position.exchange,
+                    }
+                    if tracked_position is not None
+                    else None
+                ),
+            },
         )
 
     def _evaluate_asset(self, asset: AssetMetadata, prefer_primary_strategy: bool = False) -> TradeSignal:
@@ -260,9 +281,15 @@ class AutoTrader:
         )
         context = self._build_context(asset, bars)
         legacy_signals: list[TradeSignal] = []
-        strategy_input = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
+        strategy_input: Any = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
+        if getattr(self.strategy, "name", "") == "ema_crossover":
+            strategy_input = bars
         if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
             try:
+                legacy_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input, context=context))
+            except TypeError as exc:
+                if "unexpected keyword argument 'context'" not in str(exc):
+                    raise
                 legacy_signals.extend(self.strategy.generate_signals(asset.symbol, strategy_input))
             except Exception as exc:
                 logger.warning("Legacy strategy evaluation failed for %s: %s", asset.symbol, exc)
@@ -287,6 +314,7 @@ class AutoTrader:
             ),
             reverse=True,
         )[0]
+        signal = self._normalize_signal_for_long_only(asset, signal)
         signal.liquidity_score = signal.liquidity_score or 0.0
         if signal.metrics is None:
             signal.metrics = {}
@@ -298,6 +326,56 @@ class AutoTrader:
             signal.metrics.setdefault("spread_pct", context.quote.spread_pct)
         signal.metrics.setdefault("exchange", asset.exchange)
         return signal
+
+    def _normalize_signal_for_long_only(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
+        if signal.signal != Signal.SELL:
+            return signal
+
+        has_tracked_position = self.portfolio.get_position(asset.symbol) is not None
+        has_sellable_long_position = self.portfolio.is_sellable_long_position(asset.symbol)
+        if signal.metrics is None:
+            signal.metrics = {}
+        signal.metrics.setdefault("has_tracked_position", has_tracked_position)
+        signal.metrics.setdefault("has_tracked_long_position", has_sellable_long_position)
+        signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
+        signal.metrics["is_risk_reducing_sell"] = has_sellable_long_position
+
+        if has_sellable_long_position:
+            signal.signal_type = "exit"
+            return signal
+
+        if self.settings.short_selling_enabled:
+            return signal
+
+        hold_reason = "Exit-only sell ignored: no tracked long position and short selling is disabled."
+        return TradeSignal(
+            symbol=signal.symbol,
+            signal=Signal.HOLD,
+            asset_class=signal.asset_class,
+            strategy_name=signal.strategy_name,
+            signal_type="exit",
+            confidence_score=0.0,
+            price=signal.price,
+            entry_price=signal.entry_price,
+            reason=f"{signal.reason} {hold_reason}".strip() if signal.reason else hold_reason,
+            timestamp=signal.timestamp,
+            atr=signal.atr,
+            stop_price=signal.stop_price,
+            target_price=signal.target_price,
+            position_size=signal.position_size,
+            trailing_stop=signal.trailing_stop,
+            momentum_score=signal.momentum_score,
+            liquidity_score=signal.liquidity_score,
+            spread_score=signal.spread_score,
+            regime_state=signal.regime_state,
+            generated_at=signal.generated_at,
+            metrics={
+                **signal.metrics,
+                "original_signal": signal.signal.value,
+                "blocked_rule": "no_position_to_sell",
+                "blocked_reason": hold_reason,
+            },
+        )
 
     def _scan_and_trade(self) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
@@ -446,6 +524,18 @@ class AutoTrader:
                 **(context or {}),
             },
         )
+
+    def reset_runtime_state(self) -> None:
+        with self._state_lock:
+            self._last_run_time = None
+            self._last_scanned_symbols = []
+            self._last_signals = {}
+            self._last_order = None
+            self._last_error = None
+            self._last_ranked_candidates = []
+            self._last_regime_snapshot = {}
+            self._last_scan_overview = {}
+            self._market_open = True
 
 
 _auto_trader: Optional[AutoTrader] = None

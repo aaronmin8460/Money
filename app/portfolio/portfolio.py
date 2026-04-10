@@ -28,7 +28,7 @@ class Portfolio:
     equity_history: List[float] = field(default_factory=list)
     daily_baseline_equity: float | None = None
     daily_baseline_date: date | None = None
-    risk_events: List[Dict[str, str]] = field(default_factory=list)
+    risk_events: List[Dict[str, Any]] = field(default_factory=list)
     last_trade_time: datetime | None = None
 
     def positions_snapshot(self) -> List[Dict[str, Any]]:
@@ -131,6 +131,35 @@ class Portfolio:
     def get_position(self, symbol: str) -> Position | None:
         return self.positions.get(symbol)
 
+    def is_long_position(self, symbol: str) -> bool:
+        position = self.get_position(symbol)
+        if position is None or position.quantity <= 0:
+            return False
+        return str(position.side).upper() not in {"SELL", "SHORT"}
+
+    def is_sellable_long_position(self, symbol: str) -> bool:
+        return self.is_long_position(symbol)
+
+    def positions_diagnostics(self) -> List[Dict[str, Any]]:
+        diagnostics: List[Dict[str, Any]] = []
+        for position in self.positions.values():
+            is_long = self.is_long_position(position.symbol)
+            diagnostics.append(
+                {
+                    "symbol": position.symbol,
+                    "quantity": position.quantity,
+                    "entry_price": position.entry_price,
+                    "current_price": position.current_price,
+                    "side": position.side,
+                    "asset_class": position.asset_class.value,
+                    "exchange": position.exchange,
+                    "market_value": position.quantity * position.current_price,
+                    "is_long": is_long,
+                    "sellable": is_long and position.quantity > 0,
+                }
+            )
+        return diagnostics
+
     def exposure(self) -> float:
         return sum(position.quantity * position.current_price for position in self.positions.values())
 
@@ -211,7 +240,7 @@ class Portfolio:
     def reconcile_positions(self, broker_positions: List[Dict[str, Any]]) -> None:
         """Reconcile portfolio with broker positions."""
         broker_symbols = {pos.get("symbol") or pos.get("sym"): pos for pos in broker_positions}
-        
+
         # Remove positions not in broker
         to_remove = []
         for symbol in self.positions:
@@ -219,7 +248,7 @@ class Portfolio:
                 to_remove.append(symbol)
         for symbol in to_remove:
             del self.positions[symbol]
-        
+
         # Update existing positions
         for symbol, pos in broker_symbols.items():
             qty = float(pos.get("qty", pos.get("quantity", 0)))
@@ -260,3 +289,34 @@ class Portfolio:
         if resolved.tzinfo is None:
             return resolved.replace(tzinfo=timezone.utc)
         return resolved.astimezone(timezone.utc)
+
+    def reset_runtime_state(
+        self,
+        *,
+        cash: float | None = None,
+        equity: float | None = None,
+        reset_daily_baseline_to_current_equity: bool = False,
+    ) -> None:
+        self.positions.clear()
+        self.realized_pnl = 0.0
+        self.unrealized_pnl = 0.0
+        self.equity_history.clear()
+        self.daily_baseline_equity = None
+        self.daily_baseline_date = None
+        self.risk_events.clear()
+        self.last_trade_time = None
+
+        if cash is not None:
+            self.cash = float(cash)
+
+        current_equity = float(
+            equity
+            if equity is not None
+            else (cash if cash is not None else self.cash)
+        )
+        self.initial_equity = current_equity
+
+        if reset_daily_baseline_to_current_equity:
+            self.daily_baseline_equity = current_equity
+            self.daily_baseline_date = self._normalize_timestamp(None).date()
+            self.equity_history.append(current_equity)

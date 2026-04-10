@@ -15,7 +15,7 @@ def main() -> None:
     broker = create_broker(settings)
     portfolio = Portfolio()
     risk_manager = RiskManager(portfolio)
-    strategy = EMACrossoverStrategy()
+    strategy = EMACrossoverStrategy(short_selling_enabled=settings.short_selling_enabled)
     market_data = (
         AlpacaMarketDataService(settings)
         if settings.is_alpaca_mode

@@ -37,6 +37,7 @@ class ExecutionService:
     settings: Settings = field(default_factory=get_settings)
 
     def process_signal(self, signal: TradeSignal) -> dict[str, Any]:
+        self._annotate_signal_context(signal)
         if signal.signal == Signal.HOLD:
             logger.info("Signal is HOLD", extra={"symbol": signal.symbol, "strategy": signal.strategy_name})
             return {
@@ -143,7 +144,7 @@ class ExecutionService:
         price: float,
     ) -> tuple[float | None, float | None]:
         existing_position = self.portfolio.get_position(signal.symbol)
-        if signal.signal == Signal.SELL and existing_position is not None and existing_position.quantity > 0:
+        if signal.signal == Signal.SELL and self.portfolio.is_sellable_long_position(signal.symbol):
             requested_quantity = signal.position_size if signal.position_size is not None and signal.position_size > 0 else existing_position.quantity
             sell_quantity = min(requested_quantity, existing_position.quantity)
             # For SELL orders, preserve fractional quantities without capping
@@ -152,6 +153,9 @@ class ExecutionService:
             if fractionable:
                 return round(sell_quantity, 6), None
             return sell_quantity, None
+
+        if signal.signal == Signal.SELL:
+            return 0.0, None
 
         if signal.position_size is not None and signal.position_size > 0:
             return signal.position_size, None
@@ -212,6 +216,26 @@ class ExecutionService:
             data_age_seconds=data_age_seconds,
             exchange=exchange,
         )
+
+    def _annotate_signal_context(self, signal: TradeSignal) -> None:
+        if signal.metrics is None:
+            signal.metrics = {}
+
+        position = self.portfolio.get_position(signal.symbol)
+        has_tracked_position = position is not None
+        has_tracked_long_position = self.portfolio.is_sellable_long_position(signal.symbol)
+        signal.metrics.setdefault("has_tracked_position", has_tracked_position)
+        signal.metrics.setdefault("has_tracked_long_position", has_tracked_long_position)
+        signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
+
+        if signal.signal != Signal.SELL:
+            return
+
+        signal.metrics["is_risk_reducing_sell"] = has_tracked_long_position
+        signal.metrics["tracked_position_quantity"] = position.quantity if position is not None else 0.0
+        signal.metrics["tracked_position_side"] = str(position.side) if position is not None else None
+        if has_tracked_long_position and signal.signal_type == "entry":
+            signal.signal_type = "exit"
 
     def _persist_signal_event(self, signal: TradeSignal, price: float, quantity: float, decision: RiskDecision) -> None:
         try:

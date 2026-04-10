@@ -77,6 +77,17 @@ Signals are normalized with fields such as symbol, asset class, strategy name, d
 - Live trading stays disabled unless `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_ACK=ENABLE_LIVE_TRADING`.
 - Alpaca live URLs are rejected unless live trading is explicitly enabled and acknowledged.
 - Options remain feature-flagged and paper-only.
+- `SHORT_SELLING_ENABLED=false` is the default.
+- When short selling is disabled, bearish `SELL` signals are exit-only. If there is no tracked long position, the bot will not place a sell and will surface `no_position_to_sell` diagnostics instead of behaving like a short-entry engine.
+- Daily loss and drawdown controls still block new exposure such as `BUY` orders, but real risk-reducing sells are allowed so the bot can exit losing longs.
+
+## Why Repeated Rejects Happen
+
+Repeated paper-mode rejects usually mean the bot is still evaluating symbols after a loss threshold has already been crossed.
+
+- `BUY` orders are correctly rejected once the current daily loss exceeds `MAX_DAILY_LOSS_PCT` or `MAX_DAILY_LOSS`.
+- Before this fix, a bearish strategy could emit `SELL` for symbols with no tracked long position. Those looked like new exposure, so the risk manager rejected them under the daily-loss rule and Discord showed noisy `SELL ... rejected` alerts.
+- The bot now treats bearish sells as exit-only when short selling is disabled. If no tracked long exists, the strategy returns `HOLD` for scan flow and execution/risk still reject direct sell attempts with the explicit rule `no_position_to_sell`.
 
 ## Installation
 
@@ -93,6 +104,7 @@ Start from `.env.example`. Important categories:
 
 - broker mode and credentials
 - paper vs live gating
+- short-selling guardrails
 - Discord webhook notifications
 - enabled asset classes
 - universe refresh cadence
@@ -111,6 +123,13 @@ Discord notification settings:
 - `DISCORD_NOTIFY_START_STOP=true`
 
 If Discord notifications are enabled without a webhook URL, startup and settings validation fail fast with a clear error.
+
+Important trading behavior settings:
+
+- `SHORT_SELLING_ENABLED=false`
+- `MAX_DAILY_LOSS=2000`
+- `MAX_DAILY_LOSS_PCT=0.02`
+- `MAX_DRAWDOWN_PCT=0.10`
 
 ## Discord Notifications
 
@@ -143,6 +162,66 @@ DISCORD_NOTIFY_START_STOP=true
 ```
 
 `DISCORD_NOTIFY_DRY_RUNS` is optional and defaults to `false` so local testing and paper-mode scans do not spam Discord unless you explicitly opt in.
+
+Rejected trade notifications now include the exact risk rule, whether the symbol had a tracked position, whether a rejected sell was risk-reducing, and the current equity vs daily baseline context.
+
+## Diagnostics
+
+Use the diagnostics routes to understand why the bot is blocking new exposure and whether local portfolio tracking matches the broker:
+
+- `GET /diagnostics/risk`
+- `GET /diagnostics/portfolio`
+- `GET /diagnostics/rejections/latest`
+
+These routes expose:
+
+- account cash, equity, and buying power
+- daily baseline equity and date
+- current daily loss amount and percent
+- drawdown percent
+- active symbol and strategy cooldowns
+- local tracked positions with `is_long` and `sellable`
+- broker-reported positions
+- latest risk events
+- latest rejection rule and reason
+
+## Resetting Local State
+
+Use the API or the helper script to restart the bot's local paper-trading state.
+
+API:
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/reset-local-state
+curl -X POST http://127.0.0.1:8000/admin/reset-local-state \
+  -H "Content-Type: application/json" \
+  -d '{"close_positions":true,"cancel_open_orders":true,"wipe_local_db":true,"reset_daily_baseline_to_current_equity":true}'
+```
+
+Script:
+
+```bash
+source .venv/bin/activate
+python scripts/reset_local_state.py
+python scripts/reset_local_state.py --wipe-local-db
+```
+
+The reset flow:
+
+- stops the auto-trader if it is running
+- clears in-memory portfolio state, cooldowns, cached rejections, and auto-trader debug state
+- can cancel open paper orders and close paper positions
+- can wipe the local SQLite history by dropping and recreating the schema
+
+## How To Fully Reset Alpaca Paper Trading
+
+Local bot reset and Alpaca paper-account reset are separate operations.
+
+- The app can reset its own local runtime state and local SQLite history.
+- The app does not claim to erase Alpaca's remote paper-trading history through the API.
+- If you want a truly fresh Alpaca paper account, use the Alpaca dashboard to create a fresh paper account or remove the old paper account, then generate new paper API credentials for that paper account.
+- After creating the fresh paper account, update `.env` with the new `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and keep `ALPACA_BASE_URL=https://paper-api.alpaca.markets`.
+- Restart the app after updating credentials so the runtime picks up the new paper account.
 
 ## Running Locally
 
@@ -235,6 +314,10 @@ Diagnostics:
 - `GET /diagnostics/universe`
 - `GET /diagnostics/data-feed`
 - `GET /diagnostics/strategies`
+- `GET /diagnostics/risk`
+- `GET /diagnostics/portfolio`
+- `GET /diagnostics/rejections/latest`
+- `POST /admin/reset-local-state`
 
 Legacy compatibility:
 
@@ -260,6 +343,10 @@ curl -X POST http://127.0.0.1:8000/signals/run -H "Content-Type: application/jso
 curl -X POST http://127.0.0.1:8000/auto/run-now
 curl http://127.0.0.1:8000/signals/top
 curl http://127.0.0.1:8000/risk
+curl http://127.0.0.1:8000/diagnostics/risk
+curl http://127.0.0.1:8000/diagnostics/portfolio
+curl http://127.0.0.1:8000/diagnostics/rejections/latest
+curl -X POST http://127.0.0.1:8000/admin/reset-local-state
 ```
 
 ## Mock Mode Notes

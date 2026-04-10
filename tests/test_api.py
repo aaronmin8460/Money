@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.api.app import app
 from app.config import settings as settings_module
 from app.config.settings import Settings
+from app.domain.models import AssetClass
 from app.services.runtime import get_runtime
 from app.strategies.base import Signal, TradeSignal
 
@@ -181,3 +182,68 @@ def test_admin_notifications_test_endpoint_is_debug_only() -> None:
         response = client.post("/admin/notifications/test")
 
     assert response.status_code == 403
+
+
+def test_diagnostics_endpoints_return_expected_fields() -> None:
+    settings_module._settings = build_settings(trading_enabled=True)
+    with TestClient(app) as client:
+        runtime = get_runtime()
+        runtime.execution_service.process_signal(
+            TradeSignal(
+                symbol="AAPL",
+                signal=Signal.BUY,
+                asset_class=AssetClass.EQUITY,
+                strategy_name="test_strategy",
+                price=100.0,
+                stop_price=95.0,
+                metrics={"avg_volume": 10_000, "dollar_volume": 1_000_000, "exchange": "MOCK"},
+            )
+        )
+        runtime.risk_manager.guard_against("TSLA", "SELL", 1.0, 250.0, asset_class=AssetClass.EQUITY)
+
+        risk_response = client.get("/diagnostics/risk")
+        portfolio_response = client.get("/diagnostics/portfolio")
+        rejections_response = client.get("/diagnostics/rejections/latest")
+
+    assert risk_response.status_code == 200
+    risk_data = risk_response.json()
+    assert "daily_baseline_equity" in risk_data
+    assert "current_daily_loss_pct" in risk_data
+    assert "active_cooldowns" in risk_data
+    assert "latest_risk_events" in risk_data
+
+    assert portfolio_response.status_code == 200
+    portfolio_data = portfolio_response.json()
+    assert "tracked_local_positions" in portfolio_data
+    assert "broker_positions" in portfolio_data
+    assert portfolio_data["tracked_local_positions"][0]["sellable"] is True
+
+    assert rejections_response.status_code == 200
+    rejection_data = rejections_response.json()
+    assert rejection_data["latest"]["rule"] == "no_position_to_sell"
+    assert rejection_data["latest"]["has_tracked_position"] is False
+
+
+def test_admin_reset_local_state_endpoint_works_with_default_payload() -> None:
+    settings_module._settings = build_settings(trading_enabled=True)
+    with TestClient(app) as client:
+        runtime = get_runtime()
+        runtime.execution_service.process_signal(
+            TradeSignal(
+                symbol="AAPL",
+                signal=Signal.BUY,
+                asset_class=AssetClass.EQUITY,
+                strategy_name="test_strategy",
+                price=100.0,
+                stop_price=95.0,
+                metrics={"avg_volume": 10_000, "dollar_volume": 1_000_000, "exchange": "MOCK"},
+            )
+        )
+
+        response = client.post("/admin/reset-local-state")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["options"]["close_positions"] is True
+    assert payload["local_portfolio_positions"] == []
+    assert payload["broker_positions"] == []

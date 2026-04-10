@@ -33,3 +33,15 @@ def test_paper_broker_market_open_true() -> None:
     settings = Settings(_env_file=None, broker_mode="paper")
     broker = PaperBroker(settings)
     assert broker.is_market_open() is True
+
+
+def test_paper_broker_reset_state_clears_positions_and_orders() -> None:
+    settings = Settings(_env_file=None, broker_mode="paper", trading_enabled=True)
+    broker = PaperBroker(settings)
+    broker.submit_order(OrderRequest(symbol="AAPL", side="BUY", quantity=1.0, price=100.0, is_dry_run=False))
+
+    broker.reset_state(clear_orders=True, clear_positions=True)
+
+    assert broker.get_positions() == []
+    assert broker.list_orders() == []
+    assert broker.get_account().cash == 100_000.0

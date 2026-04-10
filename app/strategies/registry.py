@@ -25,7 +25,7 @@ class StrategyRegistry:
             EquityTrendPullbackStrategy(),
             CryptoMomentumTrendStrategy(),
             MeanReversionScannerStrategy(),
-            EMACrossoverStrategy(),
+            EMACrossoverStrategy(short_selling_enabled=self.settings.short_selling_enabled),
         ]
         if self.settings.option_trading_enabled:
             self._strategies.append(OptionsLiquidityStrategy())

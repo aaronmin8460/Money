@@ -232,9 +232,9 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
     assert payload.get("content") is None
     assert embed["title"] == "🟠 PAPER | BUY AAPL rejected"
     assert embed["description"].startswith("Maximum simultaneous positions (0) reached.")
-    assert "Rule: Position Count" in embed["description"]
-    assert "Risk Reason:" not in embed["description"]
-    assert "Asset Class:" not in embed["description"]
+    assert "Rule: position_count" in embed["description"]
+    assert "Tracked Position: no" in embed["description"]
+    assert "Equity: $100,000.00" in embed["description"]
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")

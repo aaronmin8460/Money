@@ -100,7 +100,7 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         strategy = RegimeMomentumBreakoutStrategy()
     elif settings.strategy_name == "ema_crossover":
         from app.strategies.ema_crossover import EMACrossoverStrategy
-        strategy = EMACrossoverStrategy()
+        strategy = EMACrossoverStrategy(short_selling_enabled=settings.short_selling_enabled)
     else:
         raise ValueError(f"Unknown strategy: {settings.strategy_name}")
     execution_service = ExecutionService(
