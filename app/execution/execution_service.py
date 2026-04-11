@@ -192,7 +192,7 @@ class ExecutionService:
         proposal = self._build_order_request(signal, asset_class, price)
         
         # Attempt quantity reduction if stop-based risk exceeds max_risk_per_trade
-        if signal.signal == Signal.BUY and signal.stop_price is not None:
+        if self._resolve_order_side(signal) == Signal.BUY.value and signal.stop_price is not None:
             proposal = self._attempt_risk_compliant_sizing(signal, proposal, price, asset_class)
         
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
@@ -269,11 +269,15 @@ class ExecutionService:
         if not proposal.is_dry_run:
             self.portfolio.update_position(
                 proposal.symbol,
-                str(signal.signal.value),
+                proposal.side if isinstance(proposal.side, str) else str(proposal.side),
                 proposal.quantity or 0.0,
                 price,
                 asset_class=asset_class,
                 exchange=signal.metrics.get("exchange") if signal.metrics else None,
+                order_intent=signal.order_intent,
+                reduce_only=signal.reduce_only,
+                exit_stage=signal.exit_stage,
+                signal_metadata=self._build_position_signal_metadata(signal),
             )
             self.risk_manager.mark_executed(proposal.symbol, signal.strategy_name)
             self._record_post_execution_state(signal, proposal, price, asset_class)
@@ -317,6 +321,47 @@ class ExecutionService:
             "order_type": proposal.order_type,
             "is_dry_run": proposal.is_dry_run,
             "extended_hours": bool((proposal.metadata or {}).get("extended_hours")),
+            "order_intent": (proposal.metadata or {}).get("order_intent"),
+            "reduce_only": bool((proposal.metadata or {}).get("reduce_only")),
+            "exit_stage": (proposal.metadata or {}).get("exit_stage"),
+        }
+
+    def _resolve_order_side(self, signal: TradeSignal) -> str:
+        if signal.order_intent == "long_exit":
+            return Signal.SELL.value
+        if signal.order_intent == "long_entry":
+            return Signal.BUY.value
+        return signal.signal.value
+
+    def _build_order_metadata(
+        self,
+        signal: TradeSignal,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        combined_metadata = dict(metadata or {})
+        combined_metadata["signal_type"] = signal.signal_type
+        combined_metadata["order_intent"] = signal.order_intent
+        combined_metadata["reduce_only"] = signal.reduce_only
+        combined_metadata["exit_stage"] = signal.exit_stage
+        combined_metadata["exit_fraction"] = signal.exit_fraction
+        return combined_metadata
+
+    def _build_position_signal_metadata(self, signal: TradeSignal) -> dict[str, Any]:
+        metrics = signal.metrics or {}
+        return {
+            "strategy_name": signal.strategy_name,
+            "signal_type": signal.signal_type,
+            "order_intent": signal.order_intent,
+            "reduce_only": signal.reduce_only,
+            "exit_stage": signal.exit_stage,
+            "exit_fraction": signal.exit_fraction,
+            "stop_price": signal.stop_price,
+            "target_price": signal.target_price,
+            "trailing_stop": signal.trailing_stop,
+            "current_stop": metrics.get("current_stop"),
+            "next_stop": metrics.get("next_stop"),
+            "tp1_price": metrics.get("tp1_price"),
+            "tp2_price": metrics.get("tp2_price"),
         }
 
     def _attempt_risk_compliant_sizing(
@@ -400,14 +445,14 @@ class ExecutionService:
         tif = "gtc" if asset_class == AssetClass.CRYPTO else "day"
         return OrderRequest(
             symbol=signal.symbol,
-            side=signal.signal.value,
+            side=self._resolve_order_side(signal),
             quantity=sizing.quantity,
             notional=sizing.notional,
             asset_class=asset_class,
             price=sizing.price,
             time_in_force=tif,
             is_dry_run=self.dry_run or not self.settings.trading_enabled,
-            metadata=sizing.metadata,
+            metadata=self._build_order_metadata(signal, sizing.metadata),
         )
 
     def _apply_session_submission_rules(
@@ -519,7 +564,8 @@ class ExecutionService:
         price: float,
         asset_class: AssetClass,
     ) -> None:
-        if signal.signal == Signal.BUY:
+        resolved_side = self._resolve_order_side(signal)
+        if resolved_side == Signal.BUY.value:
             tranche_meta = ((proposal.metadata or {}).get("tranche") or {})
             is_valid_next_tranche = bool(tranche_meta.get("is_valid_next_tranche"))
             if is_valid_next_tranche and proposal.quantity and proposal.price:
@@ -533,7 +579,7 @@ class ExecutionService:
                     bar_index=self.tranche_state.get_scan_bar_index(),
                     reason=tranche_meta.get("decision_reason") or "Tranche submitted.",
                 )
-        elif signal.signal == Signal.SELL:
+        elif resolved_side == Signal.SELL.value:
             if not self.portfolio.is_sellable_long_position(signal.symbol):
                 self.tranche_state.mark_position_closed(
                     signal.symbol,
@@ -557,6 +603,7 @@ class ExecutionService:
         asset_class: AssetClass,
         price: float,
     ) -> OrderSizing:
+        resolved_side = self._resolve_order_side(signal)
         raw_price = self._decimal(price)
         rounded_price = self._round_price(raw_price, asset_class)
         hard_max_notional = self._decimal(self.settings.max_position_notional)
@@ -584,7 +631,7 @@ class ExecutionService:
             "allow_duplicate_buy_for_scale_in": bool(scale_in_meta.get("is_valid_next_tranche", False)),
         }
         existing_position = self.portfolio.get_position(signal.symbol)
-        if signal.signal == Signal.SELL and self.portfolio.is_sellable_long_position(signal.symbol):
+        if resolved_side == Signal.SELL.value and self.portfolio.is_sellable_long_position(signal.symbol):
             requested_quantity = (
                 signal.position_size
                 if signal.position_size is not None and signal.position_size > 0
@@ -613,7 +660,7 @@ class ExecutionService:
                 metadata={"sizing": sizing_details},
             )
 
-        if signal.signal == Signal.SELL:
+        if resolved_side == Signal.SELL.value:
             sizing_details.update(
                 {
                     "raw_calculated_qty": 0.0,
@@ -1047,6 +1094,9 @@ class ExecutionService:
             quantity,
             price,
             stop_price=signal.stop_price,
+            order_intent=signal.order_intent,
+            reduce_only=signal.reduce_only,
+            exit_stage=signal.exit_stage,
             asset_class=proposal.asset_class,
             strategy_name=signal.strategy_name,
             spread_pct=spread_pct,
@@ -1088,22 +1138,39 @@ class ExecutionService:
         if signal.metrics is None:
             signal.metrics = {}
         signal.metrics.setdefault("signal_id", build_signal_id(signal.symbol, signal.strategy_name, signal.generated_at))
+        signal.apply_intent_defaults()
 
         position = self.portfolio.get_position(signal.symbol)
         has_tracked_position = position is not None
         has_tracked_long_position = self.portfolio.is_sellable_long_position(signal.symbol)
         signal.metrics.setdefault("has_tracked_position", has_tracked_position)
         signal.metrics.setdefault("has_tracked_long_position", has_tracked_long_position)
+        signal.metrics.setdefault("has_sellable_long_position", has_tracked_long_position)
         signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
 
-        if signal.signal != Signal.SELL:
+        if signal.order_intent == "long_exit":
+            signal.signal_type = "exit"
+            signal.reduce_only = True
+
+        if signal.signal != Signal.SELL and signal.order_intent != "long_exit":
+            signal.metrics["order_intent"] = signal.order_intent
+            signal.metrics["reduce_only"] = signal.reduce_only
+            signal.metrics["exit_stage"] = signal.exit_stage
+            signal.metrics["exit_fraction"] = signal.exit_fraction
             return
 
         signal.metrics["is_risk_reducing_sell"] = has_tracked_long_position
         signal.metrics["tracked_position_quantity"] = position.quantity if position is not None else 0.0
         signal.metrics["tracked_position_side"] = str(position.side) if position is not None else None
-        if has_tracked_long_position and signal.signal_type == "entry":
+        if has_tracked_long_position and signal.signal_type == "entry" and signal.order_intent != "short_entry":
             signal.signal_type = "exit"
+            signal.order_intent = "long_exit"
+            signal.reduce_only = True
+            signal.apply_intent_defaults()
+        signal.metrics["order_intent"] = signal.order_intent
+        signal.metrics["reduce_only"] = signal.reduce_only
+        signal.metrics["exit_stage"] = signal.exit_stage
+        signal.metrics["exit_fraction"] = signal.exit_fraction
 
     def _persist_signal_event(self, signal: TradeSignal, price: float, quantity: float, decision: RiskDecision) -> None:
         try:
@@ -1145,6 +1212,10 @@ class ExecutionService:
                         metrics_json=json.dumps(
                             {
                                 **signal.metrics,
+                                "order_intent": signal.order_intent,
+                                "reduce_only": signal.reduce_only,
+                                "exit_stage": signal.exit_stage,
+                                "exit_fraction": signal.exit_fraction,
                                 "risk_rule": decision.rule,
                                 "risk_reason": decision.reason,
                                 "price": price,
@@ -1172,6 +1243,13 @@ class ExecutionService:
     def _persist_order(self, signal: TradeSignal, order: OrderRequest, executed_order: dict[str, Any]) -> None:
         try:
             status = executed_order.get("status", "UNKNOWN")
+            persisted_payload = {
+                **executed_order,
+                "metadata": {
+                    **dict(executed_order.get("metadata") or {}),
+                    **dict(order.metadata or {}),
+                },
+            }
             with SessionLocal() as session:
                 session.add(
                     LegacyOrderRecord(
@@ -1192,7 +1270,7 @@ class ExecutionService:
                         quantity=order.quantity or 0.0,
                         price=float(order.price or 0.0),
                         status=status,
-                        raw_payload=json.dumps(executed_order, default=str),
+                        raw_payload=json.dumps(persisted_payload, default=str),
                     )
                 )
                 if order.symbol in self.portfolio.positions:

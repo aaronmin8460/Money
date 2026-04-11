@@ -164,6 +164,9 @@ class RiskManager:
         price: float,
         stop_price: float | None = None,
         *,
+        order_intent: str | None = None,
+        reduce_only: bool = False,
+        exit_stage: str | None = None,
         asset_class: AssetClass | str | None = None,
         strategy_name: str | None = None,
         spread_pct: float | None = None,
@@ -188,7 +191,13 @@ class RiskManager:
         resolved_asset_class = normalize_asset_class(asset_class)
         if resolved_asset_class == AssetClass.UNKNOWN:
             resolved_asset_class = AssetClass.EQUITY
-        reduces_exposure = self._is_risk_reducing_sell(symbol, normalized_side, quantity)
+        reduces_exposure = self._is_risk_reducing_sell(
+            symbol,
+            normalized_side,
+            quantity,
+            order_intent=order_intent,
+            reduce_only=reduce_only,
+        )
         account = self.get_account_snapshot()
         quantity_decimal = self._decimal(quantity)
         price_decimal = self._decimal(price)
@@ -199,6 +208,9 @@ class RiskManager:
             price=price,
             account=account,
             asset_class=resolved_asset_class,
+            order_intent=order_intent,
+            reduce_only=reduce_only,
+            exit_stage=exit_stage,
             strategy_name=strategy_name,
             spread_pct=spread_pct,
             quote_bid=quote_bid,
@@ -489,7 +501,15 @@ class RiskManager:
             return self.settings.option_trading_enabled
         return False
 
-    def _is_risk_reducing_sell(self, symbol: str, side: str, quantity: float) -> bool:
+    def _is_risk_reducing_sell(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        *,
+        order_intent: str | None = None,
+        reduce_only: bool = False,
+    ) -> bool:
         if side != "SELL" or quantity <= 0:
             return False
 
@@ -499,6 +519,9 @@ class RiskManager:
 
         position_side = str(position.side).upper()
         if position_side in {"SELL", "SHORT"}:
+            return False
+
+        if order_intent not in {None, "long_exit"} and not reduce_only:
             return False
 
         return quantity <= (position.quantity + 1e-9)
@@ -579,6 +602,9 @@ class RiskManager:
         price: float,
         account: dict[str, float],
         asset_class: AssetClass,
+        order_intent: str | None,
+        reduce_only: bool,
+        exit_stage: str | None,
         strategy_name: str | None,
         spread_pct: float | None,
         quote_bid: float | None,
@@ -620,6 +646,9 @@ class RiskManager:
             ),
             "asset_class": asset_class.value,
             "strategy_name": strategy_name,
+            "order_intent": order_intent,
+            "reduce_only": reduce_only,
+            "exit_stage": exit_stage,
             "short_selling_enabled": self.settings.short_selling_enabled,
             "is_risk_reducing_sell": reduces_exposure,
             "has_tracked_position": has_tracked_position,

@@ -18,6 +18,7 @@ from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.events import build_signal_id, normalize_outcome_classification
 from app.monitoring.logger import get_logger
 from app.news.feature_store import NewsFeatureStore
+from app.services.exit_manager import ExitManager
 from app.services.market_data import infer_asset_class, normalize_asset_class
 from app.strategies.base import Signal, StrategyContext, TradeSignal
 
@@ -45,6 +46,7 @@ class AutoTrader:
         self.risk_manager = runtime.risk_manager
         self.market_data_service = runtime.market_data_service
         self.execution_service = runtime.execution_service
+        self.exit_manager = ExitManager(self.portfolio)
         self.tranche_state = runtime.tranche_state
         self.asset_catalog = runtime.asset_catalog
         self.scanner = runtime.scanner
@@ -208,7 +210,19 @@ class AutoTrader:
             with self._execution_lock:
                 self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
-                signal = self._evaluate_asset(asset, prefer_primary_strategy=True, evaluation_mode="manual")
+                normalized_snapshot = self._get_normalized_snapshot(asset)
+                signal = self._evaluate_exit_signal(
+                    asset,
+                    normalized_snapshot=normalized_snapshot,
+                    evaluation_mode="manual",
+                )
+                if signal is None:
+                    signal = self._evaluate_asset(
+                        asset,
+                        prefer_primary_strategy=True,
+                        evaluation_mode="manual",
+                        precomputed_snapshot=normalized_snapshot.to_dict(),
+                    )
                 news_features = self._load_news_features([asset.symbol]).get(asset.symbol)
                 self._enrich_signal(
                     signal,
@@ -467,6 +481,7 @@ class AutoTrader:
             except Exception as exc:
                 logger.warning("Failed to fetch benchmark bars: %s", exc)
         tracked_position = self.portfolio.get_position(asset.symbol)
+        position_state = self.portfolio.get_position_state(asset.symbol)
         return StrategyContext(
             asset=asset,
             session=self.market_data_service.get_session_status(asset.asset_class),
@@ -475,8 +490,7 @@ class AutoTrader:
             metadata={
                 "benchmark_bars": benchmark_bars,
                 "short_selling_enabled": self.settings.short_selling_enabled,
-                "has_tracked_position": tracked_position is not None,
-                "has_sellable_long_position": self.portfolio.is_sellable_long_position(asset.symbol),
+                **position_state,
                 "normalized_snapshot": snapshot.to_dict(),
                 "tracked_position": (
                     {
@@ -487,12 +501,88 @@ class AutoTrader:
                         "current_price": tracked_position.current_price,
                         "asset_class": tracked_position.asset_class.value,
                         "exchange": tracked_position.exchange,
+                        "initial_quantity": tracked_position.initial_quantity,
+                        "highest_price_since_entry": tracked_position.highest_price_since_entry,
+                        "current_stop": tracked_position.current_stop,
+                        "tp1_hit": tracked_position.tp1_hit,
+                        "tp2_hit": tracked_position.tp2_hit,
+                        "entry_signal_metadata": dict(tracked_position.entry_signal_metadata),
                     }
                     if tracked_position is not None
                     else None
                 ),
             },
         )
+
+    def _get_normalized_snapshot(
+        self,
+        asset: AssetMetadata,
+        precomputed_snapshot: dict[str, Any] | None = None,
+    ) -> NormalizedMarketSnapshot:
+        if precomputed_snapshot:
+            return NormalizedMarketSnapshot.from_dict(precomputed_snapshot)
+        return self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
+
+    def _apply_snapshot_metadata(
+        self,
+        signal: TradeSignal,
+        *,
+        asset: AssetMetadata,
+        normalized_snapshot: NormalizedMarketSnapshot,
+        evaluation_mode: str,
+    ) -> TradeSignal:
+        if normalized_snapshot.evaluation_price is not None:
+            evaluation_price = float(normalized_snapshot.evaluation_price)
+            if signal.signal == Signal.BUY:
+                self._rebase_signal_levels(signal, evaluation_price)
+            signal.price = evaluation_price
+            signal.entry_price = evaluation_price
+
+        if signal.metrics is None:
+            signal.metrics = {}
+        signal.metrics["evaluation_mode"] = evaluation_mode
+        signal.metrics["asset_class"] = asset.asset_class.value
+        signal.metrics["normalized_snapshot"] = normalized_snapshot.to_dict()
+        signal.metrics["quote_available"] = normalized_snapshot.quote_available
+        signal.metrics["quote_stale"] = normalized_snapshot.quote_stale
+        signal.metrics["price_source_used"] = normalized_snapshot.price_source_used
+        signal.metrics["fallback_pricing_used"] = normalized_snapshot.fallback_pricing_used
+        signal.metrics["quote_timestamp"] = (
+            normalized_snapshot.quote_timestamp.isoformat() if normalized_snapshot.quote_timestamp else None
+        )
+        signal.metrics["quote_age_seconds"] = normalized_snapshot.quote_age_seconds
+        signal.metrics["exchange"] = normalized_snapshot.exchange or asset.exchange
+        signal.metrics["source"] = normalized_snapshot.source
+        return signal
+
+    def _evaluate_exit_signal(
+        self,
+        asset: AssetMetadata,
+        *,
+        normalized_snapshot: NormalizedMarketSnapshot,
+        evaluation_mode: str,
+    ) -> TradeSignal | None:
+        evaluation = self.exit_manager.evaluate_long_position(
+            asset.symbol,
+            normalized_snapshot.evaluation_price,
+            asset_class=asset.asset_class,
+        )
+        signal = evaluation.signal
+        if signal is None:
+            return None
+        signal = self._apply_snapshot_metadata(
+            signal,
+            asset=asset,
+            normalized_snapshot=normalized_snapshot,
+            evaluation_mode=evaluation_mode,
+        )
+        if signal.metrics is None:
+            signal.metrics = {}
+        signal.metrics["strategy_selected"] = signal.strategy_name
+        signal.metrics["decision_code"] = signal.metrics.get("decision_code") or "exit_signal"
+        signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
+        signal.metrics["exit_state"] = evaluation.state
+        return signal
 
     def _evaluate_asset(
         self,
@@ -503,11 +593,7 @@ class AutoTrader:
         precomputed_snapshot: dict[str, Any] | None = None,
     ) -> TradeSignal:
         strategy = self._select_strategy_for_asset(asset)
-        normalized_snapshot: NormalizedMarketSnapshot
-        if precomputed_snapshot:
-            normalized_snapshot = NormalizedMarketSnapshot.from_dict(precomputed_snapshot)
-        else:
-            normalized_snapshot = self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
+        normalized_snapshot = self._get_normalized_snapshot(asset, precomputed_snapshot)
 
         if not strategy.supports(asset.asset_class):
             return TradeSignal(
@@ -606,11 +692,12 @@ class AutoTrader:
             reverse=True,
         )[0]
         signal = self._normalize_signal_for_long_only(asset, signal)
-        if normalized_snapshot.evaluation_price is not None:
-            evaluation_price = float(normalized_snapshot.evaluation_price)
-            self._rebase_signal_levels(signal, evaluation_price)
-            signal.price = evaluation_price
-            signal.entry_price = evaluation_price
+        signal = self._apply_snapshot_metadata(
+            signal,
+            asset=asset,
+            normalized_snapshot=normalized_snapshot,
+            evaluation_mode=evaluation_mode,
+        )
         signal.liquidity_score = signal.liquidity_score or 0.0
         if signal.metrics is None:
             signal.metrics = {}
@@ -620,20 +707,7 @@ class AutoTrader:
         signal.metrics.setdefault("latest_volume", latest_volume)
         signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
         signal.metrics["decision_code"] = signal.metrics.get("decision_code") or ("no_signal" if signal.signal == Signal.HOLD else "signal")
-        signal.metrics["evaluation_mode"] = evaluation_mode
         signal.metrics["strategy_selected"] = strategy.name
-        signal.metrics["asset_class"] = asset.asset_class.value
-        signal.metrics["normalized_snapshot"] = normalized_snapshot.to_dict()
-        signal.metrics["quote_available"] = normalized_snapshot.quote_available
-        signal.metrics["quote_stale"] = normalized_snapshot.quote_stale
-        signal.metrics["price_source_used"] = normalized_snapshot.price_source_used
-        signal.metrics["fallback_pricing_used"] = normalized_snapshot.fallback_pricing_used
-        signal.metrics["quote_timestamp"] = (
-            normalized_snapshot.quote_timestamp.isoformat() if normalized_snapshot.quote_timestamp else None
-        )
-        signal.metrics["quote_age_seconds"] = normalized_snapshot.quote_age_seconds
-        signal.metrics["exchange"] = normalized_snapshot.exchange or asset.exchange
-        signal.metrics["source"] = normalized_snapshot.source
         return signal
 
     @staticmethod
@@ -655,7 +729,8 @@ class AutoTrader:
             signal.target_price = float(new_entry_price + (float(signal.target_price) - original_entry_price))
 
     def _normalize_signal_for_long_only(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
-        if signal.signal != Signal.SELL:
+        if signal.signal != Signal.SELL and signal.order_intent != "long_exit":
+            signal.apply_intent_defaults()
             return signal
 
         has_tracked_position = self.portfolio.get_position(asset.symbol) is not None
@@ -664,23 +739,32 @@ class AutoTrader:
             signal.metrics = {}
         signal.metrics.setdefault("has_tracked_position", has_tracked_position)
         signal.metrics.setdefault("has_tracked_long_position", has_sellable_long_position)
+        signal.metrics.setdefault("has_sellable_long_position", has_sellable_long_position)
         signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
         signal.metrics["is_risk_reducing_sell"] = has_sellable_long_position
 
         if has_sellable_long_position:
             signal.signal_type = "exit"
+            signal.order_intent = signal.order_intent or "long_exit"
+            signal.reduce_only = True
+            signal.apply_intent_defaults()
             return signal
 
         if self.settings.short_selling_enabled:
+            signal.apply_intent_defaults()
             return signal
 
         hold_reason = "Exit-only sell ignored: no tracked long position and short selling is disabled."
-        return TradeSignal(
+        hold_signal = TradeSignal(
             symbol=signal.symbol,
             signal=Signal.HOLD,
             asset_class=signal.asset_class,
             strategy_name=signal.strategy_name,
             signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            exit_fraction=signal.exit_fraction,
+            exit_stage=signal.exit_stage,
             confidence_score=0.0,
             price=signal.price,
             entry_price=signal.entry_price,
@@ -704,6 +788,8 @@ class AutoTrader:
                 "blocked_reason": hold_reason,
             },
         )
+        hold_signal.apply_intent_defaults()
+        return hold_signal
 
     def _scan_and_trade(self, *, mode: str = "auto") -> List[Dict[str, Any]]:
         if not self._cycle_guard.acquire(blocking=False):
@@ -783,11 +869,21 @@ class AutoTrader:
                 symbol_evaluations: list[dict[str, Any]] = []
                 latest_signals: dict[str, Any] = {}
                 for asset in assets:
-                    signal = self._evaluate_asset(
+                    normalized_snapshot = self._get_normalized_snapshot(
                         asset,
-                        evaluation_mode="auto",
-                        precomputed_snapshot=snapshot_by_symbol.get(asset.symbol),
+                        snapshot_by_symbol.get(asset.symbol),
                     )
+                    signal = self._evaluate_exit_signal(
+                        asset,
+                        normalized_snapshot=normalized_snapshot,
+                        evaluation_mode="auto",
+                    )
+                    if signal is None:
+                        signal = self._evaluate_asset(
+                            asset,
+                            evaluation_mode="auto",
+                            precomputed_snapshot=normalized_snapshot.to_dict(),
+                        )
                     self._enrich_signal(
                         signal,
                         cycle_id=cycle_id,
@@ -864,8 +960,11 @@ class AutoTrader:
                 ]
                 available_slots = max(0, self.settings.max_positions_total - len(self.portfolio.positions))
                 selected_buy_signals = scale_in_buy_signals + new_symbol_buy_signals[:available_slots]
+                selected_signals = skipped_hold_signals + sell_signals
+                if not sell_signals:
+                    selected_signals += selected_buy_signals
 
-                for signal in skipped_hold_signals + sell_signals + selected_buy_signals:
+                for signal in selected_signals:
                     execution = self.execution_service.process_signal(signal)
                     action_result = self._build_execution_result(signal.symbol, signal, execution)
                     results.append(action_result)
@@ -1284,9 +1383,16 @@ class AutoTrader:
     ) -> None:
         if signal.metrics is None:
             signal.metrics = {}
+        position_state = self.portfolio.get_position_state(signal.symbol)
         signal.metrics.setdefault("signal_id", build_signal_id(signal.symbol, signal.strategy_name, signal.generated_at))
         signal.metrics["cycle_id"] = cycle_id
         signal.metrics["market_overview"] = dict(regime_snapshot or {})
+        signal.metrics.setdefault("has_tracked_position", position_state["has_tracked_position"])
+        signal.metrics.setdefault("has_sellable_long_position", position_state["has_sellable_long_position"])
+        signal.metrics.setdefault("highest_price_since_entry", position_state["highest_price_since_entry"])
+        signal.metrics.setdefault("current_stop", position_state["current_stop"])
+        signal.metrics.setdefault("tp1_hit", position_state["tp1_hit"])
+        signal.metrics.setdefault("tp2_hit", position_state["tp2_hit"])
         if ranked_opportunity is not None:
             signal.metrics["scan_signal_quality_score"] = getattr(ranked_opportunity, "signal_quality_score", None)
             signal.metrics["scan_tags"] = list(getattr(ranked_opportunity, "tags", []))
@@ -1319,6 +1425,10 @@ class AutoTrader:
                 asset_class=signal.asset_class,
                 strategy_name=signal.strategy_name,
                 signal_type=signal.signal_type,
+                order_intent=signal.order_intent,
+                reduce_only=signal.reduce_only,
+                exit_fraction=signal.exit_fraction,
+                exit_stage=signal.exit_stage,
                 confidence_score=signal.confidence_score,
                 price=signal.price,
                 entry_price=signal.entry_price,
@@ -1346,6 +1456,10 @@ class AutoTrader:
             asset_class=signal.asset_class,
             strategy_name=signal.strategy_name,
             signal_type=signal.signal_type,
+            order_intent=signal.order_intent,
+            reduce_only=signal.reduce_only,
+            exit_fraction=signal.exit_fraction,
+            exit_stage=signal.exit_stage,
             confidence_score=signal.confidence_score,
             price=signal.price,
             entry_price=signal.entry_price,

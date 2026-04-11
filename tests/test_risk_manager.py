@@ -188,6 +188,38 @@ def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduc
     assert decision.rule == "approved"
 
 
+def test_explicit_long_exit_is_treated_as_risk_reducing() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        short_selling_enabled=False,
+    )
+    portfolio = Portfolio(cash=95_000.0)
+    portfolio.positions["QQQ"] = Position(
+        symbol="QQQ",
+        quantity=5.0,
+        entry_price=300.0,
+        side="BUY",
+        current_price=200.0,
+    )
+    manager = RiskManager(portfolio, settings=settings)
+
+    decision = manager.evaluate_order(
+        "QQQ",
+        "SELL",
+        2.0,
+        200.0,
+        order_intent="long_exit",
+        reduce_only=True,
+        exit_stage="tp1",
+    )
+
+    assert decision.approved is True
+    assert decision.details["order_intent"] == "long_exit"
+    assert decision.details["reduce_only"] is True
+
+
 def test_sell_without_tracked_long_position_is_rejected_when_short_selling_disabled() -> None:
     settings = Settings(
         _env_file=None,

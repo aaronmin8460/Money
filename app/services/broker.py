@@ -187,6 +187,7 @@ class PaperBroker(BrokerInterface):
                 "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
                 "order_type": order.order_type,
                 "extended_hours": bool((order.metadata or {}).get("extended_hours")),
+                "metadata": dict(order.metadata or {}),
             }
             self.orders.append(result)
 
@@ -500,6 +501,7 @@ class AlpacaBroker(BrokerInterface):
                 "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
                 "order_type": order.order_type,
                 "extended_hours": bool((order.metadata or {}).get("extended_hours")),
+                "metadata": dict(order.metadata or {}),
             }
 
         payload: dict[str, Any] = {
@@ -516,7 +518,10 @@ class AlpacaBroker(BrokerInterface):
             payload["qty"] = order.quantity
         else:
             raise ValueError("OrderRequest must include quantity or notional.")
-        return self._request("POST", "/v2/orders", json=payload)
+        response = self._request("POST", "/v2/orders", json=payload)
+        if isinstance(response, dict):
+            response["metadata"] = dict(order.metadata or {})
+        return response
 
     def _default_tif(self, asset_class: AssetClass) -> str:
         return "gtc" if asset_class == AssetClass.CRYPTO else "day"

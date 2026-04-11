@@ -7,6 +7,7 @@ import pandas as pd
 from app.services import auto_trader as auto_trader_module
 from app.config.settings import Settings
 from app.domain.models import AssetClass, AssetMetadata, MarketSessionStatus, NormalizedMarketSnapshot, QuoteSnapshot, SessionState
+from app.portfolio.portfolio import Position
 from app.services.auto_trader import AutoTrader
 from app.services.scanner import ScanResult
 from app.strategies.base import Signal, TradeSignal
@@ -605,3 +606,148 @@ def test_sync_portfolio_uses_crypto_session_context_in_crypto_only_mode(monkeypa
 
     assert requested_market_open == [AssetClass.CRYPTO]
     assert requested_session_status == [AssetClass.CRYPTO]
+
+
+def test_auto_trader_prefers_exit_signals_before_new_entries(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        universe_scan_enabled=False,
+        default_symbols=["AAPL"],
+        max_positions_total=2,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader.portfolio.positions["MSFT"] = Position(
+        symbol="MSFT",
+        quantity=5.0,
+        entry_price=100.0,
+        side="BUY",
+        current_price=100.0,
+        asset_class=AssetClass.EQUITY,
+        initial_quantity=5.0,
+        highest_price_since_entry=110.0,
+        current_stop=95.0,
+        entry_signal_metadata={
+            "strategy_name": "equity_momentum_breakout",
+            "stop_price": 95.0,
+            "target_price": 120.0,
+        },
+    )
+    processed_signals: list[tuple[str, str, str | None]] = []
+    snapshots = {
+        "AAPL": NormalizedMarketSnapshot(
+            symbol="AAPL",
+            asset_class=AssetClass.EQUITY,
+            evaluation_price=150.0,
+            quote_available=True,
+            quote_stale=False,
+            price_source_used="last_trade",
+            session_state="regular",
+            exchange="NASDAQ",
+            source="mock",
+        ).to_dict(),
+        "MSFT": NormalizedMarketSnapshot(
+            symbol="MSFT",
+            asset_class=AssetClass.EQUITY,
+            evaluation_price=94.0,
+            quote_available=True,
+            quote_stale=False,
+            price_source_used="last_trade",
+            session_state="regular",
+            exchange="NASDAQ",
+            source="mock",
+        ).to_dict(),
+    }
+
+    monkeypatch.setattr(trader, "_sync_portfolio_from_broker", lambda: None)
+    monkeypatch.setattr(
+        trader.scanner,
+        "scan",
+        lambda *args, **kwargs: ScanResult(
+            generated_at=datetime.now(timezone.utc),
+            asset_class="equity",
+            scanned_count=2,
+            opportunities=[],
+            top_gainers=[],
+            top_losers=[],
+            unusual_volume=[],
+            breakouts=[],
+            pullbacks=[],
+            volatility=[],
+            momentum=[],
+            regime_status={},
+            errors=[],
+            symbol_snapshots=snapshots,
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_resolve_asset",
+        lambda symbol, asset_class=None: AssetMetadata(
+            symbol=symbol,
+            name=symbol,
+            asset_class=AssetClass.EQUITY,
+            exchange="NASDAQ",
+            tradable=True,
+        ),
+    )
+
+    def fake_evaluate_exit(asset, *, normalized_snapshot, evaluation_mode):
+        if asset.symbol != "MSFT":
+            return None
+        return TradeSignal(
+            symbol="MSFT",
+            signal=Signal.SELL,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            exit_stage="stop",
+            position_size=5.0,
+            price=94.0,
+            entry_price=94.0,
+            reason="Hard stop hit",
+            metrics={"decision_code": "exit_signal", "normalized_snapshot": snapshots["MSFT"]},
+        )
+
+    monkeypatch.setattr(trader, "_evaluate_exit_signal", fake_evaluate_exit)
+    monkeypatch.setattr(
+        trader,
+        "_evaluate_asset",
+        lambda asset, **kwargs: TradeSignal(
+            symbol=asset.symbol,
+            signal=Signal.BUY,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            price=150.0,
+            entry_price=150.0,
+            stop_price=145.0,
+            reason="Fresh breakout",
+            metrics={"decision_code": "signal", "normalized_snapshot": snapshots[asset.symbol]},
+        ),
+    )
+    monkeypatch.setattr(trader, "_enrich_signal", lambda signal, **kwargs: None)
+    monkeypatch.setattr(trader, "_apply_ml_score_filter", lambda signal, **kwargs: signal)
+    monkeypatch.setattr(trader, "_observe_broker_order_statuses", lambda cycle_id: None)
+
+    def fake_process_signal(signal: TradeSignal):
+        processed_signals.append((signal.symbol, signal.signal.value, signal.exit_stage))
+        return {
+            "latest_price": signal.price,
+            "proposal": {"symbol": signal.symbol},
+            "risk": {"rule": "approved", "reason": "ok", "details": {}},
+            "action": "dry_run",
+            "order": {"id": f"order-{signal.symbol}", "symbol": signal.symbol},
+        }
+
+    monkeypatch.setattr(trader.execution_service, "process_signal", fake_process_signal)
+
+    response = trader.run_now()
+
+    assert response["success"] is True
+    assert processed_signals == [("MSFT", "SELL", "stop")]
+    aapl_evaluation = next(item for item in trader.get_status()["last_symbol_evaluations"] if item["symbol"] == "AAPL")
+    assert aapl_evaluation["action"] == "skipped"

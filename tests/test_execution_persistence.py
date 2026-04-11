@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from app.config.settings import Settings
 from app.db.models import FillRecord, NormalizedSignalRecord
 from app.db.session import SessionLocal
@@ -573,3 +575,87 @@ def test_add_on_tranches_do_not_consume_new_symbol_slots(tmp_path) -> None:
     assert second_aapl["risk"]["details"]["tranche_consumes_new_slot"] is False
     assert first_msft["action"] == "rejected"
     assert first_msft["risk"]["rule"] == "position_count"
+
+
+def test_persisted_order_metadata_includes_order_intent_and_exit_stage(tmp_path) -> None:
+    (tmp_path / "AAPL.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,100,101,99,100,10000\n"
+        "2024-01-02,110,111,109,110,10000\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    portfolio.positions["AAPL"] = Position(
+        symbol="AAPL",
+        quantity=10.0,
+        entry_price=100.0,
+        side="BUY",
+        current_price=110.0,
+        asset_class=AssetClass.EQUITY,
+        initial_quantity=10.0,
+        highest_price_since_entry=110.0,
+        current_stop=100.0,
+        tp1_hit=False,
+        tp2_hit=False,
+        entry_signal_metadata={
+            "strategy_name": "equity_momentum_breakout",
+            "stop_price": 95.0,
+            "target_price": 120.0,
+        },
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    with SessionLocal() as session:
+        session.query(FillRecord).filter(FillRecord.symbol == "AAPL").delete()
+        session.query(NormalizedSignalRecord).filter(NormalizedSignalRecord.symbol == "AAPL").delete()
+        session.commit()
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            signal=Signal.SELL,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            exit_stage="tp1",
+            position_size=5.0,
+            price=110.0,
+            entry_price=110.0,
+            reason="Take first profit target",
+        )
+    )
+
+    assert result["action"] == "dry_run"
+    with SessionLocal() as session:
+        fill_row = session.query(FillRecord).filter(FillRecord.symbol == "AAPL").one()
+        signal_row = session.query(NormalizedSignalRecord).filter(NormalizedSignalRecord.symbol == "AAPL").one()
+
+    raw_payload = json.loads(fill_row.raw_payload)
+    signal_metrics = json.loads(signal_row.metrics_json)
+
+    assert raw_payload["metadata"]["order_intent"] == "long_exit"
+    assert raw_payload["metadata"]["exit_stage"] == "tp1"
+    assert raw_payload["metadata"]["reduce_only"] is True
+    assert signal_metrics["order_intent"] == "long_exit"
+    assert signal_metrics["exit_stage"] == "tp1"

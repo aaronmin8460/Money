@@ -32,6 +32,10 @@ class TradeSignal:
     asset_class: AssetClass = AssetClass.UNKNOWN
     strategy_name: str = "unknown"
     signal_type: str = "entry"
+    order_intent: str | None = None
+    reduce_only: bool = False
+    exit_fraction: float | None = None
+    exit_stage: str | None = None
     direction: SignalDirection = SignalDirection.FLAT
     strength: float = 0.0
     confidence_score: float | None = None
@@ -59,12 +63,34 @@ class TradeSignal:
             self.price = self.entry_price
         if self.confidence_score is None:
             self.confidence_score = max(0.0, min(1.0, abs(self.strength)))
+        self.apply_intent_defaults()
+
+    def apply_intent_defaults(self) -> None:
+        self.order_intent = self._resolve_order_intent()
+        if self.order_intent == "long_exit":
+            self.signal_type = "exit"
+            self.reduce_only = True
+        self.direction = self._resolve_direction()
+
+    def _resolve_order_intent(self) -> str | None:
+        if self.order_intent:
+            return self.order_intent
+        if self.reduce_only or self.exit_fraction is not None or self.exit_stage is not None:
+            return "long_exit"
+        if self.signal == Signal.BUY and self.signal_type == "entry":
+            return "long_entry"
+        if self.signal == Signal.SELL and self.signal_type == "exit":
+            return "long_exit"
+        return None
+
+    def _resolve_direction(self) -> SignalDirection:
+        if self.order_intent in {"long_entry", "long_exit"}:
+            return SignalDirection.LONG
         if self.signal == Signal.BUY:
-            self.direction = SignalDirection.LONG
-        elif self.signal == Signal.SELL:
-            self.direction = SignalDirection.SHORT
-        else:
-            self.direction = SignalDirection.FLAT
+            return SignalDirection.LONG
+        if self.signal == Signal.SELL:
+            return SignalDirection.SHORT
+        return SignalDirection.FLAT
 
     @staticmethod
     def _normalize_timestamp(value: datetime | str | None) -> str | None:
@@ -83,6 +109,10 @@ class TradeSignal:
             "asset_class": self.asset_class.value,
             "strategy_name": self.strategy_name,
             "signal_type": self.signal_type,
+            "order_intent": self.order_intent,
+            "reduce_only": self.reduce_only,
+            "exit_fraction": self.exit_fraction,
+            "exit_stage": self.exit_stage,
             "direction": self.direction.value,
             "strength": self.strength,
             "confidence_score": self.confidence_score,
