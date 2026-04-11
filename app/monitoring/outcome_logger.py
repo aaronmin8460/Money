@@ -87,6 +87,8 @@ class OutcomeLogger:
 
 
 def derive_bootstrap_label(*, signal: TradeSignal, action: str, classification: str) -> tuple[int | None, str | None]:
+    if classification == "ml_inference_error":
+        return None, None
     if classification in {"risk_rejected", "no_position_to_sell"}:
         return 0, "execution_outcome"
     if classification in {"submitted", "dry_run"}:

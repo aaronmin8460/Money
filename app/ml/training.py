@@ -5,10 +5,9 @@ import random
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 from app.ml.evaluation import evaluate_predictions
 from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, feature_dict
+from app.ml.preprocessing import prepare_feature_frame
 from app.ml.schema import FEATURE_VERSION
 
 try:
@@ -44,19 +43,6 @@ def _split_rows(rows: list[dict[str, Any]], validation_ratio: float = 0.2) -> tu
     validation = shuffled[:validation_size]
     training = shuffled[validation_size:] or shuffled[:]
     return training, validation
-
-
-def _prepare_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
-    frame = pd.DataFrame([feature_dict(row) for row in rows])
-    for column in CATEGORICAL_FEATURES:
-        if column not in frame:
-            frame[column] = ""
-        frame[column] = frame[column].fillna("").astype(str)
-    for column in NUMERIC_FEATURES:
-        if column not in frame:
-            frame[column] = 0.0
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
-    return frame
 
 
 def train_model(
@@ -126,8 +112,8 @@ def train_model(
         estimator = LogisticRegression(max_iter=500, class_weight="balanced")
 
     train_rows, validation_rows = _split_rows(labeled_rows)
-    train_frame = _prepare_dataframe(train_rows)
-    validation_frame = _prepare_dataframe(validation_rows)
+    train_frame = prepare_feature_frame(train_rows).frame
+    validation_frame = prepare_feature_frame(validation_rows).frame
     y_train = [int(row["label"]) for row in train_rows]
     y_validation = [int(row["label"]) for row in validation_rows]
 
@@ -173,6 +159,7 @@ def train_model(
         "feature_version": FEATURE_VERSION,
         "categorical_features": list(CATEGORICAL_FEATURES),
         "numeric_features": list(NUMERIC_FEATURES),
+        "feature_columns": list(CATEGORICAL_FEATURES + NUMERIC_FEATURES),
         "threshold": threshold,
         "metrics": metrics,
     }

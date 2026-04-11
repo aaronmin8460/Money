@@ -78,6 +78,7 @@ class ExecutionService:
                     "extended_hours_not_supported_for_asset",
                     "no_position_to_sell",
                     "skipped_low_ml_score",
+                    "ml_inference_error",
                 }
                 else "hold"
             )

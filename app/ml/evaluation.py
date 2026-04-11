@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-import pandas as pd
-
-from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, feature_dict
+from app.ml.features import feature_dict
+from app.ml.preprocessing import model_uses_internal_preprocessing, prepare_feature_frame
 
 
 def _binary_auc(y_true: list[int], y_score: list[float]) -> float | None:
@@ -54,20 +53,18 @@ def evaluate_predictions(y_true: list[int], y_score: list[float], *, threshold: 
 def predict_scores(model_bundle: dict[str, Any], rows: Iterable[dict[str, Any] | Any]) -> list[float]:
     model = model_bundle["model"]
     feature_rows = [feature_dict(row) for row in rows]
-    frame = pd.DataFrame(feature_rows)
-    for column in CATEGORICAL_FEATURES:
-        if column not in frame:
-            frame[column] = ""
-        frame[column] = frame[column].fillna("").astype(str)
-    for column in NUMERIC_FEATURES:
-        if column not in frame:
-            frame[column] = 0.0
-        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
-    ordered_frame = frame[CATEGORICAL_FEATURES + NUMERIC_FEATURES]
+    prepared = prepare_feature_frame(feature_rows, model_bundle=model_bundle)
+    scoring_frame = prepared.frame
+    if hasattr(model, "predict_proba") and not model_uses_internal_preprocessing(model):
+        scoring_frame = prepare_feature_frame(
+            feature_rows,
+            model_bundle=model_bundle,
+            fill_missing_numeric=0.0,
+        ).frame
     if hasattr(model, "predict_scores"):
         return [float(value) for value in model.predict_scores(feature_rows)]
     if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(ordered_frame)
+        probabilities = model.predict_proba(scoring_frame)
         return [float(row[1]) for row in probabilities]
     if callable(model):
         return [float(model(row)) for row in feature_rows]

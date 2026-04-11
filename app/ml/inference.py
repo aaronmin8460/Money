@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-import pandas as pd
-
 from app.config.settings import Settings, get_settings
-from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, build_signal_feature_row
+from app.ml.features import build_signal_feature_row
+from app.ml.preprocessing import model_uses_internal_preprocessing, prepare_feature_frame
 from app.ml.registry import load_registry
 from app.ml.schema import ModelScoreResult
 from app.ml.training import load_model_bundle
@@ -74,17 +73,38 @@ class SignalScorer:
             market_overview=market_overview,
             news_features=news_features,
         )
-        frame = pd.DataFrame([feature_row.to_dict()])
-        categorical = list(bundle.get("categorical_features", CATEGORICAL_FEATURES))
-        numeric = list(bundle.get("numeric_features", NUMERIC_FEATURES))
-        columns = categorical + numeric
-        for column in categorical:
-            if column not in frame:
-                frame[column] = ""
-        for column in numeric:
-            if column not in frame:
-                frame[column] = 0.0
-        score = float(bundle["model"].predict_proba(frame[columns])[0][1])
+        prepared = prepare_feature_frame([feature_row], model_bundle=bundle)
+        scoring_frame = prepared.frame
+        model = bundle["model"]
+        if not model_uses_internal_preprocessing(model):
+            scoring_frame = prepare_feature_frame(
+                [feature_row],
+                model_bundle=bundle,
+                fill_missing_numeric=0.0,
+            ).frame
+        try:
+            score = float(model.predict_proba(scoring_frame)[0][1])
+        except Exception as exc:
+            logger.warning(
+                "ML inference failed for candidate; skipping trade candidate conservatively",
+                extra={
+                    "symbol": signal.symbol,
+                    "strategy": signal.strategy_name,
+                    "cycle_id": str((signal.metrics or {}).get("cycle_id") or ""),
+                    "model_type": str(bundle.get("model_type")),
+                    "missing_numeric_features": prepared.missing_numeric_features,
+                    "feature_version": str(bundle.get("feature_version") or ""),
+                    "error": str(exc),
+                },
+            )
+            return ModelScoreResult(
+                enabled=True,
+                score=None,
+                threshold=self.settings.ml_min_score_threshold,
+                passed=False,
+                model_type=str(bundle.get("model_type")),
+                reason="ml_inference_error",
+            )
         threshold = float(self.settings.ml_min_score_threshold)
         return ModelScoreResult(
             enabled=True,

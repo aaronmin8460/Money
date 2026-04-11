@@ -26,6 +26,8 @@ def normalize_outcome_classification(action: str, risk_rule: str | None = None) 
         return "dry_run"
     if normalized_action == "skipped_low_ml_score":
         return "skipped_low_ml_score"
+    if normalized_rule == "ml_inference_error":
+        return "ml_inference_error"
     if normalized_rule == "market_closed_extended_hours_disabled":
         return "market_closed_extended_hours_disabled"
     if normalized_rule in {"market_closed", "market_closed_no_extended_session"}:

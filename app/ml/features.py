@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from app.ml.schema import FEATURE_VERSION, SignalFeatureRow
@@ -45,9 +46,12 @@ def _safe_float(value: Any) -> float | None:
     if value in {None, ""}:
         return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
 def _safe_str(value: Any) -> str | None:

@@ -930,6 +930,7 @@ class AutoTrader:
             "extended_hours_not_supported_for_asset",
             "no_position_to_sell",
             "skipped_low_ml_score",
+            "ml_inference_error",
         }:
             return "skipped"
         return "hold"
@@ -1215,8 +1216,37 @@ class AutoTrader:
         if signal.metrics is None:
             signal.metrics = {}
         signal.metrics["ml"] = result.to_dict()
-        if signal.signal != Signal.BUY or result.score is None or result.passed:
+        if signal.signal != Signal.BUY or result.passed:
             return signal
+        if result.reason == "ml_inference_error":
+            skip_reason = "Skipped: ml_inference_error (candidate could not be scored safely)."
+            return TradeSignal(
+                symbol=signal.symbol,
+                signal=Signal.HOLD,
+                asset_class=signal.asset_class,
+                strategy_name=signal.strategy_name,
+                signal_type=signal.signal_type,
+                confidence_score=signal.confidence_score,
+                price=signal.price,
+                entry_price=signal.entry_price,
+                reason=skip_reason,
+                timestamp=signal.timestamp,
+                atr=signal.atr,
+                stop_price=signal.stop_price,
+                target_price=signal.target_price,
+                position_size=signal.position_size,
+                trailing_stop=signal.trailing_stop,
+                momentum_score=signal.momentum_score,
+                liquidity_score=signal.liquidity_score,
+                spread_score=signal.spread_score,
+                regime_state=signal.regime_state,
+                generated_at=signal.generated_at,
+                metrics={
+                    **(signal.metrics or {}),
+                    "decision_code": "ml_inference_error",
+                    "original_signal": Signal.BUY.value,
+                },
+            )
         return TradeSignal(
             symbol=signal.symbol,
             signal=Signal.HOLD,
@@ -1228,7 +1258,7 @@ class AutoTrader:
             entry_price=signal.entry_price,
             reason=(
                 f"Skipped: skipped_low_ml_score "
-                f"(score={result.score:.3f}, threshold={self.settings.ml_min_score_threshold:.3f})."
+                f"(score={(result.score or 0.0):.3f}, threshold={self.settings.ml_min_score_threshold:.3f})."
             ),
             timestamp=signal.timestamp,
             atr=signal.atr,
