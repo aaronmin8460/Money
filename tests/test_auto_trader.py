@@ -284,6 +284,7 @@ def test_auto_trader_crypto_only_mode_evaluates_all_scanned_crypto_symbols(monke
     )
     trader = AutoTrader(settings)
     evaluated: list[str] = []
+    scan_calls: list[dict[str, object]] = []
     snapshot_payload = NormalizedMarketSnapshot(
         symbol="BTC/USD",
         asset_class=AssetClass.CRYPTO,
@@ -308,21 +309,23 @@ def test_auto_trader_crypto_only_mode_evaluates_all_scanned_crypto_symbols(monke
     monkeypatch.setattr(
         trader.scanner,
         "scan",
-        lambda *args, **kwargs: ScanResult(
-            generated_at=datetime.now(timezone.utc),
-            asset_class="crypto",
-            scanned_count=2,
-            opportunities=[],
-            top_gainers=[],
-            top_losers=[],
-            unusual_volume=[],
-            breakouts=[],
-            pullbacks=[],
-            volatility=[],
-            momentum=[],
-            regime_status={},
-            errors=[],
-            symbol_snapshots={"BTC/USD": snapshot_payload, "ETH/USD": eth_snapshot_payload},
+        lambda *args, **kwargs: (
+            scan_calls.append({"args": args, "kwargs": kwargs}) or ScanResult(
+                generated_at=datetime.now(timezone.utc),
+                asset_class="crypto",
+                scanned_count=2,
+                opportunities=[],
+                top_gainers=[],
+                top_losers=[],
+                unusual_volume=[],
+                breakouts=[],
+                pullbacks=[],
+                volatility=[],
+                momentum=[],
+                regime_status={},
+                errors=[],
+                symbol_snapshots={"BTC/USD": snapshot_payload, "ETH/USD": eth_snapshot_payload},
+            )
         ),
     )
     monkeypatch.setattr(
@@ -358,8 +361,112 @@ def test_auto_trader_crypto_only_mode_evaluates_all_scanned_crypto_symbols(monke
 
     assert response["success"] is True
     assert evaluated == ["BTC/USD", "ETH/USD"]
+    assert scan_calls[0]["kwargs"]["symbols"] == ["BTC/USD", "ETH/USD"]
+    assert scan_calls[0]["kwargs"]["asset_class"] == AssetClass.CRYPTO
     assert trader.get_status()["last_scanned_symbols"] == ["BTC/USD", "ETH/USD"]
     assert set(trader.get_status()["last_signals"].keys()) == {"BTC/USD", "ETH/USD"}
+
+
+def test_evaluate_asset_rebases_crypto_buy_levels_to_live_snapshot_price(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    asset = AssetMetadata(
+        symbol="ETH/USD",
+        name="Ethereum",
+        asset_class=AssetClass.CRYPTO,
+        exchange="CRYPTO",
+        tradable=True,
+    )
+    snapshot = NormalizedMarketSnapshot(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        last_trade_price=80.0,
+        bid_price=79.5,
+        ask_price=80.5,
+        quote_available=True,
+        quote_stale=False,
+        price_source_used="last_trade",
+        evaluation_price=80.0,
+        session_state="always_open",
+        exchange="CRYPTO",
+        source="alpaca",
+    )
+
+    class StubStrategy:
+        name = "crypto_momentum_trend"
+
+        @staticmethod
+        def supports(_asset_class):
+            return True
+
+        @staticmethod
+        def generate_signals(symbol, data, context=None):
+            return [
+                TradeSignal(
+                    symbol=symbol,
+                    signal=Signal.BUY,
+                    asset_class=AssetClass.CRYPTO,
+                    strategy_name="crypto_momentum_trend",
+                    price=100.0,
+                    entry_price=100.0,
+                    stop_price=90.0,
+                    target_price=122.0,
+                    reason="Bullish setup",
+                )
+            ]
+
+    bars = pd.DataFrame(
+        {
+            "Date": pd.date_range("2024-01-01", periods=5, tz="UTC"),
+            "Open": [1, 2, 3, 4, 5],
+            "High": [2, 3, 4, 5, 6],
+            "Low": [0.5, 1.5, 2.5, 3.5, 4.5],
+            "Close": [1, 2, 3, 4, 5],
+            "Volume": [10, 11, 12, 13, 14],
+        }
+    )
+
+    monkeypatch.setattr(trader, "_select_strategy_for_asset", lambda _asset: StubStrategy())
+    monkeypatch.setattr(trader.market_data_service, "fetch_bars", lambda *args, **kwargs: bars)
+    monkeypatch.setattr(
+        trader.market_data_service,
+        "get_session_status",
+        lambda *args, **kwargs: MarketSessionStatus(
+            asset_class=AssetClass.CRYPTO,
+            is_open=True,
+            session_state=SessionState.ALWAYS_OPEN,
+            extended_hours=False,
+            is_24_7=True,
+        ),
+    )
+
+    signal = trader._evaluate_asset(
+        asset,
+        evaluation_mode="auto",
+        precomputed_snapshot=snapshot.to_dict(),
+    )
+
+    assert signal.signal == Signal.BUY
+    assert signal.entry_price == 80.0
+    assert signal.stop_price == 70.0
+    assert signal.target_price == 102.0
+
+    decision = trader.risk_manager.evaluate_order(
+        "ETH/USD",
+        "BUY",
+        1.0,
+        signal.entry_price,
+        stop_price=signal.stop_price,
+        asset_class=AssetClass.CRYPTO,
+    )
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
 
 
 def test_evaluate_asset_uses_snapshot_exchange_metadata_and_normalizes_bad_timestamp(monkeypatch) -> None:

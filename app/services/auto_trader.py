@@ -254,6 +254,23 @@ class AutoTrader:
         latest_rejection = self.risk_manager.get_rejection_snapshot(limit=1)["latest"]
         notifier_diagnostics = get_discord_notifier(self.settings).diagnostics()
         with self._state_lock:
+            scan_selection_mode = self._last_scan_overview.get("scan_selection_mode")
+            if scan_selection_mode is None:
+                scan_selection_mode = (
+                    "configured_active_symbols"
+                    if self.settings.crypto_only_mode or not self.settings.universe_scan_enabled
+                    else "catalog_universe"
+                )
+            scan_requested_symbols = self._last_scan_overview.get("scan_requested_symbols")
+            if not scan_requested_symbols and scan_selection_mode == "configured_active_symbols":
+                scan_requested_symbols = list(self.settings.active_symbols)
+            scan_ranking_limit = self._last_scan_overview.get("scan_ranking_limit")
+            if scan_ranking_limit is None:
+                scan_ranking_limit = (
+                    max(1, len(self.settings.active_symbols))
+                    if scan_selection_mode == "configured_active_symbols"
+                    else max(10, self.settings.max_positions_total * 3)
+                )
             return {
                 "enabled": self.settings.auto_trade_enabled,
                 "running": self._running,
@@ -285,6 +302,12 @@ class AutoTrader:
                 "last_ranked_candidates": self._last_ranked_candidates,
                 "last_regime_snapshot": self._last_regime_snapshot,
                 "last_scan_overview": self._last_scan_overview,
+                "scan_selection_mode": scan_selection_mode,
+                "scan_requested_symbols": scan_requested_symbols or [],
+                "scan_ranking_limit": scan_ranking_limit,
+                "last_scan_scanned_count": self._last_scan_overview.get("scanned_count"),
+                "last_ranked_candidate_count": len(self._last_ranked_candidates),
+                "last_symbol_evaluation_count": len(self._last_symbol_evaluations),
                 "market_open": self._market_open,
                 "market_session_state": self._market_session_state,
                 "crypto_monitoring_active": AssetClass.CRYPTO in self.settings.enabled_asset_class_set,
@@ -584,8 +607,10 @@ class AutoTrader:
         )[0]
         signal = self._normalize_signal_for_long_only(asset, signal)
         if normalized_snapshot.evaluation_price is not None:
-            signal.price = float(normalized_snapshot.evaluation_price)
-            signal.entry_price = float(normalized_snapshot.evaluation_price)
+            evaluation_price = float(normalized_snapshot.evaluation_price)
+            self._rebase_signal_levels(signal, evaluation_price)
+            signal.price = evaluation_price
+            signal.entry_price = evaluation_price
         signal.liquidity_score = signal.liquidity_score or 0.0
         if signal.metrics is None:
             signal.metrics = {}
@@ -610,6 +635,24 @@ class AutoTrader:
         signal.metrics["exchange"] = normalized_snapshot.exchange or asset.exchange
         signal.metrics["source"] = normalized_snapshot.source
         return signal
+
+    @staticmethod
+    def _rebase_signal_levels(signal: TradeSignal, new_entry_price: float) -> None:
+        if signal.signal not in {Signal.BUY, Signal.SELL}:
+            return
+
+        original_entry_price = signal.entry_price if signal.entry_price is not None else signal.price
+        if original_entry_price is None:
+            return
+
+        original_entry_price = float(original_entry_price)
+        if abs(original_entry_price - new_entry_price) < 1e-9:
+            return
+
+        if signal.stop_price is not None:
+            signal.stop_price = float(new_entry_price + (float(signal.stop_price) - original_entry_price))
+        if signal.target_price is not None:
+            signal.target_price = float(new_entry_price + (float(signal.target_price) - original_entry_price))
 
     def _normalize_signal_for_long_only(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
         if signal.signal != Signal.SELL:
@@ -695,12 +738,27 @@ class AutoTrader:
             with self._execution_lock:
                 scan_bar_index = self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
-                if self.settings.universe_scan_enabled:
-                    scan_result = self.scanner.scan(limit=max(10, self.settings.max_positions_total * 3))
+                scan_selection_mode = "catalog_universe"
+                requested_scan_symbols: list[str] = []
+                scan_ranking_limit = max(10, self.settings.max_positions_total * 3)
+                if self.settings.crypto_only_mode:
+                    requested_scan_symbols = list(self.settings.active_symbols)
+                    scan_selection_mode = "configured_active_symbols"
+                    scan_ranking_limit = max(1, len(requested_scan_symbols))
+                    scan_result = self.scanner.scan(
+                        asset_class=self.settings.primary_runtime_asset_class,
+                        symbols=requested_scan_symbols,
+                        limit=scan_ranking_limit,
+                    )
+                elif self.settings.universe_scan_enabled:
+                    scan_result = self.scanner.scan(limit=scan_ranking_limit)
                 else:
+                    requested_scan_symbols = list(self.settings.active_symbols)
+                    scan_selection_mode = "configured_active_symbols"
+                    scan_ranking_limit = max(1, len(requested_scan_symbols))
                     scan_result = self.scanner.scan(
                         symbols=self.settings.active_symbols,
-                        limit=len(self.settings.active_symbols),
+                        limit=scan_ranking_limit,
                     )
 
                 candidate_symbols = [item.symbol for item in scan_result.opportunities]
@@ -854,6 +912,10 @@ class AutoTrader:
                     self._last_scan_overview["cycle_id"] = cycle_id
                     self._last_scan_overview["mode"] = mode
                     self._last_scan_overview["outcome_counts"] = outcome_counts
+                    self._last_scan_overview["scan_selection_mode"] = scan_selection_mode
+                    self._last_scan_overview["scan_requested_symbols"] = requested_scan_symbols
+                    self._last_scan_overview["scan_ranking_limit"] = scan_ranking_limit
+                    self._last_scan_overview["evaluated_symbol_count"] = len(symbol_evaluations)
                     self._last_symbol_evaluations = symbol_evaluations
                     self._last_run_result = self._summarize_results(mode, results)
 

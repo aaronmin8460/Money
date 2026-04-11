@@ -113,6 +113,30 @@ def test_risk_manager_distinguishes_notional_limit_from_stop_risk() -> None:
     assert approved_decision.approved is True
 
 
+def test_risk_manager_accepts_valid_crypto_buy_stop_validation() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        max_risk_per_trade=0.01,
+        max_position_notional=10_000.0,
+    )
+    portfolio = Portfolio()
+    manager = RiskManager(portfolio, settings=settings, broker=FakeBroker())
+
+    decision = manager.evaluate_order(
+        "ETH/USD",
+        "BUY",
+        1.0,
+        2322.32,
+        stop_price=2200.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
+
+
 def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
     settings = Settings(
         _env_file=None,

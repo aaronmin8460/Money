@@ -298,6 +298,8 @@ def test_crypto_only_diagnostics_report_crypto_runtime_focus() -> None:
     assert auto_payload["active_symbols"] == ["BTC/USD", "ETH/USD", "SOL/USD"]
     assert auto_payload["strategy_routing"] == {"crypto": "crypto_momentum_trend"}
     assert auto_payload["primary_runtime_asset_class"] == "crypto"
+    assert auto_payload["scan_selection_mode"] == "configured_active_symbols"
+    assert auto_payload["scan_requested_symbols"] == ["BTC/USD", "ETH/USD", "SOL/USD"]
 
     assert strategy_response.status_code == 200
     strategy_payload = strategy_response.json()

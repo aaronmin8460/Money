@@ -1,6 +1,7 @@
 import pandas as pd
 
 from app.domain.models import AssetClass, AssetMetadata
+from app.strategies.crypto_momentum_trend import CryptoMomentumTrendStrategy
 from app.strategies.regime_momentum_breakout import RegimeMomentumBreakoutStrategy
 from app.strategies.base import Signal, StrategyContext
 from app.strategies.ema_crossover import EMACrossoverStrategy
@@ -96,3 +97,29 @@ def test_ema_crossover_keeps_bearish_sell_as_exit_when_long_position_exists() ->
 
     assert signals[-1].signal == Signal.SELL
     assert signals[-1].signal_type == "exit"
+
+
+def test_crypto_momentum_trend_buy_signal_has_stop_below_entry_and_target_above_entry() -> None:
+    dates = pd.date_range(start="2024-01-01", periods=30, freq="D")
+    closes = [2000 + (index * 15) for index in range(30)]
+    data = pd.DataFrame(
+        {
+            "Date": dates,
+            "Open": [close - 5 for close in closes],
+            "High": [close + 10 for close in closes],
+            "Low": [close - 10 for close in closes],
+            "Close": closes,
+            "Volume": [1000 + (index * 50) for index in range(30)],
+        }
+    )
+
+    strategy = CryptoMomentumTrendStrategy()
+    signals = strategy.generate_signals("ETH/USD", data)
+
+    assert signals
+    signal = signals[-1]
+    assert signal.signal == Signal.BUY
+    assert signal.stop_price is not None
+    assert signal.target_price is not None
+    assert signal.stop_price < signal.entry_price
+    assert signal.target_price > signal.entry_price

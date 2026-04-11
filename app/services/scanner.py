@@ -14,7 +14,7 @@ from app.db.session import SessionLocal
 from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot, RankedOpportunity
 from app.monitoring.logger import get_logger
 from app.services.asset_catalog import AssetCatalogService
-from app.services.market_data import MarketDataService
+from app.services.market_data import MarketDataService, canonicalize_symbol, infer_asset_class, normalize_asset_class
 
 logger = get_logger("scanner")
 
@@ -113,11 +113,31 @@ class ScannerService:
         symbols: list[str] | None,
     ) -> list[AssetMetadata]:
         if symbols:
+            resolved_asset_class = normalize_asset_class(asset_class)
             universe = []
             for symbol in symbols:
                 asset = self.asset_catalog.get_asset(symbol)
-                if asset is not None:
-                    universe.append(asset)
+                if asset is None:
+                    fallback_asset_class = (
+                        resolved_asset_class
+                        if resolved_asset_class != AssetClass.UNKNOWN
+                        else infer_asset_class(symbol)
+                    )
+                    canonical_symbol = canonicalize_symbol(symbol, fallback_asset_class)
+                    asset = AssetMetadata(
+                        symbol=canonical_symbol,
+                        name=canonical_symbol,
+                        asset_class=fallback_asset_class,
+                        exchange="CRYPTO" if fallback_asset_class == AssetClass.CRYPTO else None,
+                        tradable=True,
+                        fractionable=fallback_asset_class in {AssetClass.ETF, AssetClass.CRYPTO},
+                        shortable=fallback_asset_class != AssetClass.CRYPTO,
+                        easy_to_borrow=fallback_asset_class != AssetClass.CRYPTO,
+                        marginable=fallback_asset_class != AssetClass.CRYPTO,
+                        attributes=["explicit_symbol_fallback"],
+                        raw={"source": "explicit_symbol_fallback"},
+                    )
+                universe.append(asset)
             return universe
 
         universe = self.asset_catalog.get_scan_universe(asset_class)
