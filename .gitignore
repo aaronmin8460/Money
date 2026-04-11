@@ -9,3 +9,7 @@ venv/
 .env.*
 !.env.example
 .DS_Store
+logs/
+models/*.joblib
+models/training_data.jsonl
+!models/registry.json

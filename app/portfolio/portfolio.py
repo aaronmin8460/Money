@@ -208,7 +208,11 @@ class Portfolio:
         as_of: datetime | None = None,
     ) -> bool:
         baseline_time = self._normalize_timestamp(as_of)
-        if self.daily_baseline_equity is None or self.daily_baseline_date != baseline_time.date():
+        baseline_date = baseline_time.date()
+        if self.daily_baseline_equity is None or self.daily_baseline_date is None:
+            self.reset_daily_baseline(equity=equity, as_of=baseline_time)
+            return True
+        if baseline_date > self.daily_baseline_date:
             self.reset_daily_baseline(equity=equity, as_of=baseline_time)
             return True
         return False

@@ -15,9 +15,12 @@ from app.db.models import (
     SignalEvent,
 )
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass
+from app.domain.models import AssetClass, SessionState
 from app.monitoring.discord_notifier import get_discord_notifier
+from app.monitoring.events import build_signal_id
 from app.monitoring.logger import get_logger
+from app.monitoring.outcome_logger import get_outcome_logger
+from app.monitoring.trade_logger import get_trade_logger
 from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskDecision, RiskManager
 from app.services.broker import BrokerInterface, OrderRequest
@@ -65,13 +68,27 @@ class ExecutionService:
         if signal.signal == Signal.HOLD:
             normalized_snapshot = (signal.metrics or {}).get("normalized_snapshot", {})
             latest_price = signal.price or normalized_snapshot.get("evaluation_price")
+            decision_code = str((signal.metrics or {}).get("decision_code") or "no_signal")
+            hold_action = (
+                "skipped"
+                if decision_code in {
+                    "market_closed",
+                    "market_closed",
+                    "market_closed_extended_hours_disabled",
+                    "extended_hours_not_supported_for_asset",
+                    "no_position_to_sell",
+                    "skipped_low_ml_score",
+                }
+                else "hold"
+            )
             hold_risk = RiskDecision(
                 approved=False,
                 reason=signal.reason or "No trade signal.",
-                rule=(signal.metrics or {}).get("decision_code", "no_signal"),
+                rule=decision_code,
                 details={
                     **(signal.metrics or {}),
                     "latest_price": latest_price,
+                    "action": hold_action,
                 },
             )
             hold_proposal = OrderRequest(
@@ -86,20 +103,29 @@ class ExecutionService:
                 metadata={"hold": True, "normalized_snapshot": normalized_snapshot},
             )
             self._persist_signal_event(signal, latest_price or 0.0, 0.0, hold_risk)
-            self._notify_trade_event(
-                action="hold",
+            self._log_execution_artifacts(
+                action=hold_action,
                 signal=signal,
                 proposal=hold_proposal,
                 risk_decision=hold_risk,
+                order=None,
             )
-            logger.info("Signal is HOLD", extra={"symbol": signal.symbol, "strategy": signal.strategy_name})
+            logger.info(
+                "Signal not traded",
+                extra={
+                    "symbol": signal.symbol,
+                    "strategy": signal.strategy_name,
+                    "action": hold_action,
+                    "rule": decision_code,
+                },
+            )
             return {
                 "symbol": signal.symbol,
                 "signal": signal.signal.value,
                 "latest_price": latest_price,
                 "proposal": {},
                 "risk": hold_risk.to_dict(),
-                "action": "hold",
+                "action": hold_action,
                 "order": None,
             }
 
@@ -130,6 +156,13 @@ class ExecutionService:
             )
             self.risk_manager.record_manual_rejection(signal.symbol, signal.signal.value, risk_decision)
             self._persist_signal_event(signal, price, 0.0, risk_decision)
+            self._log_execution_artifacts(
+                action="rejected",
+                signal=signal,
+                proposal=rejected_proposal,
+                risk_decision=risk_decision,
+                order=None,
+            )
             self._notify_trade_event(
                 action="rejected",
                 signal=signal,
@@ -164,16 +197,7 @@ class ExecutionService:
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
         self._persist_signal_event(signal, price, proposal.quantity or 0.0, risk_decision)
 
-        proposal_payload = {
-            "symbol": proposal.symbol,
-            "asset_class": asset_class.value,
-            "side": proposal.side.value if hasattr(proposal.side, "value") else str(proposal.side),
-            "quantity": proposal.quantity,
-            "notional": proposal.notional,
-            "price": proposal.price,
-            "time_in_force": proposal.time_in_force,
-            "is_dry_run": proposal.is_dry_run,
-        }
+        proposal_payload = self._proposal_to_payload(proposal, asset_class)
 
         if not risk_decision.approved:
             logger.warning("Order blocked by risk manager", extra={"reason": risk_decision.reason, "symbol": proposal.symbol})
@@ -189,6 +213,13 @@ class ExecutionService:
                 proposal=proposal,
                 risk_decision=risk_decision,
             )
+            self._log_execution_artifacts(
+                action="rejected",
+                signal=signal,
+                proposal=proposal,
+                risk_decision=risk_decision,
+                order=None,
+            )
             return {
                 "symbol": proposal.symbol,
                 "signal": signal.signal.value,
@@ -196,6 +227,39 @@ class ExecutionService:
                 "proposal": proposal_payload,
                 "risk": risk_decision.to_dict(),
                 "action": "rejected",
+                "order": None,
+            }
+
+        proposal, session_skip = self._apply_session_submission_rules(
+            signal=signal,
+            proposal=proposal,
+            asset_class=asset_class,
+            price=price,
+        )
+        proposal_payload = self._proposal_to_payload(proposal, asset_class)
+        if session_skip is not None:
+            logger.info(
+                "Order skipped by session rules",
+                extra={
+                    "symbol": proposal.symbol,
+                    "rule": session_skip.rule,
+                    "reason": session_skip.reason,
+                },
+            )
+            self._log_execution_artifacts(
+                action="skipped",
+                signal=signal,
+                proposal=proposal,
+                risk_decision=session_skip,
+                order=None,
+            )
+            return {
+                "symbol": proposal.symbol,
+                "signal": signal.signal.value,
+                "latest_price": price,
+                "proposal": proposal_payload,
+                "risk": session_skip.to_dict(),
+                "action": "skipped",
                 "order": None,
             }
 
@@ -216,6 +280,13 @@ class ExecutionService:
 
         action = "dry_run" if proposal.is_dry_run else "submitted"
         logger.info("Order processed", extra={"action": action, "order": executed_order})
+        self._log_execution_artifacts(
+            action=action,
+            signal=signal,
+            proposal=proposal,
+            risk_decision=risk_decision,
+            order=executed_order,
+        )
         self._notify_trade_event(
             action=action,
             signal=signal,
@@ -231,6 +302,20 @@ class ExecutionService:
             "risk": risk_decision.to_dict(),
             "action": action,
             "order": executed_order,
+        }
+
+    def _proposal_to_payload(self, proposal: OrderRequest, asset_class: AssetClass) -> dict[str, Any]:
+        return {
+            "symbol": proposal.symbol,
+            "asset_class": asset_class.value,
+            "side": proposal.side.value if hasattr(proposal.side, "value") else str(proposal.side),
+            "quantity": proposal.quantity,
+            "notional": proposal.notional,
+            "price": proposal.price,
+            "time_in_force": proposal.time_in_force,
+            "order_type": proposal.order_type,
+            "is_dry_run": proposal.is_dry_run,
+            "extended_hours": bool((proposal.metadata or {}).get("extended_hours")),
         }
 
     def _attempt_risk_compliant_sizing(
@@ -322,6 +407,108 @@ class ExecutionService:
             time_in_force=tif,
             is_dry_run=self.dry_run or not self.settings.trading_enabled,
             metadata=sizing.metadata,
+        )
+
+    def _apply_session_submission_rules(
+        self,
+        *,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        asset_class: AssetClass,
+        price: float,
+    ) -> tuple[OrderRequest, RiskDecision | None]:
+        # The mock broker replays local CSV data and is not tied to real exchange sessions.
+        if self.settings.is_mock_mode:
+            return proposal, None
+        if asset_class == AssetClass.CRYPTO:
+            return proposal, None
+        if asset_class not in {AssetClass.EQUITY, AssetClass.ETF}:
+            return proposal, None
+        if self.market_data_service is None:
+            return proposal, None
+
+        session = self.market_data_service.get_session_status(asset_class)
+        session_state = getattr(session.session_state, "value", str(session.session_state))
+        is_regular_session = session_state == SessionState.REGULAR.value
+        if is_regular_session:
+            return proposal, None
+
+        if not self.settings.allow_extended_hours:
+            return proposal, RiskDecision(
+                approved=False,
+                reason="Market is closed and extended-hours trading is disabled.",
+                rule="market_closed_extended_hours_disabled",
+                details={
+                    "symbol": signal.symbol,
+                    "asset_class": asset_class.value,
+                    "session_state": session_state,
+                    "allow_extended_hours": self.settings.allow_extended_hours,
+                },
+            )
+
+        if not bool(session.extended_hours):
+            return proposal, RiskDecision(
+                approved=False,
+                reason="Market session is closed and no extended-hours session is available.",
+                rule="market_closed",
+                details={
+                    "symbol": signal.symbol,
+                    "asset_class": asset_class.value,
+                    "session_state": session_state,
+                    "allow_extended_hours": self.settings.allow_extended_hours,
+                },
+            )
+
+        asset = self.broker.get_asset(signal.symbol, asset_class)
+        if asset is not None and not asset.tradable:
+            return proposal, RiskDecision(
+                approved=False,
+                reason="Asset is not eligible for extended-hours order submission.",
+                rule="extended_hours_not_supported_for_asset",
+                details={
+                    "symbol": signal.symbol,
+                    "asset_class": asset_class.value,
+                    "session_state": session_state,
+                    "asset_tradable": asset.tradable,
+                },
+            )
+
+        limit_price = proposal.price or signal.entry_price or signal.price or price
+        if limit_price is None or limit_price <= 0:
+            return proposal, RiskDecision(
+                approved=False,
+                reason="Extended-hours order requires a valid limit price.",
+                rule="extended_hours_not_supported_for_asset",
+                details={
+                    "symbol": signal.symbol,
+                    "asset_class": asset_class.value,
+                    "session_state": session_state,
+                    "limit_price": limit_price,
+                },
+            )
+
+        updated_metadata = dict(proposal.metadata or {})
+        updated_metadata["extended_hours"] = True
+        updated_metadata["extended_hours_submission"] = {
+            "session_state": session_state,
+            "allow_extended_hours": self.settings.allow_extended_hours,
+            "order_type": "limit",
+            "time_in_force": "day",
+        }
+        return (
+            OrderRequest(
+                symbol=proposal.symbol,
+                side=proposal.side,
+                quantity=proposal.quantity,
+                notional=proposal.notional,
+                asset_class=proposal.asset_class,
+                price=float(limit_price),
+                time_in_force="day",
+                order_type="limit",
+                is_dry_run=proposal.is_dry_run,
+                metadata=updated_metadata,
+            ),
+            None,
         )
 
     def _record_post_execution_state(
@@ -899,6 +1086,7 @@ class ExecutionService:
     def _annotate_signal_context(self, signal: TradeSignal) -> None:
         if signal.metrics is None:
             signal.metrics = {}
+        signal.metrics.setdefault("signal_id", build_signal_id(signal.symbol, signal.strategy_name, signal.generated_at))
 
         position = self.portfolio.get_position(signal.symbol)
         has_tracked_position = position is not None
@@ -968,6 +1156,17 @@ class ExecutionService:
                 session.commit()
         except Exception as exc:
             logger.warning("Failed to persist signal event: %s", exc)
+        try:
+            classification = decision.rule if signal.signal == Signal.HOLD else None
+            get_trade_logger(self.settings).log_signal(
+                signal,
+                latest_price=price,
+                outcome_classification=classification,
+                market_overview=dict((signal.metrics or {}).get("market_overview") or {}),
+                news_features=dict((signal.metrics or {}).get("news_features") or {}),
+            )
+        except Exception as exc:
+            logger.warning("Failed to write structured signal log: %s", exc)
 
     def _persist_order(self, signal: TradeSignal, order: OrderRequest, executed_order: dict[str, Any]) -> None:
         try:
@@ -1030,6 +1229,41 @@ class ExecutionService:
             risk=risk_decision,
             order=order,
         )
+
+    def _log_execution_artifacts(
+        self,
+        *,
+        action: str,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        risk_decision: RiskDecision,
+        order: dict[str, Any] | None,
+    ) -> None:
+        market_overview = dict((signal.metrics or {}).get("market_overview") or {})
+        news_features = dict((signal.metrics or {}).get("news_features") or {})
+        try:
+            if action != "hold":
+                get_trade_logger(self.settings).log_order(
+                    action=action,
+                    signal=signal,
+                    proposal=proposal,
+                    risk=risk_decision,
+                    order=order,
+                )
+        except Exception as exc:
+            logger.warning("Failed to write structured order log: %s", exc)
+        try:
+            get_outcome_logger(self.settings).log_execution_outcome(
+                action=action,
+                signal=signal,
+                proposal=proposal,
+                risk=risk_decision,
+                order=order,
+                market_overview=market_overview,
+                news_features=news_features,
+            )
+        except Exception as exc:
+            logger.warning("Failed to write structured outcome log: %s", exc)
 
     def run_once(self, symbol: str, strategy: BaseStrategy, data: Any) -> dict[str, Any]:
         signals = strategy.generate_signals(symbol, data)

@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
+import json
+import threading
+import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -24,6 +29,7 @@ _MAX_CONTENT = 2000
 _MAX_ERROR_BODY = 500
 _MAX_EMBED_TITLE = 256
 _MAX_EMBED_DESCRIPTION = 4096
+_DEFAULT_DEDUPE_TTL_SECONDS = 45.0
 
 
 def _truncate(value: str, limit: int) -> str:
@@ -208,6 +214,27 @@ class DiscordMessage:
         return payload
 
 
+@dataclass(frozen=True)
+class NotificationEvent:
+    category: str
+    action: str
+    symbol: str | None = None
+    order_id: str | None = None
+    cycle_id: str | None = None
+
+    def dedupe_key(self) -> str:
+        raw = "|".join(
+            [
+                self.category,
+                self.action,
+                self.symbol or "-",
+                self.order_id or "-",
+                self.cycle_id or "-",
+            ]
+        )
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
 def build_system_notification_payload(
     *,
     settings: Settings,
@@ -225,7 +252,7 @@ def build_system_notification_payload(
                 f"Mode: {mode_label}",
                 f"Auto-trade: {_enabled_label(settings.auto_trade_enabled)}",
                 f"Strategy: {settings.active_strategy}",
-                f"Time: {format_readable_notification_timestamp(timestamp)}",
+                f"Time: {format_readable_notification_timestamp(timestamp, settings)}",
             ]
         )
     else:
@@ -233,7 +260,7 @@ def build_system_notification_payload(
             lines.append(reason)
         for key, value in (details or {}).items():
             _append_line(lines, _humanize(key), value)
-        lines.append(f"Time: {format_readable_notification_timestamp(timestamp)}")
+        lines.append(f"Time: {format_readable_notification_timestamp(timestamp, settings)}")
 
     return DiscordMessage(
         embeds=[
@@ -259,9 +286,17 @@ def build_trade_notification_payload(
     side = (_format_scalar(signal.signal) or _format_scalar(proposal.side) or "TRADE").upper()
     symbol = signal.symbol or proposal.symbol
     asset_class = _resolve_trade_asset_class(signal=signal, proposal=proposal)
-    quantity = _coalesce(order_payload.get("quantity"), proposal.quantity)
+    quantity = _coalesce(order_payload.get("qty"), order_payload.get("quantity"), proposal.quantity)
+    filled_quantity = _coalesce(order_payload.get("filled_qty"), order_payload.get("filled_quantity"))
     notional = _coalesce(order_payload.get("notional"), proposal.notional)
-    price = _coalesce(order_payload.get("price"), proposal.price, signal.entry_price, signal.price)
+    price = _coalesce(
+        order_payload.get("filled_avg_price"),
+        order_payload.get("avg_fill_price"),
+        order_payload.get("price"),
+        proposal.price,
+        signal.entry_price,
+        signal.price,
+    )
     strategy = signal.strategy_name
     order_status = order_payload.get("status")
     order_id = _coalesce(order_payload.get("id"), order_payload.get("client_order_id"))
@@ -276,12 +311,15 @@ def build_trade_notification_payload(
     if summary:
         lines.append(summary)
     detail_lines: list[str] = []
-    if quantity is not None:
+    if action in {"filled", "partially_filled"} and filled_quantity is not None:
+        detail_lines.append(f"Qty Filled: {_format_quantity(filled_quantity, asset_class)}")
+    elif quantity is not None:
         detail_lines.append(f"Qty: {_format_quantity(quantity, asset_class)}")
     elif notional is not None:
         detail_lines.append(f"Notional: {_format_money(notional)}")
     if price is not None:
-        detail_lines.append(f"Price: {_format_price(price, asset_class)}")
+        price_label = "Avg Fill Price" if action in {"filled", "partially_filled"} else "Price"
+        detail_lines.append(f"{price_label}: {_format_price(price, asset_class)}")
     if settings.active_strategy:
         detail_lines.append(f"Active Strategy: {settings.active_strategy}")
     if strategy:
@@ -316,7 +354,7 @@ def build_trade_notification_payload(
         detail_lines.append(f"Status: {order_status}")
     if order_id:
         detail_lines.append(f"Order ID: {order_id}")
-    detail_lines.append(f"Time: {format_readable_notification_timestamp(timestamp)}")
+    detail_lines.append(f"Time: {format_readable_notification_timestamp(timestamp, settings)}")
     if detail_lines:
         if lines:
             lines.append("")
@@ -355,7 +393,7 @@ def build_error_notification_payload(
         embeds=[
             {
                 "title": _truncate(
-                    f"🔴 {format_runtime_mode_label(settings)} | {title}",
+                    f"{format_runtime_mode_label(settings)} | {title}",
                     _MAX_EMBED_TITLE,
                 ),
                 "description": _truncate("\n".join(lines), _MAX_EMBED_DESCRIPTION),
@@ -368,48 +406,51 @@ def build_error_notification_payload(
 def build_scan_summary_notification_payload(
     *,
     settings: Settings,
-    symbols_scanned: list[str],
-    results: list[dict[str, Any]],
+    cycle_id: str,
+    symbols_evaluated: int,
+    outcome_counts: dict[str, int],
+    highlights: list[dict[str, Any]],
     timestamp: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build a scan summary notification payload."""
     ts = timestamp or datetime.now(timezone.utc)
     timestamp_str = format_readable_notification_timestamp(ts, settings)
-    
-    scanned_count = len(symbols_scanned)
-    buy_signals = sum(1 for r in results if r.get("signal") == "BUY")
-    sell_signals = sum(1 for r in results if r.get("signal") == "SELL")
-    hold_signals = sum(1 for r in results if r.get("signal") == "HOLD")
-    
+    submitted_count = outcome_counts.get("submitted", 0)
+    rejected_count = outcome_counts.get("rejected", 0)
+    skipped_count = outcome_counts.get("skipped", 0)
+    hold_count = outcome_counts.get("hold", 0)
+
     description_lines = [
-        f"**Scan Results**",
-        f"Symbols Scanned: {scanned_count}",
-        f"BUY Signals: {buy_signals}",
-        f"SELL Signals: {sell_signals}",
-        f"HOLD Signals: {hold_signals}",
-        "",
+        f"Cycle: {cycle_id}",
+        f"Symbols Evaluated: {symbols_evaluated}",
+        (
+            "Outcomes: "
+            f"submitted={submitted_count} | "
+            f"rejected={rejected_count} | "
+            f"skipped={skipped_count} | "
+            f"hold={hold_count}"
+        ),
     ]
-    
-    # Add top signals summary
-    if results:
-        description_lines.append("**Top Signals**")
-        for i, result in enumerate(results[:5]):
-            symbol = result.get("symbol", "?")
-            signal = result.get("signal", "?")
-            asset_class = result.get("asset_class", "?")
-            price = result.get("price", "?")
-            reason = result.get("reason", "")[:50]
-            description_lines.append(
-                f"{i+1}. {symbol} ({asset_class}): {signal} @ {price} - {reason}"
-            )
-    
-    description_lines.append(f"\nTime: {timestamp_str}")
-    
+
+    if highlights:
+        description_lines.append("")
+        description_lines.append("Highlights:")
+        for row in highlights[:5]:
+            symbol = str(row.get("symbol") or "?")
+            action = str(row.get("action") or "unknown")
+            reason = _truncate(str(row.get("reason") or row.get("decision_reason") or ""), 90)
+            if reason:
+                description_lines.append(f"- {symbol} {action}: {reason}")
+            else:
+                description_lines.append(f"- {symbol} {action}")
+
+    description_lines.append("")
+    description_lines.append(f"Time: {timestamp_str}")
+
     return DiscordMessage(
         embeds=[
             {
                 "title": _truncate(
-                    f"📊 {format_runtime_mode_label(settings)} | Scan Summary",
+                    f"{format_runtime_mode_label(settings)} | Scan summary",
                     _MAX_EMBED_TITLE,
                 ),
                 "description": _truncate("\n".join(description_lines), _MAX_EMBED_DESCRIPTION),
@@ -423,6 +464,12 @@ def build_scan_summary_notification_payload(
 class DiscordNotifier:
     settings: Settings
     timeout_seconds: float = 3.0
+    dedupe_ttl_seconds: float = _DEFAULT_DEDUPE_TTL_SECONDS
+    _recent_events: dict[str, float] = field(default_factory=dict, init=False, repr=False)
+    _cache_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _dedupe_suppressed_count: int = field(default=0, init=False)
+    _sent_event_count: int = field(default=0, init=False)
+    _persistent_cache_loaded: bool = field(default=False, init=False, repr=False)
 
     @property
     def enabled(self) -> bool:
@@ -436,10 +483,19 @@ class DiscordNotifier:
         proposal: OrderRequest,
         risk: RiskDecision | None = None,
         order: dict[str, Any] | None = None,
+        dedupe_event: NotificationEvent | None = None,
     ) -> bool:
         if not self._should_send_trade_action(action):
             return False
 
+        resolved_order = order or {}
+        resolved_order_id = str(resolved_order.get("id") or resolved_order.get("client_order_id") or "")
+        event = dedupe_event or NotificationEvent(
+            category="trade_attempt",
+            action=action,
+            symbol=signal.symbol or proposal.symbol,
+            order_id=resolved_order_id or None,
+        )
         payload = build_trade_notification_payload(
             settings=self.settings,
             action=action,
@@ -448,7 +504,66 @@ class DiscordNotifier:
             risk=risk,
             order=order,
         )
-        return self._post_payload(payload)
+        return self._post_payload(payload, dedupe_event=event)
+
+    def send_broker_lifecycle_notification(
+        self,
+        *,
+        status: str,
+        order: dict[str, Any],
+        strategy_name: str | None = None,
+    ) -> bool:
+        if not self.enabled:
+            return False
+
+        normalized_status = _normalize_broker_status(status)
+        if normalized_status is None:
+            return False
+        if normalized_status == "rejected" and not self.settings.discord_notify_rejections:
+            return False
+
+        order_id = str(order.get("id") or order.get("client_order_id") or "")
+        symbol = str(order.get("symbol") or "?").upper()
+        side = str(order.get("side") or "TRADE").upper()
+        price = _coalesce(order.get("filled_avg_price"), order.get("avg_fill_price"), order.get("price"))
+        qty_submitted = _coalesce(order.get("qty"), order.get("quantity"))
+        qty_filled = _coalesce(order.get("filled_qty"), order.get("quantity"), order.get("qty"))
+        timestamp = _coalesce(order.get("filled_at"), order.get("updated_at"), order.get("submitted_at"))
+
+        lines = [_broker_lifecycle_summary(normalized_status)]
+        if normalized_status in {"filled", "partially_filled"} and qty_filled is not None:
+            lines.append(f"Qty Filled: {_format_decimal(float(qty_filled), min_decimals=0, max_decimals=6)}")
+        elif qty_submitted is not None:
+            lines.append(f"Qty: {_format_decimal(float(qty_submitted), min_decimals=0, max_decimals=6)}")
+        if price is not None:
+            lines.append(f"Avg Fill Price: {_format_money(price, max_decimals=6)}")
+        if strategy_name:
+            lines.append(f"Strategy: {strategy_name}")
+        if order_id:
+            lines.append(f"Order ID: {order_id}")
+        lines.append(f"Time: {format_readable_notification_timestamp(timestamp, self.settings)}")
+
+        payload = DiscordMessage(
+            embeds=[
+                {
+                    "title": _truncate(
+                        f"{format_runtime_mode_label(self.settings)} | {side} {symbol} {normalized_status}",
+                        _MAX_EMBED_TITLE,
+                    ),
+                    "description": _truncate("\n".join(lines), _MAX_EMBED_DESCRIPTION),
+                    "color": _trade_color(normalized_status),
+                }
+            ]
+        ).to_payload()
+        return self._post_payload(
+            payload,
+            dedupe_event=NotificationEvent(
+                category="broker_lifecycle",
+                action=normalized_status,
+                symbol=symbol,
+                order_id=order_id or None,
+            ),
+        )
 
     def send_error_notification(
         self,
@@ -468,7 +583,10 @@ class DiscordNotifier:
             error=error,
             context=context,
         )
-        return self._post_payload(payload)
+        return self._post_payload(
+            payload,
+            dedupe_event=NotificationEvent(category="error", action=title.strip().lower().replace(" ", "_")),
+        )
 
     def send_system_notification(
         self,
@@ -490,38 +608,77 @@ class DiscordNotifier:
             details=details,
             category=category,
         )
-        return self._post_payload(payload)
+        return self._post_payload(
+            payload,
+            dedupe_event=NotificationEvent(
+                category=category,
+                action=f"{event.strip().lower().replace(' ', '_')}:{reason.strip().lower()}",
+            ),
+        )
 
     def send_scan_summary_notification(
         self,
         *,
-        symbols_scanned: list[str],
-        results: list[dict[str, Any]],
+        cycle_id: str,
+        symbols_evaluated: int,
+        outcome_counts: dict[str, int],
+        highlights: list[dict[str, Any]],
         timestamp: datetime | None = None,
     ) -> bool:
-        """Send a scan summary notification with top results."""
         if not self.enabled or not self.settings.discord_notify_scan_summary:
             return False
 
         payload = build_scan_summary_notification_payload(
             settings=self.settings,
-            symbols_scanned=symbols_scanned,
-            results=results,
+            cycle_id=cycle_id,
+            symbols_evaluated=symbols_evaluated,
+            outcome_counts=outcome_counts,
+            highlights=highlights,
             timestamp=timestamp or datetime.now(timezone.utc),
         )
-        return self._post_payload(payload)
+        return self._post_payload(
+            payload,
+            dedupe_event=NotificationEvent(category="scan_summary", action="cycle_summary", cycle_id=cycle_id),
+        )
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._cache_lock:
+            return {
+                "enabled": self.enabled,
+                "recent_event_cache_size": len(self._recent_events),
+                "dedupe_ttl_seconds": self.dedupe_ttl_seconds,
+                "dedupe_suppressed_count": self._dedupe_suppressed_count,
+                "sent_event_count": self._sent_event_count,
+            }
 
     def _should_send_trade_action(self, action: str) -> bool:
         if not self.enabled:
             return False
-        if action == "dry_run":
+        normalized = action.strip().lower()
+        if normalized in {"hold", "skipped"}:
+            return False
+        if normalized == "dry_run":
             return self.settings.discord_notify_dry_runs
-        if action == "rejected":
+        if normalized == "rejected":
             return self.settings.discord_notify_rejections
-        return action == "submitted"
+        return normalized in {
+            "submitted",
+            "accepted",
+            "partially_filled",
+            "filled",
+            "canceled",
+        }
 
-    def _post_payload(self, payload: dict[str, Any]) -> bool:
+    def _post_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        dedupe_event: NotificationEvent | None = None,
+    ) -> bool:
         if not self.enabled:
+            return False
+
+        if dedupe_event is not None and self._is_duplicate(dedupe_event.dedupe_key()):
             return False
 
         target = sanitize_webhook_target(str(self.settings.discord_webhook_url))
@@ -537,6 +694,10 @@ class DiscordNotifier:
             return False
 
         if 200 <= response.status_code < 300:
+            if dedupe_event is not None:
+                self._remember_event(dedupe_event.dedupe_key())
+            with self._cache_lock:
+                self._sent_event_count += 1
             return True
 
         body = _truncate((response.text or "").replace("\n", " ").strip() or "<empty>", _MAX_ERROR_BODY)
@@ -547,6 +708,66 @@ class DiscordNotifier:
             body,
         )
         return False
+
+    def _is_duplicate(self, event_key: str) -> bool:
+        now = time.time()
+        with self._cache_lock:
+            self._load_persistent_cache()
+            self._purge_expired(now)
+            seen_at = self._recent_events.get(event_key)
+            if seen_at is None:
+                return False
+            if now - seen_at <= self.dedupe_ttl_seconds:
+                self._dedupe_suppressed_count += 1
+                return True
+            return False
+
+    def _remember_event(self, event_key: str) -> None:
+        now = time.time()
+        with self._cache_lock:
+            self._load_persistent_cache()
+            self._purge_expired(now)
+            self._recent_events[event_key] = now
+            self._persist_cache()
+
+    def _purge_expired(self, now: float) -> None:
+        expired = [
+            key
+            for key, seen_at in self._recent_events.items()
+            if now - seen_at > self.dedupe_ttl_seconds
+        ]
+        for key in expired:
+            self._recent_events.pop(key, None)
+        if expired:
+            self._persist_cache()
+
+    def _cache_path(self) -> Path:
+        return Path(self.settings.log_dir) / "discord_dedupe.json"
+
+    def _load_persistent_cache(self) -> None:
+        if self._persistent_cache_loaded:
+            return
+        cache_path = self._cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if cache_path.exists():
+            try:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                payload = {}
+            if isinstance(payload, dict):
+                self._recent_events.update(
+                    {
+                        str(key): float(value)
+                        for key, value in payload.items()
+                        if isinstance(key, str) and isinstance(value, (int, float))
+                    }
+                )
+        self._persistent_cache_loaded = True
+
+    def _persist_cache(self) -> None:
+        cache_path = self._cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(self._recent_events), encoding="utf-8")
 
 
 def _append_line(lines: list[str], label: str, value: Any) -> None:
@@ -625,25 +846,21 @@ def _format_quantity(value: Any, asset_class: AssetClass) -> str:
 
 
 def _trade_title(*, settings: Settings, action: str, side: str, symbol: str) -> str:
-    emoji = {
-        "submitted": "🟢",
-        "dry_run": "🟡",
-        "rejected": "🟠",
-    }.get(action, "ℹ️")
     mode_label = format_runtime_mode_label(settings)
-    action_label = {
-        "submitted": "submitted",
-        "dry_run": "dry run",
-        "rejected": "rejected",
-    }.get(action, action.replace("_", " "))
-    return f"{emoji} {mode_label} | {side} {symbol} {action_label}"
+    action_label = action.replace("_", " ")
+    return f"{mode_label} | {side} {symbol} {action_label}"
 
 
 def _trade_color(action: str) -> int:
     return {
         "submitted": 0x2ECC71,
+        "accepted": 0x2ECC71,
+        "partially_filled": 0x1ABC9C,
+        "filled": 0x27AE60,
+        "canceled": 0x95A5A6,
         "dry_run": 0xF1C40F,
         "rejected": 0xE67E22,
+        "skipped": 0x95A5A6,
     }.get(action, 0x5D6D7E)
 
 
@@ -661,8 +878,13 @@ def _resolve_trade_summary(
         return risk.reason
     return {
         "submitted": "Order submitted.",
+        "accepted": "Accepted by broker.",
+        "partially_filled": "Partially filled.",
+        "filled": "Order filled.",
+        "canceled": "Order canceled.",
         "dry_run": "Dry run only.",
         "rejected": "Order rejected.",
+        "skipped": "Trade opportunity skipped.",
     }.get(action, "Trade update.")
 
 
@@ -739,18 +961,48 @@ def _format_rejection_context_lines(risk: RiskDecision) -> list[str]:
 
 
 def _system_title(*, settings: Settings, event: str) -> str:
-    emoji = {
-        "Bot started": "🔵",
-        "Bot stopped": "⚫",
-    }.get(event, "🔵")
-    return f"{emoji} {format_runtime_mode_label(settings)} | {event}"
+    return f"{format_runtime_mode_label(settings)} | {event}"
 
 
 def _system_color(event: str) -> int:
     return {
         "Bot started": 0x3498DB,
         "Bot stopped": 0x2C3E50,
+        "Paper auto-trader started": 0x3498DB,
+        "Paper auto-trader stopped": 0x2C3E50,
+        "Scan summary": 0x3498DB,
     }.get(event, 0x3498DB)
+
+
+def _normalize_broker_status(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    mappings = {
+        "new": "accepted",
+        "accepted": "accepted",
+        "pending_new": "accepted",
+        "pending_replace": "accepted",
+        "accepted_for_bidding": "accepted",
+        "partially_filled": "partially_filled",
+        "filled": "filled",
+        "canceled": "canceled",
+        "expired": "canceled",
+        "done_for_day": "canceled",
+        "rejected": "rejected",
+        "suspended": "rejected",
+    }
+    return mappings.get(normalized)
+
+
+def _broker_lifecycle_summary(status: str) -> str:
+    return {
+        "accepted": "Accepted by broker.",
+        "partially_filled": "Order partially filled.",
+        "filled": "Order filled.",
+        "canceled": "Order canceled.",
+        "rejected": "Order rejected by broker.",
+    }.get(status, "Broker order update.")
 
 
 def _resolve_asset_class(*, signal: TradeSignal, proposal: OrderRequest) -> str | None:

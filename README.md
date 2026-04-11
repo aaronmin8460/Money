@@ -1,104 +1,45 @@
 # Money Trading Bot
 
-Multi-asset market scanner and trading engine built with FastAPI, SQLite, and broker-aware services.
+FastAPI-based paper-trading platform for scanning, risk-filtering, paper execution, structured logging, Discord notifications, ML scoring, and offline research workflows.
 
-The project is API-first, paper-trading safe by default, and designed for learning, research, and paper execution. It does not guarantee profitability and should not be treated as investment advice.
+The default posture is paper-safe:
 
-## What It Does
+- `BROKER_MODE=paper`
+- `TRADING_ENABLED=false`
+- `AUTO_TRADE_ENABLED=false`
+- `DISCORD_NOTIFICATIONS_ENABLED=false`
+- `ML_ENABLED=false`
+- `ML_RETRAIN_ENABLED=false`
+- `NEWS_FEATURES_ENABLED=false`
+- `ALLOW_EXTENDED_HOURS=false`
 
-- Syncs a broker-aware asset universe instead of relying on a tiny hardcoded stock list.
-- Supports equities, ETFs, and supported crypto pairs.
-- Keeps options behind a feature flag and paper-only guardrail.
-- Normalizes bars, quotes, trades, snapshots, and session state across asset classes.
-- Scans the tradable universe for gainers, losers, breakouts, pullbacks, volatility, momentum, and overall opportunities.
-- Runs one explicitly configured active strategy at runtime.
-- Applies multi-asset risk controls before any order placement.
-- Persists catalog syncs, scanner runs, opportunities, signals, orders, fills, position snapshots, and bot runs in SQLite.
+## V1 Architecture
 
-## Architecture
+`scanner -> strategy -> risk context -> ML score filter -> execution -> broker response -> logs/Discord -> dataset export -> retrain/evaluate/promote loop`
 
-- `app/api/`: FastAPI routers for assets, market data, scanner, signals, broker, automation, and diagnostics.
-- `app/config/`: environment-backed settings and feature flags.
-- `app/db/`: SQLAlchemy models and schema initialization.
-- `app/domain/`: normalized asset, market data, session, and opportunity types.
-- `app/services/asset_catalog.py`: broker-aware asset universe sync and cache.
-- `app/services/market_data.py`: normalized bars, quotes, trades, snapshots, and session behavior.
-- `app/services/scanner.py`: multi-asset ranking engine and scanner persistence.
-- `app/services/market_overview.py`: overview summaries built from scanner output.
-- `app/strategies/`: strategy implementations plus active-strategy selection helpers.
-- `app/risk/`: exposure, liquidity, spread, drawdown, cooldown, and kill-switch controls.
-- `app/execution/`: normalized signal-to-order flow with dry-run and paper safety.
-- `app/services/auto_trader.py`: automation loop for scanning, signal ranking, and execution.
+Important guardrails:
 
-## Supported Asset Classes
+- news is feature-only and never places orders directly
+- RL is sandbox-only and never touches the live or paper execution path
+- ML is a filter/booster only and never overrides hard risk controls
+- the preferred local/API runtime stays single-process through `scripts/run_paper_api.py`
 
-- `equity`
-- `etf`
-- `crypto`
-- `option`
-  Options remain disabled by default and are limited to feature-flagged, paper-only handling.
+## Repository Layout
 
-## Universe Discovery
-
-`All markets` in this project means all tradable assets supported by the configured broker or data provider.
-
-- In `mock` mode, the asset universe comes from local symbol CSVs in `data/`.
-- In `paper` mode, the asset catalog syncs from Alpaca paper and caches the results in SQLite.
-- The catalog stores symbol, name, asset class, exchange, tradable flags, borrow flags, margin flags, and raw attributes.
-- Universe scanning can be narrowed with watchlists, inclusion lists, exclusion lists, and enabled asset-class switches.
-
-## Scanning and Signals
-
-The scanner produces ranked views for:
-
-- top gainers
-- top losers
-- unusual volume
-- breakout candidates
-- pullback candidates
-- high volatility
-- momentum
-- overall opportunities
-
-Available strategies:
-
-- equity/ETF momentum breakout
-- equity/ETF trend pullback
-- crypto momentum trend
-- mean reversion scanner
-- legacy EMA crossover support
-
-Only one strategy is active at runtime. Set it with `ACTIVE_STRATEGY`, inspect it with `GET /config`, `GET /auto/status`, or `GET /diagnostics/strategy`, and do not rely on stale `ema_crossover` alerts from older wiring.
-
-Signals are normalized with fields such as symbol, asset class, strategy name, direction, confidence score, entry, stop, target, ATR, momentum, liquidity, spread, regime, and reason.
-
-## Paper Trading Safety
-
-- `BROKER_MODE=paper` means Alpaca paper trading.
-- `BROKER_MODE=mock` keeps everything local and CSV-backed.
-- `TRADING_ENABLED=false` is the default.
-- `AUTO_TRADE_ENABLED=false` is the default.
-- `TRADING_ENABLED=true` enables actual Alpaca paper order submission when `BROKER_MODE=paper`.
-- `AUTO_TRADE_ENABLED=true` starts the in-process auto-trader exactly once at API startup.
-- Live trading stays disabled unless `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_ACK=ENABLE_LIVE_TRADING`.
-- Alpaca live URLs are rejected unless live trading is explicitly enabled and acknowledged.
-- Options remain feature-flagged and paper-only.
-- `SHORT_SELLING_ENABLED=false` is the default.
-- When short selling is disabled, bearish `SELL` signals are exit-only. If there is no tracked long position, the bot will not place a sell and will surface `no_position_to_sell` diagnostics instead of behaving like a short-entry engine.
-- Daily loss and drawdown controls still block new exposure such as `BUY` orders, but real risk-reducing sells are allowed so the bot can exit losing longs.
-- Position sizing uses `Decimal` math plus `POSITION_NOTIONAL_BUFFER_PCT` so auto-sized orders land safely under the hard `MAX_POSITION_NOTIONAL` cap instead of right on the boundary.
-- Entry sizing is staged with tranche plans (`ENTRY_TRANCHES`, `ENTRY_TRANCHE_WEIGHTS`) so new exposure is scaled in across multiple buys instead of one full-size entry.
-- `SCALE_IN_MODE` controls add-on rules (`confirmation`, `time`, or `momentum`), and `ALLOW_AVERAGE_DOWN=false` keeps the default behavior safety-first.
-
-## Why Repeated Rejects Happen
-
-Repeated paper-mode rejects usually mean the bot is still evaluating symbols after a loss threshold has already been crossed, or that the proposed size landed too close to a hard notional limit.
-
-- `BUY` orders are correctly rejected once the current daily loss exceeds `MAX_DAILY_LOSS_PCT` or `MAX_DAILY_LOSS`.
-- Before this fix, a bearish strategy could emit `SELL` for symbols with no tracked long position. Those looked like new exposure, so the risk manager rejected them under the daily-loss rule and Discord showed noisy `SELL ... rejected` alerts.
-- The bot now treats bearish sells as exit-only when short selling is disabled. If no tracked long exists, the strategy returns `HOLD` for scan flow and execution/risk still reject direct sell attempts with the explicit rule `no_position_to_sell`.
-- The bot now clamps final submitted quantity using `Decimal` math so the rounded order notional sent to the broker never exceeds `MAX_POSITION_NOTIONAL`.
-- Rejection diagnostics now expose raw qty, rounded qty, rounded price, raw notional, final submitted notional, cap values, comparison operator, and whether quantity was reduced to fit the cap.
+- `app/api/`: FastAPI routes, diagnostics, admin helpers
+- `app/config/`: environment-backed settings
+- `app/db/`: SQLAlchemy models and schema init
+- `app/domain/`: normalized market and asset models
+- `app/execution/`: signal-to-order flow and persistence
+- `app/monitoring/`: app logging, Discord notifications, JSONL artifact writers
+- `app/ml/`: feature schema, inference, training, evaluation, registry helpers
+- `app/news/`: RSS ingestion, conservative ticker mapping, optional LLM analysis, feature store
+- `app/rl/`: experimental replay-only RL sandbox
+- `app/services/`: auto-trader, broker, scanner, market data, runtime wiring
+- `deploy/`: EC2 bootstrap scripts, env example, systemd units/timers
+- `scripts/`: local run path, model ops, news ingestion, RL experiment
+- `models/`: current/candidate model artifacts and `registry.json`
+- `logs/`: JSONL signal/order/outcome/news artifacts plus `app.jsonl`
 
 ## Installation
 
@@ -109,336 +50,406 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-## Configuration
+Guaranteed baseline ML dependencies are in `requirements.txt`:
 
-Start from `.env.example`. Important categories:
+- `scikit-learn`
+- `joblib`
+- `feedparser`
+- `openai`
 
-- broker mode and credentials
-- paper vs mock behavior
-- `TRADING_ENABLED` vs `AUTO_TRADE_ENABLED`
-- active strategy selection
-- position-notional sizing buffer
-- short-selling guardrails
-- Discord webhook notifications
-- enabled asset classes
-- universe refresh cadence
-- watchlists and exclusions
-- liquidity and spread thresholds
-- risk and exposure caps
-- strategy enable switches
+`xgboost` is supported when installed, but it is intentionally optional.
 
-Discord notification settings:
+## Local Run Commands
 
-- `DISCORD_NOTIFICATIONS_ENABLED=false`
-- `DISCORD_WEBHOOK_URL=` for the Discord webhook URL
-- `DISCORD_NOTIFY_DRY_RUNS=false` to keep paper and dry-run alerts optional
-- `DISCORD_NOTIFY_REJECTIONS=true`
-- `DISCORD_NOTIFY_ERRORS=true`
-- `DISCORD_NOTIFY_START_STOP=true`
-
-If Discord notifications are enabled without a webhook URL, startup and settings validation fail fast with a clear error.
-
-Important trading behavior settings:
-
-- `BROKER_MODE=paper`
-- `ACTIVE_STRATEGY=equity_momentum_breakout`
-- `SHORT_SELLING_ENABLED=false`
-- `POSITION_NOTIONAL_BUFFER_PCT=0.995`
-- `ENTRY_TRANCHES=3`
-- `ENTRY_TRANCHE_WEIGHTS=0.4,0.3,0.3`
-- `SCALE_IN_MODE=confirmation`
-- `MIN_BARS_BETWEEN_TRANCHES=1`
-- `MINUTES_BETWEEN_TRANCHES=5`
-- `ADD_ON_FAVORABLE_MOVE_PCT=0.5`
-- `ALLOW_AVERAGE_DOWN=false`
-- `MAX_DAILY_LOSS=2000`
-- `MAX_DAILY_LOSS_PCT=0.02`
-- `MAX_DRAWDOWN_PCT=0.10`
-
-Paper-mode setup:
-
-- Use `BROKER_MODE=paper` with Alpaca paper API keys in `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`.
-- Use `BROKER_MODE=mock` only for local CSV-backed testing without Alpaca.
-- `TRADING_ENABLED=true` submits Alpaca paper orders.
-- `AUTO_TRADE_ENABLED=true` starts the continuous in-process auto-trader loop.
-- `ACTIVE_STRATEGY` is the only runtime strategy selector. The old `STRATEGY_NAME` env var is accepted as a compatibility alias, but the app normalizes it to `ACTIVE_STRATEGY`.
-
-## Discord Notifications
-
-The bot can send targeted Discord webhook notifications for meaningful trading events:
-
-- submitted orders
-- optional dry-run orders
-- optional risk rejections
-- auto-trader start and stop events
-- auto-trader cycle failures
-
-It does not mirror the full application log to Discord, and it does not send notifications for `HOLD` signals or normal scan heartbeats.
-
-### Create a Webhook
-
-1. In Discord, open the channel where you want notifications.
-2. Open `Edit Channel`, then `Integrations`, then `Webhooks`.
-3. Create a webhook and copy the webhook URL.
-4. Set `DISCORD_WEBHOOK_URL` in `.env`.
-
-Example configuration:
-
-```env
-DISCORD_NOTIFICATIONS_ENABLED=true
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/your_webhook_id/your_webhook_token
-DISCORD_NOTIFY_DRY_RUNS=true
-DISCORD_NOTIFY_REJECTIONS=true
-DISCORD_NOTIFY_ERRORS=true
-DISCORD_NOTIFY_START_STOP=true
-```
-
-`DISCORD_NOTIFY_DRY_RUNS` is optional and defaults to `false` so local testing and paper-mode scans do not spam Discord unless you explicitly opt in.
-
-Rejected trade notifications now include the exact risk rule, whether the symbol had a tracked position, whether a rejected sell was risk-reducing, the active strategy, current equity vs daily baseline context, and the raw/rounded notional sizing details when the candidate failed on exposure rules.
-Submitted BUY notifications now include tranche number, tranche notional, projected post-fill position notional, remaining planned allocation, scale-in mode, and add reason.
-
-## Diagnostics
-
-Use the diagnostics routes to understand why the bot is blocking new exposure, whether the auto-trader is really running, and whether local portfolio tracking matches the broker:
-
-- `GET /diagnostics/auto`
-- `GET /diagnostics/risk`
-- `GET /diagnostics/strategy`
-- `GET /diagnostics/portfolio`
-- `GET /diagnostics/tranches`
-- `GET /diagnostics/rejections/latest`
-
-These routes expose:
-
-- trading enabled, auto-trade enabled, broker mode, broker backend, and active strategy
-- market-open status and extended-hours allowance
-- account cash, equity, and buying power
-- daily baseline equity and date
-- current daily loss amount and percent
-- drawdown percent
-- active symbol and strategy cooldowns
-- latest evaluated symbols and latest signals
-- latest accepted and rejected order candidates
-- local tracked positions with `is_long` and `sellable`
-- broker-reported positions
-- latest risk events
-- latest rejection rule and reason
-- per-symbol tranche plan state (target, filled count, next tranche, remaining allocation, last decision reason)
-
-## Resetting Local State
-
-Use the API or the helper script to restart the bot's local paper-trading state.
-
-API:
-
-```bash
-curl -X POST http://127.0.0.1:8000/admin/reset-local-state
-curl -X POST http://127.0.0.1:8000/admin/reset-local-state \
-  -H "Content-Type: application/json" \
-  -d '{"close_positions":true,"cancel_open_orders":true,"wipe_local_db":true,"reset_daily_baseline_to_current_equity":true}'
-```
-
-Script:
+Recommended single-process API run path:
 
 ```bash
 source .venv/bin/activate
-python scripts/reset_local_state.py
-python scripts/reset_local_state.py --wipe-local-db
+python scripts/run_paper_api.py --host 127.0.0.1 --port 8000
 ```
 
-The reset flow:
-
-- stops the auto-trader if it is running
-- clears in-memory portfolio state, cooldowns, cached rejections, tranche state, and auto-trader debug state
-- can cancel open paper orders and close paper positions
-- can wipe the local SQLite history by dropping and recreating the schema
-- does not claim to erase Alpaca remote paper order/fill history
-
-## How To Fully Reset Alpaca Paper Trading
-
-Local bot reset and Alpaca paper-account reset are separate operations.
-
-- The app can reset its own local runtime state and local SQLite history.
-- The app does not claim to erase Alpaca's remote paper-trading history through the API.
-- If you want a truly fresh Alpaca paper account, use the Alpaca dashboard to create a fresh paper account or remove the old paper account, then generate new paper API credentials for that paper account.
-- A practical workflow is:
-  1. Open the Alpaca dashboard.
-  2. Create a new paper account or delete the old paper account there.
-  3. Generate fresh paper API keys for the new paper account.
-  4. Update `.env` with the new `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and `BROKER_MODE=paper`.
-  5. Restart the API so the runtime reconnects to the new paper account.
-- After creating the fresh paper account, update `.env` with the new `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, and keep `ALPACA_BASE_URL=https://paper-api.alpaca.markets`.
-- Restart the app after updating credentials so the runtime picks up the new paper account.
-
-## Running Locally
-
-Recommended stable run path for continuous paper auto-trading:
+Manual one-off symbol evaluation:
 
 ```bash
 source .venv/bin/activate
-python scripts/run_paper_api.py
+python scripts/run_once.py
 ```
 
-This starts Uvicorn in a single process so the in-process auto-trader runs once. The logs now make startup and shutdown explicit with lines such as `Paper auto-trader is running` and `Paper auto-trader stopped`.
-
-Direct Uvicorn run:
+Exact local test commands:
 
 ```bash
 source .venv/bin/activate
-uvicorn main:app --host 127.0.0.1 --port 8000
-```
-
-Run tests:
-
-```bash
-source .venv/bin/activate
+uv run pytest tests/test_config.py tests/test_discord_notifications.py tests/test_auto_trader.py tests/test_execution_persistence.py tests/test_v1_platform.py tests/test_api.py
 uv run pytest
 ```
 
-Test Discord notifications locally:
+## Phase A: Logging And Discord
+
+### Logging Artifacts
+
+The app now writes structured JSONL artifacts under `LOG_DIR`:
+
+- `logs/app.jsonl`
+- `logs/signals.jsonl`
+- `logs/orders.jsonl`
+- `logs/outcomes.jsonl`
+- `logs/news_features.jsonl`
+
+The directory is created automatically.
+
+### What Gets Logged
+
+- every executed or evaluated signal that reaches structured persistence
+- order proposals and broker-facing submission details
+- normalized outcome classifications for later ML export
+- optional news feature rows
+- structured app logs with contextual metadata
+
+Outcome classifications include:
+
+- `market_closed`
+- `market_closed_extended_hours_disabled`
+- `extended_hours_not_supported_for_asset`
+- `no_position_to_sell`
+- `risk_rejected`
+- `dry_run`
+- `submitted`
+- `skipped_low_ml_score`
+
+### Discord Behavior
+
+Discord is intentionally meaningful instead of noisy.
+
+Sent when enabled:
+
+- order submitted
+- dry-run order only when `DISCORD_NOTIFY_DRY_RUNS=true`
+- risk rejection when `DISCORD_NOTIFY_REJECTIONS=true`
+- startup / shutdown
+- auto-trader cycle error
+- optional compact scan summary when `DISCORD_NOTIFY_SCAN_SUMMARY=true`
+
+Not sent:
+
+- `HOLD`
+- noisy heartbeats
+- giant raw dict dumps
+
+Dedupe protection exists for:
+
+- scan summaries
+- broker lifecycle updates
+- startup/shutdown duplicates across quick reloads via a short-lived local dedupe cache
+
+## Signal, Trade, And Outcome Storage
+
+Signal/order/outcome storage now has two layers:
+
+1. SQLite persistence for normalized signals, orders, fills, positions, and bot runs
+2. JSONL artifact logs for downstream ML/news/retrain workflows
+
+`logs/outcomes.jsonl` is the main bootstrap source for model export. Each row carries:
+
+- signal identity
+- cycle id
+- action and classification
+- risk rule and reason
+- feature snapshot
+- optional ML score metadata
+- optional news feature metadata
+
+## ML Scoring
+
+### Where ML Sits
+
+ML scoring is optional and disabled by default.
+
+- strategies still generate the primary signal
+- ML only scores `BUY` candidates
+- if the score is below `ML_MIN_SCORE_THRESHOLD`, the candidate becomes `skipped_low_ml_score`
+- risk controls still run independently and remain authoritative
+
+### Model Types
+
+- guaranteed baseline: `logistic_regression`
+- optional if installed: `xgboost`
+
+### Runtime Artifacts
+
+- `models/current_model.joblib`
+- `models/candidate_model.joblib`
+- `models/registry.json`
+
+### Model Registry
+
+`models/registry.json` tracks:
+
+- `current_model`
+- `candidate_model`
+- `created_at`
+- `promoted`
+- `model_type`
+- `feature_version`
+- `train_rows`
+- `validation_rows`
+- `metrics`
+- `notes`
+
+Helper functions live in `app/ml/registry.py` for initialize/load/update/promote/rollback flows.
+
+## Training, Evaluation, And Promotion
+
+### Export Training Data
 
 ```bash
 source .venv/bin/activate
-export DISCORD_NOTIFICATIONS_ENABLED=true
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/your_webhook_id/your_webhook_token"
-export DISCORD_NOTIFY_DRY_RUNS=true
-python scripts/run_paper_api.py
+python scripts/export_training_data.py --output models/training_data.jsonl
 ```
 
-Then in another terminal:
+### Train Candidate Model
 
 ```bash
 source .venv/bin/activate
-curl -X POST http://127.0.0.1:8000/run-once -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
-curl -X POST http://127.0.0.1:8000/auto/start
-sleep 2
-curl -X POST http://127.0.0.1:8000/auto/stop
+python scripts/train_model.py --dataset models/training_data.jsonl
 ```
 
-## Key Endpoints
+### Evaluate Current And Candidate
 
-Assets:
+```bash
+source .venv/bin/activate
+python scripts/evaluate_model.py --dataset models/training_data.jsonl
+```
 
-- `GET /assets`
-- `GET /assets/search`
-- `GET /assets/{symbol}`
-- `POST /assets/refresh`
-- `GET /assets/stats`
+### Promote Candidate
 
-Market data:
+```bash
+source .venv/bin/activate
+python scripts/promote_model.py
+```
 
-- `GET /market/bars`
-- `GET /market/quote`
-- `GET /market/trade`
-- `GET /market/snapshot`
-- `GET /market/session`
+### Nightly Retrain Wrapper
 
-Scanner:
+```bash
+source .venv/bin/activate
+ML_RETRAIN_ENABLED=true bash scripts/run_nightly_retrain.sh
+```
 
-- `GET /scanner/overview`
-- `GET /scanner/top-gainers`
-- `GET /scanner/top-losers`
-- `GET /scanner/breakouts`
-- `GET /scanner/momentum`
-- `GET /scanner/volatility`
-- `GET /scanner/opportunities`
-- `GET /scanner/asset-class/{asset_class}`
+Promotion is threshold-gated by:
 
-Signals:
+- `ML_PROMOTION_MIN_AUC`
+- `ML_PROMOTION_MIN_PRECISION`
+- `ML_PROMOTION_MIN_WINRATE_LIFT`
 
-- `GET /signals`
-- `POST /signals/run`
-- `GET /signals/top`
+Sparse data is handled safely. If there are not enough labeled rows, the scripts log a skip instead of crashing the system.
 
-Trading and automation:
+### Label Bootstrapping Note
+
+This v1 uses conservative bootstrap labels from structured outcome data. When realized trade outcome history is sparse, the export path falls back to execution outcome plus basic reward/risk heuristics. That keeps the retrain loop operational without pretending the labels are a full production-grade realized-PnL dataset yet.
+
+## News Feature Pipeline
+
+### What It Does
+
+- ingests RSS headlines
+- maps headlines to configured symbols conservatively
+- groups headlines per ticker and time window
+- optionally calls an OpenAI model for summary/sentiment/risk tagging
+- stores the result as features only
+
+### What It Does Not Do
+
+- it does not place orders
+- it does not bypass strategy logic
+- it does not override risk controls
+
+### Fetch News Features
+
+```bash
+source .venv/bin/activate
+python scripts/fetch_news_features.py
+python scripts/fetch_news_features.py --symbols AAPL MSFT BTC/USD
+```
+
+If `OPENAI_API_KEY` is missing, the code falls back to a heuristic non-LLM analysis path and continues safely.
+
+Relevant env vars:
+
+- `NEWS_FEATURES_ENABLED`
+- `NEWS_RSS_ENABLED`
+- `NEWS_LLM_ENABLED`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- `NEWS_MAX_HEADLINES_PER_TICKER`
+- `NEWS_LOOKBACK_HOURS`
+
+## Diagnostics And Verification
+
+Core runtime/status routes:
 
 - `GET /auto/status`
 - `POST /auto/start`
 - `POST /auto/stop`
 - `POST /auto/run-now`
-- `GET /orders`
-- `GET /positions`
-- `GET /trades`
-- `GET /risk`
-- `GET /broker/account`
-- `GET /broker/status`
+- `POST /run-once`
 
-Diagnostics:
+Diagnostics routes:
 
-- `GET /health`
-- `GET /config`
-- `GET /diagnostics/universe`
-- `GET /diagnostics/data-feed`
 - `GET /diagnostics/auto`
-- `GET /diagnostics/strategy`
-- `GET /diagnostics/strategies`
 - `GET /diagnostics/risk`
+- `GET /diagnostics/strategy`
 - `GET /diagnostics/portfolio`
 - `GET /diagnostics/tranches`
 - `GET /diagnostics/rejections/latest`
-- `POST /admin/reset-local-state`
 
-Legacy compatibility:
-
-- `POST /run-once`
-- `POST /backtest`
-- `GET /strategy/signals`
-- `GET /strategy/positions`
-
-`POST /run-once` now requires an explicit `symbol` in the request body and no longer silently falls back to `AAPL`.
-
-## Verification Commands
-
-Assuming the API is running on `127.0.0.1:8000`:
+Exact curl commands:
 
 ```bash
-uv run pytest
-python scripts/run_paper_api.py
-uvicorn main:app --host 127.0.0.1 --port 8000
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:8000/config
 curl http://127.0.0.1:8000/auto/status
-curl http://127.0.0.1:8000/assets/stats
-curl "http://127.0.0.1:8000/assets/search?q=BTC"
-curl "http://127.0.0.1:8000/market/snapshot?symbol=AAPL&asset_class=equity"
-curl "http://127.0.0.1:8000/market/snapshot?symbol=BTC/USD&asset_class=crypto"
-curl "http://127.0.0.1:8000/scanner/overview?limit=5"
-curl "http://127.0.0.1:8000/scanner/asset-class/crypto?limit=5"
-curl -X POST http://127.0.0.1:8000/signals/run -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
-curl -X POST http://127.0.0.1:8000/auto/start
 curl -X POST http://127.0.0.1:8000/auto/run-now
-curl http://127.0.0.1:8000/signals/top
-curl http://127.0.0.1:8000/risk
+curl -X POST http://127.0.0.1:8000/run-once -H "Content-Type: application/json" -d '{"symbol":"AAPL","asset_class":"equity"}'
 curl http://127.0.0.1:8000/diagnostics/auto
-curl http://127.0.0.1:8000/diagnostics/strategy
 curl http://127.0.0.1:8000/diagnostics/risk
+curl http://127.0.0.1:8000/diagnostics/strategy
 curl http://127.0.0.1:8000/diagnostics/portfolio
 curl http://127.0.0.1:8000/diagnostics/tranches
 curl http://127.0.0.1:8000/diagnostics/rejections/latest
-curl -X POST http://127.0.0.1:8000/admin/reset-local-state
-curl -X POST http://127.0.0.1:8000/run-once -H "Content-Type: application/json" -d '{"symbol":"MSFT","asset_class":"equity"}'
 ```
 
-## Mock Mode Notes
+To verify only one auto-trader loop is active:
 
-The repository includes local mock CSVs for:
+- run the API through `python scripts/run_paper_api.py`
+- check `GET /auto/status` for `running`, `thread_ident`, `process_lock_acquired`, and `auto_trader_lock_path`
+- on EC2, use `systemctl status money-api` and `journalctl -u money-api -n 100 --no-pager`
 
-- `AAPL`
-- `SPY`
-- `QQQ`
-- `BTC/USD`
-- `ETH/USD`
+## AWS EC2 Quickstart
 
-In mock mode, the catalog and scanner treat those as the supported universe, and `TRADING_ENABLED=true` only affects the local in-memory broker. Use `BROKER_MODE=paper` when you want real Alpaca paper orders instead of the mock broker.
+Assumptions:
 
-## Broker Limitations
+- Ubuntu host
+- venv-based deployment first
+- internal API/bot usage
+- no nginx required
 
-- Broker coverage is limited to what the configured provider exposes.
-- ETF classification in broker mode may depend on provider metadata and lightweight heuristics.
-- Options support is feature-flagged, limited, and intentionally conservative.
-- Large live universes may require tighter filters or scan limits to stay within provider rate limits.
+Bootstrap:
 
-## Disclaimer
+```bash
+chmod +x deploy/ec2/bootstrap.sh
+APP_DIR=/opt/money bash deploy/ec2/bootstrap.sh
+sudo mkdir -p /etc/money
+sudo cp deploy/env/money.env.example /etc/money/money.env
+sudo nano /etc/money/money.env
+```
 
-This project is for learning, experimentation, and paper trading. It does not promise profits or reliable market performance.
+Install systemd units:
+
+```bash
+sudo cp deploy/systemd/money-api.service /etc/systemd/system/
+sudo cp deploy/systemd/money-retrain.service /etc/systemd/system/
+sudo cp deploy/systemd/money-retrain.timer /etc/systemd/system/
+sudo cp deploy/systemd/money-news.service /etc/systemd/system/
+sudo cp deploy/systemd/money-news.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable money-api.service
+sudo systemctl enable money-retrain.timer
+sudo systemctl enable money-news.timer
+sudo systemctl start money-api.service
+sudo systemctl start money-retrain.timer
+sudo systemctl start money-news.timer
+```
+
+Deploy update:
+
+```bash
+chmod +x deploy/ec2/pull_and_restart.sh
+APP_DIR=/opt/money bash deploy/ec2/pull_and_restart.sh
+```
+
+Useful journal commands:
+
+```bash
+journalctl -u money-api -f
+journalctl -u money-api -n 200 --no-pager
+journalctl -u money-retrain.service -n 200 --no-pager
+journalctl -u money-news.service -n 200 --no-pager
+systemctl status money-api
+systemctl list-timers --all | grep money
+```
+
+## systemd Behavior
+
+`deploy/systemd/money-api.service` is configured for:
+
+- `Restart=always`
+- single-process `scripts/run_paper_api.py`
+- environment loading via `EnvironmentFile`
+- correct `WorkingDirectory`
+
+That preserves the single in-process auto-trader loop and makes systemd the owner of restart behavior.
+
+## RL Sandbox Disclaimer
+
+`app/rl/` and `scripts/rl_experiment.py` are experimental only.
+
+- they use replay/offline simulation concepts only
+- they are not wired into paper execution
+- they are not wired into live execution
+
+Try the stub:
+
+```bash
+source .venv/bin/activate
+python scripts/rl_experiment.py
+```
+
+## Key Env Vars
+
+Core:
+
+- `BROKER_MODE`
+- `TRADING_ENABLED`
+- `AUTO_TRADE_ENABLED`
+- `ACTIVE_STRATEGY`
+- `ALLOW_EXTENDED_HOURS`
+- `LOG_DIR`
+- `AUTO_TRADER_LOCK_PATH`
+
+Discord:
+
+- `DISCORD_NOTIFICATIONS_ENABLED`
+- `DISCORD_WEBHOOK_URL`
+- `DISCORD_NOTIFY_DRY_RUNS`
+- `DISCORD_NOTIFY_REJECTIONS`
+- `DISCORD_NOTIFY_ERRORS`
+- `DISCORD_NOTIFY_START_STOP`
+- `DISCORD_NOTIFY_SCAN_SUMMARY`
+
+ML:
+
+- `ML_ENABLED`
+- `ML_MODEL_TYPE`
+- `ML_MIN_SCORE_THRESHOLD`
+- `ML_MIN_TRAIN_ROWS`
+- `ML_RETRAIN_ENABLED`
+- `ML_PROMOTION_MIN_AUC`
+- `ML_PROMOTION_MIN_PRECISION`
+- `ML_PROMOTION_MIN_WINRATE_LIFT`
+- `ML_CURRENT_MODEL_PATH`
+- `ML_CANDIDATE_MODEL_PATH`
+- `ML_REGISTRY_PATH`
+
+News:
+
+- `NEWS_FEATURES_ENABLED`
+- `NEWS_RSS_ENABLED`
+- `NEWS_LLM_ENABLED`
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL`
+- `NEWS_MAX_HEADLINES_PER_TICKER`
+- `NEWS_LOOKBACK_HOURS`
+
+## Operational Notes
+
+- use `scripts/run_paper_api.py` locally and in systemd to avoid duplicate worker processes
+- keep `TRADING_ENABLED=false` until you explicitly want paper order submission
+- ML/news/RL are additive and optional; the bot still runs safely with all of them disabled
+- this repository does not claim live-trading readiness from the new ML, news, or RL additions

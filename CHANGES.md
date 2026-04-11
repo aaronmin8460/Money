@@ -13,6 +13,7 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** Crypto symbols like BTC/USD and ETH/USD were being evaluated by an equity-only strategy (equity_momentum_breakout), returning HOLD with null latest_price issues and unsupported asset class behavior.
 
 **Solution:**
+
 - Added `ACTIVE_STRATEGY_BY_ASSET_CLASS` config to map asset classes to specific strategies
 - Modified `_select_strategy_for_asset()` in auto_trader.py to route:
   - EQUITY → equity_momentum_breakout
@@ -21,13 +22,15 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 - Default: falls back to configured active strategy, then crypto_momentum_trend for crypto
 
 **Files Changed:**
+
 - app/config/settings.py: Added `active_strategy_by_asset_class` field (dict, env var)
 - app/services/auto_trader.py: Strategy selection updated in `_select_strategy_for_asset()`
 - app/services/runtime.py: No changes needed (already uses strategy_registry)
 - .env: Added ACTIVE_STRATEGY_BY_ASSET_CLASS config
 
 **Code Location:**
-- Strategy selection: `app/services/auto_trader.py` lines ~304-330  
+
+- Strategy selection: `app/services/auto_trader.py` lines ~304-330
 - Config parsing: `app/config/settings.py` lines ~393-405
 
 ---
@@ -37,19 +40,23 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** Equity/ETF symbols were flowing deep into rejection logic when market was closed, creating noisy alerts and misleading evaluations.
 
 **Solution:**
+
 - Added early session eligibility check in `_evaluate_asset()` for equities/ETFs
 - When market is closed and `ALLOW_EXTENDED_HOURS=false`, returns HOLD with decision_code="market_closed"
 - Crypto continues evaluation 24/7 (always_open session)
 - Prevents unnecessary risk checks and rejections for after-hours equity evaluations
 
 **Files Changed:**
+
 - app/services/auto_trader.py: Added market session check before strategy evaluation
 - Imports: Added `SessionState` to auto_trader.py
 
 **Code Location:**
+
 - Session filtering: `app/services/auto_trader.py` lines ~418-443
 
 **Behavior:**
+
 - Regular hours (9:30 AM - 4:00 PM ET): Equities/ETFs evaluated normally
 - Outside regular hours + ALLOW_EXTENDED_HOURS=false: HOLD with clear reason
 - Crypto always evaluated (is_24_7=true, session_state=always_open)
@@ -61,6 +68,7 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** Scanner was too broad, repeatedly surfacing irrelevant symbols like AAOX, AA, A, AAAU, random crypto variants.
 
 **Solution:**
+
 - Added `SCAN_UNIVERSE_MODE` config (default="major")
 - Added `MAJOR_EQUITY_SYMBOLS` and `MAJOR_CRYPTO_SYMBOLS` lists
 - When mode="major", scanning only evaluates configured major symbols
@@ -68,14 +76,17 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 - Default major crypto: BTC/USD, ETH/USD, SOL/USD, AVAX/USD
 
 **Files Changed:**
+
 - app/config/settings.py: Added scan_universe_mode, major_equity_symbols, major_crypto_symbols, prefer_primary_crypto_quotes
 - app/services/asset_catalog.py: Modified `get_scan_universe()` to filter by major symbols
 
 **Code Location:**
+
 - Config: `app/config/settings.py` lines ~186-193
 - Filtering: `app/services/asset_catalog.py` lines ~207-243
 
 **Behavior:**
+
 - SCAN_UNIVERSE_MODE=major (default): Restrict to configured major symbols only
 - SCAN_UNIVERSE_MODE=full: Scan full tradable universe (previous behavior)
 - /auto/status lastI_scanned_symbols reflects actual restricted universe
@@ -87,6 +98,7 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** Trades rejected when stop-based risk exceeded max_risk_per_trade, even though a smaller sized quantity would have been compliant.
 
 **Solution:**
+
 - Added `_attempt_risk_compliant_sizing()` method to ExecutionService
 - When BUY signal with stop_price would violate max_risk_per_trade:
   - Calculate max compliant quantity: max_qty = max_trade_risk / risk_per_share
@@ -96,13 +108,16 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 - Only reject if compliant quantity < minimum viable size
 
 **Files Changed:**
+
 - app/execution/execution_service.py: Added `_attempt_risk_compliant_sizing()` method
 - Called from `process_signal()` before risk evaluation
 
 **Code Location:**
+
 - Quantity reduction: `app/execution/execution_service.py` lines ~237-310
 
 **Example:**
+
 - Account equity: $100,000
 - max_risk_per_trade: 1% = $1,000
 - Entry price: $50
@@ -119,6 +134,7 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** Discord notifications were generic, missing asset_class info, and timestamps were hard to read.
 
 **Solution:**
+
 - Added `DISCORD_NOTIFY_HOLDS_MANUAL`, `DISCORD_NOTIFY_SCAN_SUMMARY`, `DISCORD_NOTIFY_CRYPTO` config flags
 - Added `DISCORD_TIMEZONE` config (default America/Indiana/Indianapolis)
 - Updated `format_readable_notification_timestamp()` to use configured timezone
@@ -128,19 +144,22 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 - Timestamp format: "YYYY-MM-DD HH:MM:SS ZZZ" (e.g., "2026-04-10 17:25:25 EDT")
 
 **Files Changed:**
+
 - app/config/settings.py: Added discord_notify_holds_manual, discord_notify_scan_summary, discord_notify_crypto, discord_timezone
-- app/monitoring/discord_notifier.py: 
+- app/monitoring/discord_notifier.py:
   - Added pytz import for timezone handling
   - Updated timestamp formatting functions
   - Added send_scan_summary_notification() method
   - Added build_scan_summary_notification_payload() function
 
 **Code Location:**
+
 - Timezone formatting: `app/monitoring/discord_notifier.py` lines ~73-87
 - Scan summary: `app/monitoring/discord_notifier.py` lines ~366-417
 - Send method: `app/monitoring/discord_notifier.py` lines ~450-465
 
 **Notification Types:**
+
 - Manual run-once evaluations: Send detailed HOLD reasons if DISCORD_NOTIFY_HOLDS_MANUAL=true
 - Auto scan summaries: Send top results with asset_class if DISCORD_NOTIFY_SCAN_SUMMARY=true
 - Crypto-specific: Include all crypto actions if DISCORD_NOTIFY_CRYPTO=true
@@ -152,6 +171,7 @@ This release fixes major issues with the auto-trading flow to enable correct beh
 **Problem:** POST /run-once required a JSON body field and returned "Field required" error when called without proper body.
 
 **Solution:**
+
 - Changed endpoint to accept optional request body
 - Default: `RunOnceRequest()`
 - If symbol is missing, returns clear error message with usage examples
@@ -160,12 +180,15 @@ This release fixes major issues with the auto-trading flow to enable correct beh
   - `POST /run-once` with body `{"symbol": "AAPL"}`
 
 **Files Changed:**
+
 - app/api/routes.py: Updated run_once() endpoint signature and error message
 
 **Code Location:**
+
 - API endpoint: `app/api/routes.py` lines ~101-129
 
 **Example Usage:**
+
 ```bash
 # Valid requests:
 curl -X POST http://localhost:8000/run-once -H "Content-Type: application/json" -d '{"symbol": "BTC/USD"}'
@@ -178,6 +201,7 @@ curl -X POST http://localhost:8000/run-once -H "Content-Type: application/json" 
 ## 7. CONFIGURATION CHANGES
 
 ### New Environment Variables:
+
 ```
 # Asset class routing
 ACTIVE_STRATEGY_BY_ASSET_CLASS={"equity":"equity_momentum_breakout","etf":"equity_momentum_breakout","crypto":"crypto_momentum_trend"}
@@ -200,6 +224,7 @@ ALLOW_EXTENDED_HOURS=false
 ```
 
 ### Updated in .env:
+
 - DEFAULT_SYMBOLS simplified to remove low-priority symbols
 - ACTIVE_STRATEGY_BY_ASSET_CLASS configured for proper routing
 - SCAN_UNIVERSE_MODE set to "major"
@@ -210,6 +235,7 @@ ALLOW_EXTENDED_HOURS=false
 ## 8. NORMALIZED MARKET DATA
 
 **Existing:** The normalized snapshot already contains all necessary pricing and metadata:
+
 - latest_trade_price, bid_price, ask_price, mid_price, evaluation_price
 - quote_available, quote_stale, quote_age_seconds
 - spread_pct, spread_abs
@@ -224,6 +250,7 @@ ALLOW_EXTENDED_HOURS=false
 ## 9. DIAGNOSTICS EXPOSURE
 
 **Existing visibility:**
+
 - `/config` endpoint returns all settings
 - `/auto/status` returns:
   - strategy_routing with mapping by asset_class
@@ -240,27 +267,32 @@ No additional changes needed for diagnostics.
 ## 10. KEY BEHAVIORS
 
 ### Crypto Monitoring:
+
 - BTC/USD and ETH/USD now evaluated 24/7 (always_open session)
 - Use crypto_momentum_trend strategy
 - Continue scanning even when US equity market is closed
 
 ### Equity/ETF Filtering:
+
 - Outside 9:30 AM - 4:00 PM ET with allow_extended_hours=false:
   - Marked HOLD with decision_code="market_closed"
   - NOT rejected (no noisy alerts)
   - No risk/spread checks attempted
 
 ### Risk Compliance:
+
 - Trades not rejected for max_risk_per_trade if quantity can be reduced
 - Metadata shows original qty, reduced qty, and reason
 - Only reject if min viable qty is non-compliant
 
 ### Universe Scanning:
+
 - SCAN_UNIVERSE_MODE=major filters to 10 major equities + 4 major crypto
 - Can be changed to "full" for broader scanning
 - /auto/status.last_scanned_symbols reflects actual universe used
 
 ### Discord Notifications:
+
 - All timestamps use configured timezone (default EDT)
 - Format: "2026-04-10 17:25:25 EDT"
 - Scan summaries include top results with asset_class
@@ -278,14 +310,14 @@ No additional changes needed for diagnostics.
 
 2. **app/services/auto_trader.py**
    - Added SessionState import
-   - Added session eligibility check in _evaluate_asset()
+   - Added session eligibility check in \_evaluate_asset()
    - Strategy selection already routes by asset_class
 
 3. **app/services/asset_catalog.py**
    - Modified get_scan_universe() to filter by major symbols when SCAN_UNIVERSE_MODE=major
 
 4. **app/execution/execution_service.py**
-   - Added _attempt_risk_compliant_sizing() method
+   - Added \_attempt_risk_compliant_sizing() method
    - Called from process_signal() to reduce quantity when risk-limited
 
 5. **app/monitoring/discord_notifier.py**

@@ -1,0 +1,13 @@
+{
+  "created_at": null,
+  "promoted": false,
+  "current_model": null,
+  "candidate_model": null,
+  "previous_current_model": null,
+  "model_type": null,
+  "feature_version": "v1",
+  "train_rows": 0,
+  "validation_rows": 0,
+  "metrics": {},
+  "notes": ""
+}

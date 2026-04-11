@@ -1,0 +1,9 @@
+[Unit]
+Description=Money nightly candidate-model retrain
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/money
+EnvironmentFile=/etc/money/money.env
+ExecStart=/bin/bash scripts/run_nightly_retrain.sh

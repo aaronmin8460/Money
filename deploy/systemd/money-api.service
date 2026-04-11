@@ -1,0 +1,18 @@
+[Unit]
+Description=Money paper-trading FastAPI service
+After=network.target
+
+[Service]
+Type=simple
+# Update to the deployed repository path.
+WorkingDirectory=/opt/money
+# Place environment variables here or export them before starting the service.
+EnvironmentFile=/etc/money/money.env
+ExecStart=/opt/money/.venv/bin/python scripts/run_paper_api.py --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -82,6 +82,7 @@ class Settings(BaseSettings):
     app_env: str = Field("development", env="APP_ENV")
     log_level: str = Field("INFO", env="LOG_LEVEL")
     database_url: str = Field("sqlite:///./trading.db", env="DATABASE_URL")
+    log_dir: str = Field("logs", env="LOG_DIR")
     broker_mode: str = Field("paper", env="BROKER_MODE")
     alpaca_api_key: str | None = Field(None, env="ALPACA_API_KEY")
     alpaca_secret_key: str | None = Field(None, env="ALPACA_SECRET_KEY")
@@ -184,9 +185,10 @@ class Settings(BaseSettings):
     scanner_limit_per_asset_class: int = Field(50, env="SCANNER_LIMIT_PER_ASSET_CLASS")
     strategy_switches: dict[str, bool] = Field(default_factory=dict, env="STRATEGY_SWITCHES")
     discord_notify_holds_manual: bool = Field(True, env="DISCORD_NOTIFY_HOLDS_MANUAL")
-    discord_notify_scan_summary: bool = Field(True, env="DISCORD_NOTIFY_SCAN_SUMMARY")
+    discord_notify_scan_summary: bool = Field(False, env="DISCORD_NOTIFY_SCAN_SUMMARY")
     discord_notify_crypto: bool = Field(True, env="DISCORD_NOTIFY_CRYPTO")
     discord_timezone: str = Field("America/Indiana/Indianapolis", env="DISCORD_TIMEZONE")
+    auto_trader_lock_path: str = Field("logs/auto_trader.lock", env="AUTO_TRADER_LOCK_PATH")
     scan_universe_mode: str = Field("full", env="SCAN_UNIVERSE_MODE")
     major_equity_symbols: list[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "SPY", "QQQ", "IWM"],
@@ -197,6 +199,25 @@ class Settings(BaseSettings):
         env="MAJOR_CRYPTO_SYMBOLS",
     )
     prefer_primary_crypto_quotes: bool = Field(True, env="PREFER_PRIMARY_CRYPTO_QUOTES")
+    ml_enabled: bool = Field(False, env="ML_ENABLED")
+    ml_model_type: str = Field("logistic_regression", env="ML_MODEL_TYPE")
+    ml_min_score_threshold: float = Field(0.55, env="ML_MIN_SCORE_THRESHOLD")
+    ml_min_train_rows: int = Field(50, env="ML_MIN_TRAIN_ROWS")
+    ml_retrain_enabled: bool = Field(False, env="ML_RETRAIN_ENABLED")
+    ml_promotion_min_auc: float = Field(0.55, env="ML_PROMOTION_MIN_AUC")
+    ml_promotion_min_precision: float = Field(0.50, env="ML_PROMOTION_MIN_PRECISION")
+    ml_promotion_min_winrate_lift: float = Field(0.00, env="ML_PROMOTION_MIN_WINRATE_LIFT")
+    model_dir: str = Field("models", env="MODEL_DIR")
+    ml_current_model_path: str = Field("models/current_model.joblib", env="ML_CURRENT_MODEL_PATH")
+    ml_candidate_model_path: str = Field("models/candidate_model.joblib", env="ML_CANDIDATE_MODEL_PATH")
+    ml_registry_path: str = Field("models/registry.json", env="ML_REGISTRY_PATH")
+    news_features_enabled: bool = Field(False, env="NEWS_FEATURES_ENABLED")
+    news_rss_enabled: bool = Field(False, env="NEWS_RSS_ENABLED")
+    news_llm_enabled: bool = Field(True, env="NEWS_LLM_ENABLED")
+    openai_api_key: str | None = Field(None, env="OPENAI_API_KEY")
+    openai_model: str = Field("gpt-4.1-nano", env="OPENAI_MODEL")
+    news_max_headlines_per_ticker: int = Field(8, env="NEWS_MAX_HEADLINES_PER_TICKER")
+    news_lookback_hours: int = Field(24, env="NEWS_LOOKBACK_HOURS")
 
     class Config:
         env_file = ".env"
@@ -290,6 +311,12 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("openai_api_key", mode="before")
+    def parse_openai_api_key(cls, value: str | None) -> str | None:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("excluded_symbols", "included_symbols", mode="before")
     def parse_symbol_lists(cls, value: str | list[str], info: ValidationInfo) -> list[str]:
         return _parse_json_list(value, info.field_name.upper())
@@ -361,6 +388,22 @@ class Settings(BaseSettings):
         self.scale_in_mode = self.scale_in_mode.strip().lower()
         if self.scale_in_mode not in {"confirmation", "time", "momentum"}:
             raise ValueError("SCALE_IN_MODE must be one of: confirmation, time, momentum.")
+        self.log_level = self.log_level.strip().upper()
+        self.ml_model_type = self.ml_model_type.strip().lower()
+        if self.ml_model_type not in {"logistic_regression", "xgboost"}:
+            raise ValueError("ML_MODEL_TYPE must be one of: logistic_regression, xgboost.")
+        if not 0 <= self.ml_min_score_threshold <= 1:
+            raise ValueError("ML_MIN_SCORE_THRESHOLD must be between 0 and 1.")
+        if self.ml_min_train_rows < 1:
+            raise ValueError("ML_MIN_TRAIN_ROWS must be >= 1.")
+        if not 0 <= self.ml_promotion_min_auc <= 1:
+            raise ValueError("ML_PROMOTION_MIN_AUC must be between 0 and 1.")
+        if not 0 <= self.ml_promotion_min_precision <= 1:
+            raise ValueError("ML_PROMOTION_MIN_PRECISION must be between 0 and 1.")
+        if self.news_max_headlines_per_ticker < 1:
+            raise ValueError("NEWS_MAX_HEADLINES_PER_TICKER must be >= 1.")
+        if self.news_lookback_hours < 1:
+            raise ValueError("NEWS_LOOKBACK_HOURS must be >= 1.")
         if self.min_bars_between_tranches < 0:
             raise ValueError("MIN_BARS_BETWEEN_TRANCHES must be >= 0.")
         if self.minutes_between_tranches < 0:
@@ -408,6 +451,10 @@ class Settings(BaseSettings):
         if key == AssetClass.CRYPTO.value and self.active_strategy != "crypto_momentum_trend":
             return "crypto_momentum_trend"
         return self.active_strategy
+
+    @property
+    def news_llm_available(self) -> bool:
+        return self.news_features_enabled and self.news_llm_enabled and bool(self.openai_api_key)
 
 
 _settings: Settings | None = None

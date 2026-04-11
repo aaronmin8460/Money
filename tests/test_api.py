@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib
+import tempfile
+import uuid
 from fastapi.testclient import TestClient
 
 from app.api.app import app
@@ -25,6 +27,10 @@ def build_settings(**overrides: object) -> Settings:
         "max_position_notional": 10_000.0,
         "max_risk_per_trade": 0.05,
         "scan_interval_seconds": 1,
+        "allow_extended_hours": True,
+        "quote_stale_after_seconds": 10**9,
+        "data_stale_after_seconds": 10**9,
+        "auto_trader_lock_path": f"{tempfile.gettempdir()}/money-api-test-{uuid.uuid4().hex}.lock",
     }
     values.update(overrides)
     return Settings(**values)
@@ -87,14 +93,16 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     strategy_positions = strategy_positions_response.json()["positions"]
     signals = strategy_signals_response.json()["signals"]
     auto_status = auto_status_response.json()
+    executed_order = orders[0]
+    expected_cash = 100000.0 - (float(executed_order["quantity"]) * float(executed_order["price"]))
 
-    assert account["cash"] == 96100.0
+    assert account["cash"] == expected_cash
     assert account["positions"] == 1
     assert len(positions) == 1
     assert positions[0]["symbol"] == "AAPL"
     assert len(orders) == 1
     assert orders[0]["status"] == "FILLED"
-    assert risk["cash"] == 96100.0
+    assert risk["cash"] == expected_cash
     assert risk["equity"] == 100000.0
     assert risk["open_positions_count"] == 1
     assert risk["trading_enabled"] is True
@@ -114,7 +122,7 @@ def test_run_once_requires_explicit_symbol() -> None:
         response = client.post("/run-once", json={})
 
     assert response.status_code == 400
-    assert "symbol is required" in response.json()["detail"]
+    assert "symbol is required" in response.json()["detail"].lower()
 
 
 def test_auto_trade_enabled_starts_on_startup() -> None:

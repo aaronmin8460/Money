@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import tempfile
+import uuid
 from unittest.mock import Mock, patch
 
 import httpx
@@ -23,6 +25,7 @@ def build_execution_service(**setting_overrides: object) -> tuple[ExecutionServi
         "_env_file": None,
         "broker_mode": "mock",
         "trading_enabled": True,
+        "log_dir": f"{tempfile.gettempdir()}/money-discord-tests-{uuid.uuid4().hex}",
         "discord_notifications_enabled": True,
         "discord_webhook_url": "https://discord.com/api/webhooks/test-id/test-token",
         "min_avg_volume": 1,
@@ -71,6 +74,7 @@ def test_build_system_notification_payload_start_stop_is_compact() -> None:
         auto_trade_enabled=True,
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        discord_timezone="UTC",
     )
 
     payload = build_system_notification_payload(
@@ -83,7 +87,7 @@ def test_build_system_notification_payload_start_stop_is_compact() -> None:
     embed = payload["embeds"][0]
 
     assert "content" not in payload
-    assert embed["title"] == "🔵 PAPER | Bot started"
+    assert embed["title"] == "PAPER | Bot started"
     assert embed["description"] == (
         "Mode: PAPER\n"
         "Auto-trade: enabled\n"
@@ -99,6 +103,7 @@ def test_build_trade_notification_payload_is_compact() -> None:
         trading_enabled=True,
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        discord_timezone="UTC",
     )
     signal = TradeSignal(
         symbol="BTC/USD",
@@ -136,7 +141,7 @@ def test_build_trade_notification_payload_is_compact() -> None:
     embed = payload["embeds"][0]
 
     assert "content" not in payload
-    assert embed["title"] == "🟢 PAPER | BUY BTC/USD submitted"
+    assert embed["title"] == "PAPER | BUY BTC/USD submitted"
     assert embed["description"] == (
         "Momentum breakout\n\n"
         "Qty: 0.001\n"
@@ -160,6 +165,46 @@ def test_no_webhook_sent_when_notifications_disabled(mock_post: Mock) -> None:
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
+def test_hold_signal_does_not_send_discord_notification(mock_post: Mock) -> None:
+    mock_post.return_value = build_response()
+    execution, _broker = build_execution_service()
+    hold_signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.HOLD,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=150.0,
+        reason="no signal",
+    )
+
+    result = execution.process_signal(hold_signal)
+
+    assert result["action"] == "hold"
+    mock_post.assert_not_called()
+
+
+@patch("app.monitoring.discord_notifier.httpx.post")
+def test_market_closed_hold_is_classified_as_skipped(mock_post: Mock) -> None:
+    mock_post.return_value = build_response()
+    execution, _broker = build_execution_service()
+    skipped_signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.HOLD,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=150.0,
+        reason="outside regular session",
+        metrics={"decision_code": "market_closed_extended_hours_disabled"},
+    )
+
+    result = execution.process_signal(skipped_signal)
+
+    assert result["action"] == "skipped"
+    assert result["risk"]["rule"] == "market_closed_extended_hours_disabled"
+    mock_post.assert_not_called()
+
+
+@patch("app.monitoring.discord_notifier.httpx.post")
 def test_submitted_trade_sends_embed_webhook_without_duplicate_content(mock_post: Mock) -> None:
     mock_post.return_value = build_response()
     execution, _broker = build_execution_service()
@@ -171,7 +216,7 @@ def test_submitted_trade_sends_embed_webhook_without_duplicate_content(mock_post
     payload = mock_post.call_args.kwargs["json"]
     embed = payload["embeds"][0]
     assert payload.get("content") is None
-    assert embed["title"] == "🟢 PAPER | BUY AAPL submitted"
+    assert embed["title"] == "PAPER | BUY AAPL submitted"
     assert embed["description"].startswith("test notification\n\nQty: ")
     assert "Price: $150.00" in embed["description"]
     assert "Active Strategy: equity_momentum_breakout" in embed["description"]
@@ -205,7 +250,7 @@ def test_dry_runs_send_only_when_enabled(mock_post: Mock) -> None:
     payload = mock_post.call_args.kwargs["json"]
     embed = payload["embeds"][0]
     assert payload.get("content") is None
-    assert embed["title"] == "🟡 PAPER | BUY AAPL dry run"
+    assert embed["title"] == "PAPER | BUY AAPL dry run"
     assert "test notification" in embed["description"]
     assert "Price: $150.00" in embed["description"]
 
@@ -235,7 +280,7 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
     payload = mock_post.call_args.kwargs["json"]
     embed = payload["embeds"][0]
     assert payload.get("content") is None
-    assert embed["title"] == "🟠 PAPER | BUY AAPL rejected"
+    assert embed["title"] == "PAPER | BUY AAPL rejected"
     assert embed["description"].startswith("Maximum simultaneous positions (0) reached.")
     assert "Rule: position_count" in embed["description"]
     assert "Tracked Position: no" in embed["description"]
@@ -277,3 +322,33 @@ def test_webhook_failures_do_not_break_trade_execution(mock_post: Mock) -> None:
 
     assert result["action"] == "submitted"
     assert len(broker.list_orders()) == 1
+
+
+@patch("app.monitoring.discord_notifier.httpx.post")
+def test_broker_lifecycle_notifications_are_deduped(mock_post: Mock) -> None:
+    mock_post.return_value = build_response()
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        log_dir=f"{tempfile.gettempdir()}/money-discord-tests-{uuid.uuid4().hex}",
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+    )
+    notifier = DiscordNotifier(settings)
+    order_payload = {
+        "id": "order-abc",
+        "symbol": "AAPL",
+        "side": "buy",
+        "status": "filled",
+        "filled_qty": 1,
+        "filled_avg_price": 150.0,
+        "filled_at": "2026-04-10T14:05:00Z",
+    }
+
+    first = notifier.send_broker_lifecycle_notification(status="filled", order=order_payload)
+    second = notifier.send_broker_lifecycle_notification(status="filled", order=order_payload)
+
+    assert first is True
+    assert second is False
+    assert mock_post.call_count == 1

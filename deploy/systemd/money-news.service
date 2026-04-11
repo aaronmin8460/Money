@@ -1,0 +1,9 @@
+[Unit]
+Description=Money news feature refresh
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/money
+EnvironmentFile=/etc/money/money.env
+ExecStart=/opt/money/.venv/bin/python scripts/fetch_news_features.py

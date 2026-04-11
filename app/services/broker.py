@@ -185,6 +185,8 @@ class PaperBroker(BrokerInterface):
                 "executed_at": datetime.datetime.utcnow().isoformat(),
                 "is_dry_run": order.is_dry_run,
                 "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
+                "order_type": order.order_type,
+                "extended_hours": bool((order.metadata or {}).get("extended_hours")),
             }
             self.orders.append(result)
 
@@ -197,6 +199,8 @@ class PaperBroker(BrokerInterface):
         return "gtc" if asset_class == AssetClass.CRYPTO else "day"
 
     def is_market_open(self, asset_class: AssetClass | str | None = None) -> bool:
+        if self.settings.is_mock_mode:
+            return True
         session = self.market_data_service.get_session_status(asset_class or AssetClass.EQUITY)
         return session.is_open
 
@@ -494,6 +498,8 @@ class AlpacaBroker(BrokerInterface):
                 "status": "DRY_RUN",
                 "is_dry_run": True,
                 "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
+                "order_type": order.order_type,
+                "extended_hours": bool((order.metadata or {}).get("extended_hours")),
             }
 
         payload: dict[str, Any] = {
@@ -502,6 +508,8 @@ class AlpacaBroker(BrokerInterface):
             "type": order.order_type,
             "time_in_force": order.time_in_force or self._default_tif(resolved_asset_class),
         }
+        if resolved_asset_class in {AssetClass.EQUITY, AssetClass.ETF} and bool((order.metadata or {}).get("extended_hours")):
+            payload["extended_hours"] = True
         if order.notional is not None:
             payload["notional"] = order.notional
         elif order.quantity is not None:

@@ -122,9 +122,10 @@ def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
         max_daily_loss_pct=0.02,
     )
     portfolio = Portfolio(cash=97_000.0)
+    baseline_time = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     portfolio.reset_daily_baseline(
         equity=100_000.0,
-        as_of=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+        as_of=baseline_time,
     )
     manager = RiskManager(portfolio, settings=settings)
 
@@ -143,6 +144,7 @@ def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduc
         max_daily_loss_pct=0.02,
     )
     portfolio = Portfolio(cash=95_000.0)
+    baseline_time = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     portfolio.positions["QQQ"] = Position(
         symbol="QQQ",
         quantity=5.0,
@@ -152,7 +154,7 @@ def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduc
     )
     portfolio.reset_daily_baseline(
         equity=100_000.0,
-        as_of=datetime(2026, 4, 10, 0, 0, tzinfo=timezone.utc),
+        as_of=baseline_time,
     )
     manager = RiskManager(portfolio, settings=settings)
 

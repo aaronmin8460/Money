@@ -1,4 +1,5 @@
 # COMPLETION REPORT: Money Bot Auto-Trading Fixes
+
 ## Commit: cce7645
 
 ---
@@ -12,83 +13,92 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
 ## EXACT FILES CHANGED
 
 ### 1. **app/config/settings.py**
-   - **Lines 117-127:** Added 7 new configuration fields
-     - `active_strategy_by_asset_class: dict` - Maps asset classes to strategies
-     - `scan_universe_mode: str` - "major" or "full" mode
-     - `major_equity_symbols: list` - Default major equities to scan
-     - `major_crypto_symbols: list` - Default major crypto to scan
-     - `prefer_primary_crypto_quotes: bool` - Crypto quote preference
-     - Plus 3 Discord fields in earlier section (discord_notify_holds_manual, discord_notify_scan_summary, discord_notify_crypto, discord_timezone)
-   - **Lines 328-330:** Parse and normalize these new fields
-   - **Lines 393-405:** Added `strategy_for_asset_class()` method that uses the mapping
+
+- **Lines 117-127:** Added 7 new configuration fields
+  - `active_strategy_by_asset_class: dict` - Maps asset classes to strategies
+  - `scan_universe_mode: str` - "major" or "full" mode
+  - `major_equity_symbols: list` - Default major equities to scan
+  - `major_crypto_symbols: list` - Default major crypto to scan
+  - `prefer_primary_crypto_quotes: bool` - Crypto quote preference
+  - Plus 3 Discord fields in earlier section (discord_notify_holds_manual, discord_notify_scan_summary, discord_notify_crypto, discord_timezone)
+- **Lines 328-330:** Parse and normalize these new fields
+- **Lines 393-405:** Added `strategy_for_asset_class()` method that uses the mapping
 
 ### 2. **app/services/auto_trader.py**
-   - **Line 13:** Added `SessionState` import
-   - **Lines 418-443:** Added major new session-eligibility check
-     - For equities/ETFs outside regular hours with allow_extended_hours=false
-     - Returns HOLD with decision_code="market_closed" instead of proceeding to risk checks
-     - Crypto always passes (is_24_7 = True)
-   - **Lines 304-330:** Strategy selection already properly routes by asset class
-   - **No changes to signal evaluation logic** - existing code already uses the strategy registry correctly
+
+- **Line 13:** Added `SessionState` import
+- **Lines 418-443:** Added major new session-eligibility check
+  - For equities/ETFs outside regular hours with allow_extended_hours=false
+  - Returns HOLD with decision_code="market_closed" instead of proceeding to risk checks
+  - Crypto always passes (is_24_7 = True)
+- **Lines 304-330:** Strategy selection already properly routes by asset class
+- **No changes to signal evaluation logic** - existing code already uses the strategy registry correctly
 
 ### 3. **app/services/asset_catalog.py**
-   - **Lines 207-243:** Modified `get_scan_universe()` method
-     - Added major symbols filtering logic
-     - When `SCAN_UNIVERSE_MODE=major`: Filters to only configured major symbols
-     - When `SCAN_UNIVERSE_MODE=full`: Scans full tradable universe
+
+- **Lines 207-243:** Modified `get_scan_universe()` method
+  - Added major symbols filtering logic
+  - When `SCAN_UNIVERSE_MODE=major`: Filters to only configured major symbols
+  - When `SCAN_UNIVERSE_MODE=full`: Scans full tradable universe
 
 ### 4. **app/execution/execution_service.py**
-   - **Lines 237-310:** Added new `_attempt_risk_compliant_sizing()` method
-     - Calculates if order violates max_risk_per_trade limit
-     - If yes, calculates compliant reduced quantity
-     - Returns new OrderRequest with reduced quantity and metadata showing the reduction
-   - **Lines 155-157:** Integrated into `process_signal()` flow
-     - Called after building order request but before risk evaluation
-     - Only applied to BUY signals with stop_price
+
+- **Lines 237-310:** Added new `_attempt_risk_compliant_sizing()` method
+  - Calculates if order violates max_risk_per_trade limit
+  - If yes, calculates compliant reduced quantity
+  - Returns new OrderRequest with reduced quantity and metadata showing the reduction
+- **Lines 155-157:** Integrated into `process_signal()` flow
+  - Called after building order request but before risk evaluation
+  - Only applied to BUY signals with stop_price
 
 ### 5. **app/monitoring/discord_notifier.py**
-   - **Line 9:** Added `import pytz` for timezone handling
-   - **Lines 73-87:** Updated `format_readable_notification_timestamp()` function
-     - Now uses configured Discord timezone from settings
-     - Format: "YYYY-MM-DD HH:MM:SS ZZZ" (e.g., "2026-04-10 17:25:25 EDT")
-   - **Lines 366-417:** Added new `build_scan_summary_notification_payload()` function
-     - Creates Discord embeds for scan summaries
-     - Shows count of BUY/SELL/HOLD signals
-     - Lists top results with symbol, asset_class, signal, price, reason
-     - Includes timezone-aware timestamp
-   - **Lines 450-465:** Added `send_scan_summary_notification()` method to DiscordNotifier class
-     - Checks DISCORD_NOTIFY_SCAN_SUMMARY setting
-     - Calls into build function and posts via webhook
-   - **Note:** Also updated other timestamp calls to pass settings parameter
+
+- **Line 9:** Added `import pytz` for timezone handling
+- **Lines 73-87:** Updated `format_readable_notification_timestamp()` function
+  - Now uses configured Discord timezone from settings
+  - Format: "YYYY-MM-DD HH:MM:SS ZZZ" (e.g., "2026-04-10 17:25:25 EDT")
+- **Lines 366-417:** Added new `build_scan_summary_notification_payload()` function
+  - Creates Discord embeds for scan summaries
+  - Shows count of BUY/SELL/HOLD signals
+  - Lists top results with symbol, asset_class, signal, price, reason
+  - Includes timezone-aware timestamp
+- **Lines 450-465:** Added `send_scan_summary_notification()` method to DiscordNotifier class
+  - Checks DISCORD_NOTIFY_SCAN_SUMMARY setting
+  - Calls into build function and posts via webhook
+- **Note:** Also updated other timestamp calls to pass settings parameter
 
 ### 6. **app/api/routes.py**
-   - **Line 101:** Changed `Body(...)` to `Body(default=RunOnceRequest())`
-     - Makes the JSON body optional
-   - **Lines 105-112:** Improved error message
-     - Clear indication that symbol is required
-     - Shows example format `{"symbol": "BTC/USD"}`
-     - Explains both ways to call the endpoint
+
+- **Line 101:** Changed `Body(...)` to `Body(default=RunOnceRequest())`
+  - Makes the JSON body optional
+- **Lines 105-112:** Improved error message
+  - Clear indication that symbol is required
+  - Shows example format `{"symbol": "BTC/USD"}`
+  - Explains both ways to call the endpoint
 
 ### 7. **.env**
-   - **Added new sections:**
-     - Discord notification controls (holds, scan summary, crypto, timezone)
-     - Strategy routing config
-     - Universe mode and major symbols
-     - Risk and quote stale settings
-   - **Updated values:**
-     - DEFAULT_SYMBOLS simplified
-     - ACTIVE_STRATEGY_BY_ASSET_CLASS configured
+
+- **Added new sections:**
+  - Discord notification controls (holds, scan summary, crypto, timezone)
+  - Strategy routing config
+  - Universe mode and major symbols
+  - Risk and quote stale settings
+- **Updated values:**
+  - DEFAULT_SYMBOLS simplified
+  - ACTIVE_STRATEGY_BY_ASSET_CLASS configured
 
 ### 8. **Created new files:**
-   - **CHANGES.md:** Comprehensive changelog with all details
-   - **verify_changes.py:** Verification script that tests all major changes
-   - **VERIFY.sh:** Bash script with exact commands for verification
+
+- **CHANGES.md:** Comprehensive changelog with all details
+- **verify_changes.py:** Verification script that tests all major changes
+- **VERIFY.sh:** Bash script with exact commands for verification
 
 ---
 
 ## WHAT WAS COMPLETED
 
 ### ✅ 1. ASSET-CLASS STRATEGY ROUTING
+
 - **Implementation:** `_select_strategy_for_asset()` in auto_trader.py
 - **How it works:**
   1. Get requested strategy name from `settings.strategy_for_asset_class(asset.asset_class)`
@@ -103,6 +113,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - Registry: app/services/runtime.py (unchanged, already correct)
 
 ### ✅ 2. SESSION-AWARE BEHAVIOR
+
 - **Crypto monitoring 24/7:** Already handled by market_data.py SessionState logic
   - session_state = ALWAYS_OPEN for AssetClass.CRYPTO
   - is_24_7 = True
@@ -120,6 +131,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
     4. Otherwise continue evaluation normally
 
 ### ✅ 3. MAJOR-SYMBOL UNIVERSE RESTRICTION
+
 - **Location:** app/services/asset_catalog.py ~ lines 207-243 in `get_scan_universe()`
 - **How it works:**
   1. If SCAN_UNIVERSE_MODE = "major":
@@ -134,12 +146,13 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - .env has SCAN_UNIVERSE_MODE=major with lists
 
 ### ✅ 4. RISK-AWARE QUANTITY REDUCTION
+
 - **Location:** app/execution/execution_service.py ~ lines 237-310 (`_attempt_risk_compliant_sizing()`)
 - **How it works:**
-  1. Called from process_signal() after _build_order_request()
+  1. Called from process_signal() after \_build_order_request()
   2. Only applies if: signal.signal == BUY AND signal.stop_price is not None
   3. Calculate risk per share: entry_price - stop_price
-  4. Calculate trade risk: original_quantity * risk_per_share
+  4. Calculate trade risk: original_quantity \* risk_per_share
   5. Check against max_risk_per_trade limit
   6. If exceeds limit:
      - Calculate max_compliant_quantity = max_trade_risk / risk_per_share
@@ -151,6 +164,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
 - **Result:** Trade continues with compliant size instead of being rejected
 
 ### ✅ 5. NORMALIZED MARKET DATA SNAPSHOT
+
 - **Location:** Already fully implemented in app/domain/models.py and app/services/market_data.py
 - **Snapshot includes:**
   - last_trade_price, bid_price, ask_price, mid_price, evaluation_price
@@ -167,6 +181,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   ```
 
 ### ✅ 6. DISCORD NOTIFICATIONS IMPROVEMENTS
+
 - **Timezone formatting:**
   - Location: app/monitoring/discord_notifier.py ~ lines 73-87
   - Configured via DISCORD_TIMEZONE env var (default: America/Indiana/Indianapolis)
@@ -189,6 +204,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - DISCORD_TIMEZONE: Timezone for timestamp formatting
 
 ### ✅ 7. RUN-ONCE API USABILITY
+
 - **Location:** app/api/routes.py ~ lines 101-129
 - **Changes:**
   - Accept optional request body (default empty)
@@ -196,6 +212,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - Accepts `{"symbol": "BTC/USD"}`, `{"symbol": "AAPL"}`, etc.
 
 ### ✅ 8. BETTER ACTION LABELS
+
 - **No changes needed** - existing code already uses:
   - HOLD: no signal, unsupported asset class, market closed, stale quotes, etc.
   - REJECTED: blocked by risk manager
@@ -203,6 +220,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - Diagnostics expose decision_code for each evaluation (no_signal, unsupported_asset_class, market_closed, stale_quote, etc.)
 
 ### ✅ 9. DIAGNOSTICS AND API VISIBILITY
+
 - **Location:** app/services/auto_trader.py ~ `get_status()` method (already comprehensive)
 - **Exposed in /auto/status:**
   - strategy_routing: {equity, etf, crypto} → strategy names
@@ -211,6 +229,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - quote_stale_after_seconds, allow_extended_hours, crypto_monitoring_active
 
 ### ✅ 10. TESTS (Plan, not fully implemented)
+
 - Verification script (verify_changes.py) covers:
   1. ✓ Strategies routed correctly by asset_class
   2. ✓ Crypto evaluated when equity market closed (session state check)
@@ -227,6 +246,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
   - discord_test: timestamps in correct timezone format
 
 ### ✅ 11. CONFIG / DOCS / BACKWARD COMPATIBILITY
+
 - **Updated .env** with all new variables and sensible defaults
 - **Backward compatible:**
   - active_strategy_by_asset_class optional (falls back to active_strategy)
@@ -286,6 +306,7 @@ All modules imported successfully. No syntax errors.
 ## EXACT VERIFICATION COMMANDS
 
 ### 1. LOCAL VERIFICATION (No API server needed)
+
 ```bash
 cd /Users/byeongilmin/Desktop/Project/Money
 source .venv/bin/activate
@@ -293,6 +314,7 @@ python verify_changes.py
 ```
 
 ### 2. MODULE IMPORT CHECKS
+
 ```bash
 source .venv/bin/activate
 python -c "from app.services.auto_trader import AutoTrader; print('OK')"
@@ -301,6 +323,7 @@ python -c "from app.monitoring.discord_notifier import DiscordNotifier; print('O
 ```
 
 ### 3. START API SERVER (in one terminal)
+
 ```bash
 cd /Users/byeongilmin/Desktop/Project/Money
 source .venv/bin/activate
@@ -308,6 +331,7 @@ uvicorn app.api.app:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### 4. TEST RUN-ONCE ENDPOINT (in another terminal)
+
 ```bash
 # For BTC/USD
 curl -X POST http://localhost:8000/run-once \
@@ -326,6 +350,7 @@ curl -X POST http://localhost:8000/run-once \
 ```
 
 ### 5. CHECK CONFIGURATION
+
 ```bash
 curl http://localhost:8000/config | jq '.active_strategy_by_asset_class'
 curl http://localhost:8000/config | jq '.scan_universe_mode'
@@ -334,6 +359,7 @@ curl http://localhost:8000/config | jq '.discord_notify_scan_summary'
 ```
 
 ### 6. CHECK AUTO STATUS
+
 ```bash
 curl http://localhost:8000/auto/status | jq '.strategy_routing'
 curl http://localhost:8000/auto/status | jq '.last_scanned_symbols'
@@ -341,6 +367,7 @@ curl http://localhost:8000/auto/status | jq '.crypto_monitoring_active'
 ```
 
 ### 7. START AUTO TRADER
+
 ```bash
 curl -X POST http://localhost:8000/auto/start
 # Then check status:
@@ -348,6 +375,7 @@ curl http://localhost:8000/auto/status | jq '.running'
 ```
 
 ### 8. STOP AUTO TRADER
+
 ```bash
 curl -X POST http://localhost:8000/auto/stop
 ```
@@ -357,6 +385,7 @@ curl -X POST http://localhost:8000/auto/stop
 ## KEY CONFIGURATION TO VERIFY
 
 In .env or via GET /config:
+
 ```
 ACTIVE_STRATEGY_BY_ASSET_CLASS={"equity":"equity_momentum_breakout","etf":"equity_momentum_breakout","crypto":"crypto_momentum_trend"}
 SCAN_UNIVERSE_MODE=major
@@ -374,15 +403,15 @@ ALLOW_EXTENDED_HOURS=false
 
 ## WHERE LOGIC LIVES (QUICK REFERENCE)
 
-| Problem | Solution | File | Lines |
-|---------|----------|------|-------|
-| Crypto to wrong strategy | Route by asset_class | auto_trader.py | 304-330 |
-| Equity outside hours flows deep | Early session check | auto_trader.py | 418-443 |
-| Irrelevant symbols scanned | Major symbol filter | asset_catalog.py | 207-243 |
-| Risk too high, rejected | Qty reduction | execution_service.py | 237-310 |
-| Unreadable timestamps | Timezone formatting | discord_notifier.py | 73-87 |
-| No scan summaries | Build payload | discord_notifier.py | 366-417 |
-| Run-once errors | Optional body | routes.py | 101-129 |
+| Problem                         | Solution             | File                 | Lines   |
+| ------------------------------- | -------------------- | -------------------- | ------- |
+| Crypto to wrong strategy        | Route by asset_class | auto_trader.py       | 304-330 |
+| Equity outside hours flows deep | Early session check  | auto_trader.py       | 418-443 |
+| Irrelevant symbols scanned      | Major symbol filter  | asset_catalog.py     | 207-243 |
+| Risk too high, rejected         | Qty reduction        | execution_service.py | 237-310 |
+| Unreadable timestamps           | Timezone formatting  | discord_notifier.py  | 73-87   |
+| No scan summaries               | Build payload        | discord_notifier.py  | 366-417 |
+| Run-once errors                 | Optional body        | routes.py            | 101-129 |
 
 ---
 
@@ -431,6 +460,7 @@ Files Changed:
 ## READY FOR DEPLOYMENT
 
 All changes verified locally. Code compiles, imports successfully, configuration loads correctly. Ready for:
+
 1. Paper trading verification
 2. Full pytest test suite implementation
 3. Live testing against Alpaca paper account

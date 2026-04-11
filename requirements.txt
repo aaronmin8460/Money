@@ -10,3 +10,7 @@ httpx
 python-dotenv
 pytest
 pytz
+scikit-learn
+joblib
+feedparser
+openai

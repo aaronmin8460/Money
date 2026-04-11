@@ -92,3 +92,44 @@ def test_discord_notifications_reject_placeholder_webhook_url() -> None:
                 discord_notifications_enabled=True,
                 discord_webhook_url="https://discord.com/api/webhooks/your_webhook_id/your_webhook_token",
             )
+
+
+def test_new_ml_and_news_settings_parse_correctly() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            log_dir="custom-logs",
+            auto_trader_lock_path="custom-logs/auto.lock",
+            ml_enabled=True,
+            ml_model_type="logistic_regression",
+            ml_min_score_threshold=0.65,
+            ml_min_train_rows=25,
+            ml_retrain_enabled=True,
+            ml_promotion_min_auc=0.61,
+            ml_promotion_min_precision=0.58,
+            ml_promotion_min_winrate_lift=0.03,
+            model_dir="custom-models",
+            ml_current_model_path="custom-models/current.joblib",
+            ml_candidate_model_path="custom-models/candidate.joblib",
+            ml_registry_path="custom-models/registry.json",
+            news_features_enabled=True,
+            news_rss_enabled=True,
+            news_llm_enabled=False,
+            openai_model="gpt-4.1-nano",
+            news_max_headlines_per_ticker=4,
+            news_lookback_hours=12,
+        )
+
+    assert settings.log_dir == "custom-logs"
+    assert settings.auto_trader_lock_path == "custom-logs/auto.lock"
+    assert settings.ml_enabled is True
+    assert settings.ml_min_score_threshold == 0.65
+    assert settings.ml_retrain_enabled is True
+    assert settings.ml_registry_path == "custom-models/registry.json"
+    assert settings.news_features_enabled is True
+    assert settings.news_rss_enabled is True
+    assert settings.news_llm_enabled is False
+    assert settings.openai_model == "gpt-4.1-nano"
+    assert settings.news_lookback_hours == 12

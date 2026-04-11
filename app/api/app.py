@@ -39,14 +39,10 @@ def on_startup() -> None:
             "active_strategy": settings.active_strategy,
             "trading_enabled": settings.trading_enabled,
             "auto_trade_enabled": settings.auto_trade_enabled,
+            "discord_enabled": settings.discord_notifications_enabled,
         },
     )
     notifier = get_discord_notifier(settings)
-    notifier.send_system_notification(
-        event="Bot started",
-        reason="application startup completed",
-        category="start_stop",
-    )
     if settings.auto_trade_enabled:
         started = runtime.get_auto_trader().start()
         logger.info(
@@ -58,12 +54,28 @@ def on_startup() -> None:
                 "active_strategy": settings.active_strategy,
             },
         )
+    else:
+        notifier.send_system_notification(
+            event="Bot started",
+            reason="application startup completed",
+            details={
+                "broker_mode": settings.broker_mode,
+                "active_strategy": settings.active_strategy,
+                "trading_enabled": settings.trading_enabled,
+                "auto_trade_enabled": settings.auto_trade_enabled,
+                "discord_enabled": settings.discord_notifications_enabled,
+            },
+            category="start_stop",
+        )
     logger.info(
         "API startup complete",
         extra={
             "broker_mode": settings.broker_mode,
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
+            "trading_enabled": settings.trading_enabled,
+            "auto_trade_enabled": settings.auto_trade_enabled,
+            "discord_enabled": settings.discord_notifications_enabled,
         },
     )
 
@@ -72,6 +84,8 @@ def on_startup() -> None:
 def on_shutdown() -> None:
     settings = get_settings()
     notifier = get_discord_notifier(settings)
+    runtime = get_runtime(settings)
+    was_auto_trader_running = runtime.get_auto_trader().get_status().get("running", False)
     try:
         close_runtime()
     finally:
@@ -84,8 +98,16 @@ def on_shutdown() -> None:
                 "active_strategy": settings.active_strategy,
             },
         )
-        notifier.send_system_notification(
-            event="Bot stopped",
-            reason="application shutdown completed",
-            category="start_stop",
-        )
+        if not was_auto_trader_running:
+            notifier.send_system_notification(
+                event="Bot stopped",
+                reason="application shutdown completed",
+                details={
+                    "broker_mode": settings.broker_mode,
+                    "active_strategy": settings.active_strategy,
+                    "trading_enabled": settings.trading_enabled,
+                    "auto_trade_enabled": settings.auto_trade_enabled,
+                    "discord_enabled": settings.discord_notifications_enabled,
+                },
+                category="start_stop",
+            )
