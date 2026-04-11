@@ -8,6 +8,7 @@ from app.domain.models import AssetClass
 from app.execution.execution_service import ExecutionService
 from app.ml.registry import initialize_registry, load_registry, promote_candidate, update_candidate
 from app.ml.schema import ModelScoreResult
+from app.ml.evaluation import predict_scores
 from app.ml.training import train_model
 from app.news.feature_store import NewsFeatureStore
 from app.news.llm_analysis import analyze_headlines
@@ -128,6 +129,105 @@ def test_sparse_data_training_path_fails_safely() -> None:
 
     assert result["trained"] is False
     assert "Not enough labeled rows" in result["reason"]
+
+
+def test_evaluation_prediction_path_handles_missing_values() -> None:
+    training_rows = [
+        {
+            "symbol": "AAPL",
+            "asset_class": "equity",
+            "strategy_name": "test_strategy",
+            "signal": "BUY",
+            "direction": "long",
+            "regime": "bull",
+            "session_state": "open",
+            "price_source_used": "snapshot",
+            "news_sentiment_label": "positive",
+            "confidence": 0.8,
+            "entry": 100.0,
+            "stop": 95.0,
+            "target": 108.0,
+            "atr": 2.0,
+            "momentum": 0.7,
+            "liquidity": 0.8,
+            "spread": 0.01,
+            "latest_price": 101.0,
+            "latest_volume": 100000.0,
+            "avg_volume": 80000.0,
+            "dollar_volume": 8000000.0,
+            "scanner_signal_quality": 0.9,
+            "quote_age_seconds": 1.0,
+            "market_bullish_count": 4.0,
+            "market_bearish_count": 1.0,
+            "news_sentiment_score": 0.6,
+            "news_relevance_score": 0.9,
+            "news_risk_tags_count": 1.0,
+            "label": 1,
+        },
+        {
+            "symbol": "MSFT",
+            "asset_class": "equity",
+            "strategy_name": "test_strategy",
+            "signal": "BUY",
+            "direction": "long",
+            "regime": "bear",
+            "session_state": "open",
+            "price_source_used": "snapshot",
+            "news_sentiment_label": "negative",
+            "confidence": 0.3,
+            "entry": 100.0,
+            "stop": 99.0,
+            "target": 101.0,
+            "atr": 1.0,
+            "momentum": 0.2,
+            "liquidity": 0.4,
+            "spread": 0.03,
+            "latest_price": 99.5,
+            "latest_volume": 50000.0,
+            "avg_volume": 40000.0,
+            "dollar_volume": 4000000.0,
+            "scanner_signal_quality": 0.2,
+            "quote_age_seconds": 3.0,
+            "market_bullish_count": 1.0,
+            "market_bearish_count": 4.0,
+            "news_sentiment_score": -0.6,
+            "news_relevance_score": 0.5,
+            "news_risk_tags_count": 2.0,
+            "label": 0,
+        },
+    ] * 30
+    result = train_model(training_rows, model_type="logistic_regression", min_train_rows=10)
+
+    assert result["trained"] is True
+
+    evaluation_rows = [
+        {
+            "symbol": "AAPL",
+            "asset_class": "equity",
+            "strategy_name": "test_strategy",
+            "signal": "BUY",
+            "direction": "long",
+            "label": 1,
+            "entry": None,
+            "stop": None,
+            "target": None,
+            "latest_price": None,
+            "news_sentiment_score": None,
+        },
+        {
+            "symbol": "MSFT",
+            "asset_class": "equity",
+            "strategy_name": "test_strategy",
+            "signal": "BUY",
+            "direction": "long",
+            "label": 0,
+        },
+    ]
+
+    scores = predict_scores(result["bundle"], evaluation_rows)
+
+    assert len(scores) == 2
+    assert all(0.0 <= score <= 1.0 for score in scores)
 
 
 def test_registry_json_initializes_updates_and_promotes(tmp_path: Path) -> None:

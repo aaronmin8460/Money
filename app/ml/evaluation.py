@@ -4,7 +4,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from app.ml.features import feature_dict
+from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, feature_dict
 
 
 def _binary_auc(y_true: list[int], y_score: list[float]) -> float | None:
@@ -54,10 +54,20 @@ def evaluate_predictions(y_true: list[int], y_score: list[float], *, threshold: 
 def predict_scores(model_bundle: dict[str, Any], rows: Iterable[dict[str, Any] | Any]) -> list[float]:
     model = model_bundle["model"]
     feature_rows = [feature_dict(row) for row in rows]
+    frame = pd.DataFrame(feature_rows)
+    for column in CATEGORICAL_FEATURES:
+        if column not in frame:
+            frame[column] = ""
+        frame[column] = frame[column].fillna("").astype(str)
+    for column in NUMERIC_FEATURES:
+        if column not in frame:
+            frame[column] = 0.0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+    ordered_frame = frame[CATEGORICAL_FEATURES + NUMERIC_FEATURES]
     if hasattr(model, "predict_scores"):
         return [float(value) for value in model.predict_scores(feature_rows)]
     if hasattr(model, "predict_proba"):
-        probabilities = model.predict_proba(pd.DataFrame(feature_rows))
+        probabilities = model.predict_proba(ordered_frame)
         return [float(row[1]) for row in probabilities]
     if callable(model):
         return [float(model(row)) for row in feature_rows]
