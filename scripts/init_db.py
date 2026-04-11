@@ -1,3 +1,5 @@
+import _bootstrap  # noqa: F401
+
 from app.db.init_db import init_db
 
 

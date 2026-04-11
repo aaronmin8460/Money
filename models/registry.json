@@ -9,5 +9,12 @@
   "train_rows": 0,
   "validation_rows": 0,
   "metrics": {},
-  "notes": ""
+  "notes": "",
+  "evaluation": {
+    "evaluated_at": "2026-04-11T01:30:56.286507Z",
+    "dataset_path": "/private/tmp/money_training_data.jsonl",
+    "candidate_metrics": null,
+    "current_metrics": null,
+    "dataset_rows": 191
+  }
 }

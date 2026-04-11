@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 from app.ml.evaluation import evaluate_predictions, predict_scores
 from app.ml.registry import load_registry, save_registry

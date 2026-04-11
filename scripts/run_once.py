@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 from app.data.historical import load_csv_data
 from app.execution.execution_service import ExecutionService

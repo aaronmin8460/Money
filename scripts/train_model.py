@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 from app.ml.registry import update_candidate
 from app.ml.training import save_model_bundle, train_model

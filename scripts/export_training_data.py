@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 
 

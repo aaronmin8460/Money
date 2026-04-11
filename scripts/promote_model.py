@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 from app.ml.registry import load_registry, promote_candidate, rollback_candidate
 

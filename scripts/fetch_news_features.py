@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+import _bootstrap  # noqa: F401
+
 from app.config.settings import get_settings
 from app.news.feature_store import NewsFeatureStore
 from app.news.llm_analysis import analyze_headlines

@@ -1,6 +1,8 @@
 import argparse
 import json
 
+import _bootstrap  # noqa: F401
+
 from app.services.local_state_reset import LocalStateResetOptions, reset_local_state
 
 

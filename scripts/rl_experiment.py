@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import _bootstrap  # noqa: F401
+
 from app.rl.train_stub import train_stub
 
 
