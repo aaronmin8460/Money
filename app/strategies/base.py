@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any
 
 from app.domain.models import AssetClass, AssetMetadata, MarketSessionStatus, QuoteSnapshot, SignalDirection
+from app.utils.datetime_parser import parse_iso_datetime
 
 
 class Signal(str, Enum):
@@ -51,6 +52,7 @@ class TradeSignal:
     metrics: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self.timestamp = self._normalize_timestamp(self.timestamp)
         if self.entry_price is None and self.price is not None:
             self.entry_price = self.price
         if self.price is None and self.entry_price is not None:
@@ -63,6 +65,16 @@ class TradeSignal:
             self.direction = SignalDirection.SHORT
         else:
             self.direction = SignalDirection.FLAT
+
+    @staticmethod
+    def _normalize_timestamp(value: datetime | str | None) -> str | None:
+        if value in {None, ""}:
+            return None
+        try:
+            parsed = parse_iso_datetime(value)
+        except ValueError:
+            return None
+        return parsed.isoformat() if parsed is not None else None
 
     def to_dict(self) -> dict[str, Any]:
         return {

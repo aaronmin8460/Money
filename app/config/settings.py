@@ -25,6 +25,32 @@ def _parse_json_list(value: str | list[str] | None, field_name: str) -> list[str
     return [str(item).strip().upper() for item in parsed if str(item).strip()]
 
 
+def _dedupe_symbols(symbols: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for symbol in symbols:
+        normalized = str(symbol).strip().upper()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _looks_like_crypto_symbol(symbol: str) -> bool:
+    normalized = str(symbol).strip().upper()
+    if not normalized:
+        return False
+    if "/" in normalized:
+        base, quote = normalized.split("/", 1)
+        return bool(base) and quote in {"USD", "USDT", "USDC", "BTC", "ETH"}
+    return normalized.endswith(("USD", "USDT", "USDC")) and len(normalized) > 3
+
+
+def _filter_crypto_symbols(symbols: list[str]) -> list[str]:
+    return _dedupe_symbols([symbol for symbol in symbols if _looks_like_crypto_symbol(symbol)])
+
+
 def _parse_json_object(value: str | dict[str, Any] | None, field_name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -169,6 +195,7 @@ class Settings(BaseSettings):
         ],
         env="ENABLED_ASSET_CLASSES",
     )
+    crypto_only_mode: bool = Field(False, env="CRYPTO_ONLY_MODE")
     equity_trading_enabled: bool = Field(True, env="EQUITY_TRADING_ENABLED")
     etf_trading_enabled: bool = Field(True, env="ETF_TRADING_ENABLED")
     crypto_trading_enabled: bool = Field(True, env="CRYPTO_TRADING_ENABLED")
@@ -197,6 +224,10 @@ class Settings(BaseSettings):
     major_crypto_symbols: list[str] = Field(
         default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD"],
         env="MAJOR_CRYPTO_SYMBOLS",
+    )
+    crypto_symbols: list[str] = Field(
+        default_factory=lambda: ["BTC/USD", "ETH/USD", "SOL/USD", "AVAX/USD", "DOGE/USD", "LINK/USD", "LTC/USD"],
+        env="CRYPTO_SYMBOLS",
     )
     prefer_primary_crypto_quotes: bool = Field(True, env="PREFER_PRIMARY_CRYPTO_QUOTES")
     ml_enabled: bool = Field(False, env="ML_ENABLED")
@@ -258,6 +289,8 @@ class Settings(BaseSettings):
 
     @property
     def enabled_asset_class_set(self) -> set[AssetClass]:
+        if self.crypto_only_mode:
+            return {AssetClass.CRYPTO}
         raw = {item.lower() for item in self.enabled_asset_classes}
         allowed = set()
         for value in raw:
@@ -280,22 +313,64 @@ class Settings(BaseSettings):
         values: list[str] = []
         for symbols in self.watchlists.values():
             values.extend(symbols)
-        return sorted({symbol.strip().upper() for symbol in values if symbol.strip()})
+        return _dedupe_symbols([symbol for symbol in values if str(symbol).strip()])
 
     @property
     def manual_symbols(self) -> list[str]:
         return self.default_symbols or self.watchlist_symbols
 
     @property
+    def active_crypto_symbols(self) -> list[str]:
+        candidate_groups = [
+            self.included_symbols,
+            self.crypto_symbols,
+            self.manual_symbols,
+            self.watchlist_symbols,
+            self.major_crypto_symbols,
+        ]
+        for group in candidate_groups:
+            filtered = _filter_crypto_symbols(group)
+            if filtered:
+                return filtered
+        return []
+
+    @property
     def active_symbols(self) -> list[str]:
+        if self.crypto_only_mode:
+            return self.active_crypto_symbols
         # Support INCLUDED_SYMBOLS as backward-compatible alias for DEFAULT_SYMBOLS
         if self.included_symbols:
-            return sorted({symbol.strip().upper() for symbol in self.included_symbols if symbol.strip()})
+            return _dedupe_symbols(self.included_symbols)
         return self.manual_symbols
 
-    @field_validator("default_symbols", mode="before")
+    @property
+    def scan_symbol_allowlist(self) -> list[str]:
+        if self.crypto_only_mode:
+            return self.active_crypto_symbols
+        if self.included_symbols:
+            return _dedupe_symbols(self.included_symbols)
+        return []
+
+    @property
+    def active_asset_classes(self) -> list[str]:
+        return sorted(item.value for item in self.enabled_asset_class_set)
+
+    @property
+    def primary_runtime_asset_class(self) -> AssetClass:
+        if self.crypto_only_mode:
+            return AssetClass.CRYPTO
+        for candidate in (AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO, AssetClass.OPTION):
+            if candidate in self.enabled_asset_class_set:
+                return candidate
+        return AssetClass.EQUITY
+
+    @property
+    def primary_runtime_strategy(self) -> str:
+        return self.strategy_for_asset_class(self.primary_runtime_asset_class)
+
+    @field_validator("default_symbols", "crypto_symbols", "major_equity_symbols", "major_crypto_symbols", mode="before")
     def parse_default_symbols(cls, value: str | List[str]) -> List[str]:
-        return _parse_json_list(value, "DEFAULT_SYMBOLS")
+        return _parse_json_list(value, "SYMBOLS")
 
     @field_validator("enabled_asset_classes", mode="before")
     def parse_enabled_asset_classes(cls, value: str | list[str]) -> list[str]:

@@ -104,6 +104,45 @@ def test_sell_preserves_fractional_quantity(tmp_path) -> None:
     assert result["action"] == "dry_run"
 
 
+def test_crypto_buy_uses_gtc_time_in_force(tmp_path) -> None:
+    (tmp_path / "BTCUSD.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,40000,41000,39000,40500,100\n"
+        "2024-01-02,40500,42000,40000,41500,120\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False, min_avg_volume=1, min_dollar_volume=1, min_price=1)
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="BTC/USD",
+            signal=Signal.BUY,
+            asset_class=AssetClass.CRYPTO,
+            strategy_name="crypto_momentum_trend",
+            price=41500.0,
+            stop_price=40000.0,
+            reason="crypto tif test",
+            metrics={"exchange": "CRYPTO"},
+        )
+    )
+
+    assert result["proposal"]["time_in_force"] == "gtc"
+    assert result["action"] == "dry_run"
+
+
 def test_sell_without_tracked_long_is_rejected_in_execution_when_short_selling_disabled(tmp_path) -> None:
     (tmp_path / "AAPL.csv").write_text(
         "Date,Open,High,Low,Close,Volume\n"

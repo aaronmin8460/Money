@@ -208,15 +208,18 @@ class AssetCatalogService:
         resolved_asset_class = normalize_asset_class(asset_class)
         allowed_classes = self.settings.enabled_asset_class_set
         if resolved_asset_class != AssetClass.UNKNOWN:
-            allowed_classes = {resolved_asset_class}
+            allowed_classes = allowed_classes.intersection({resolved_asset_class})
+            if not allowed_classes:
+                return []
 
-        include_symbols = {symbol.upper() for symbol in self.settings.included_symbols}
+        explicit_symbol_order = self.settings.scan_symbol_allowlist
+        include_symbols = {symbol.upper() for symbol in explicit_symbol_order}
         exclude_symbols = {symbol.upper() for symbol in self.settings.excluded_symbols}
-        watchlist_symbols = {symbol.upper() for symbol in self.settings.watchlist_symbols}
+        watchlist_symbols = {symbol.upper() for symbol in self.settings.watchlist_symbols} if not include_symbols else set()
 
         # Major symbols mode
         major_symbols = set()
-        if self.settings.scan_universe_mode.lower() == "major":
+        if self.settings.scan_universe_mode.lower() == "major" and not include_symbols:
             for symbol in self.settings.major_equity_symbols + self.settings.major_crypto_symbols:
                 major_symbols.add(symbol.upper())
 
@@ -237,4 +240,8 @@ class AssetCatalogService:
             if not asset.tradable or asset.status.lower() != "active":
                 continue
             filtered.append(asset)
+
+        if include_symbols:
+            symbol_rank = {symbol: index for index, symbol in enumerate(explicit_symbol_order)}
+            filtered.sort(key=lambda asset: symbol_rank.get(asset.symbol.upper(), len(symbol_rank)))
         return filtered

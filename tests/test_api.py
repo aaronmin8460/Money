@@ -271,6 +271,41 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert isinstance(tranche_data["tranche_state"], list)
 
 
+def test_crypto_only_diagnostics_report_crypto_runtime_focus() -> None:
+    settings_module._settings = build_settings(
+        crypto_only_mode=True,
+        default_symbols=["AAPL", "BTC/USD"],
+        crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+        active_strategy="equity_momentum_breakout",
+    )
+
+    with TestClient(app) as client:
+        config_response = client.get("/config")
+        auto_response = client.get("/diagnostics/auto")
+        strategy_response = client.get("/diagnostics/strategy")
+
+    assert config_response.status_code == 200
+    config_payload = config_response.json()
+    assert config_payload["crypto_only_mode"] is True
+    assert config_payload["active_symbols"] == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert config_payload["enabled_asset_classes"] == ["crypto"]
+    assert config_payload["primary_runtime_strategy"] == "crypto_momentum_trend"
+
+    assert auto_response.status_code == 200
+    auto_payload = auto_response.json()
+    assert auto_payload["crypto_only_mode"] is True
+    assert auto_payload["active_asset_classes"] == ["crypto"]
+    assert auto_payload["active_symbols"] == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert auto_payload["strategy_routing"] == {"crypto": "crypto_momentum_trend"}
+    assert auto_payload["primary_runtime_asset_class"] == "crypto"
+
+    assert strategy_response.status_code == 200
+    strategy_payload = strategy_response.json()
+    assert strategy_payload["primary_runtime_strategy"] == "crypto_momentum_trend"
+    assert strategy_payload["primary_runtime_asset_class"] == "crypto"
+    assert strategy_payload["supported_asset_classes"] == ["crypto"]
+
+
 def test_admin_reset_local_state_endpoint_works_with_default_payload() -> None:
     settings_module._settings = build_settings(trading_enabled=True)
     with TestClient(app) as client:

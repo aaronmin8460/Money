@@ -4,6 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from app.config.settings import Settings, is_placeholder_discord_webhook_url
+from app.domain.models import AssetClass
 
 
 def test_settings_defaults() -> None:
@@ -46,8 +47,29 @@ def test_active_symbols_uses_included_symbols_when_set() -> None:
             trading_enabled=False,
             default_symbols=["AAPL", "SPY"],
             included_symbols=["BTC/USD", "ETH/USD"],
-        )
+    )
     assert settings.active_symbols == ["BTC/USD", "ETH/USD"]
+
+
+def test_crypto_only_mode_uses_configured_crypto_symbols() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            crypto_only_mode=True,
+            active_strategy="equity_momentum_breakout",
+            default_symbols=["AAPL", "SPY"],
+            included_symbols=["AAPL"],
+            crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
+        )
+
+    assert settings.active_symbols == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert settings.active_crypto_symbols == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert settings.scan_symbol_allowlist == ["BTC/USD", "ETH/USD", "SOL/USD"]
+    assert settings.active_asset_classes == ["crypto"]
+    assert settings.primary_runtime_asset_class == AssetClass.CRYPTO
+    assert settings.primary_runtime_strategy == "crypto_momentum_trend"
 
 
 def test_active_strategy_defaults_to_equity_momentum_breakout() -> None:

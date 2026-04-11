@@ -6,7 +6,7 @@ import pytest
 
 from app.config.settings import Settings
 from app.domain.models import AssetClass
-from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
+from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, infer_asset_class
 from app.strategies.base import Signal
 
 
@@ -313,6 +313,12 @@ class TestCSVMarketDataService:
 
         with pytest.raises(FileNotFoundError, match="MSFT"):
             service.fetch_bars("MSFT", limit=1)
+
+
+def test_infer_asset_class_recognizes_generic_crypto_pairs() -> None:
+    assert infer_asset_class("AVAX/USD") == AssetClass.CRYPTO
+    assert infer_asset_class("LINK/USD") == AssetClass.CRYPTO
+    assert infer_asset_class("DOGEUSD") == AssetClass.CRYPTO
 
 
 class TestMarketDataProtocol:

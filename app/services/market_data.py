@@ -34,6 +34,16 @@ MOCK_ASSET_NAMES: dict[str, tuple[str, AssetClass]] = {
 }
 
 
+def _looks_like_crypto_symbol(symbol: str) -> bool:
+    normalized = symbol.strip().upper()
+    if not normalized:
+        return False
+    if "/" in normalized:
+        base, quote = normalized.split("/", 1)
+        return bool(base) and quote in {"USD", "USDT", "USDC", "BTC", "ETH"}
+    return normalized.endswith(("USD", "USDT", "USDC")) and len(normalized) > 3
+
+
 class MarketDataService(Protocol):
     def get_bars(
         self,
@@ -100,9 +110,8 @@ def normalize_asset_class(value: AssetClass | str | None) -> AssetClass:
 def infer_asset_class(symbol: str, name: str | None = None) -> AssetClass:
     normalized_symbol = symbol.strip().upper()
     normalized_name = (name or "").upper()
-    if "/" in normalized_symbol or normalized_symbol.endswith("USD") and len(normalized_symbol) <= 10:
-        if normalized_symbol.startswith(("BTC", "ETH", "SOL", "DOGE", "LTC")):
-            return AssetClass.CRYPTO
+    if _looks_like_crypto_symbol(normalized_symbol):
+        return AssetClass.CRYPTO
     if "ETF" in normalized_name or normalized_symbol in {"SPY", "QQQ", "DIA", "IWM", "VTI", "IVV"}:
         return AssetClass.ETF
     return AssetClass.EQUITY
@@ -698,6 +707,12 @@ class AlpacaMarketDataService:
             bids = orderbook.get("b") or []
             best_ask = asks[0] if asks else {}
             best_bid = bids[0] if bids else {}
+            timestamp_value = (
+                orderbook.get("t")
+                or orderbook.get("timestamp")
+                or best_ask.get("t")
+                or best_bid.get("t")
+            )
             return QuoteSnapshot(
                 symbol=resolved_symbol,
                 asset_class=AssetClass.CRYPTO,
@@ -705,7 +720,7 @@ class AlpacaMarketDataService:
                 ask_size=float(best_ask["s"]) if best_ask.get("s") is not None else None,
                 bid_price=float(best_bid["p"]) if best_bid.get("p") is not None else None,
                 bid_size=float(best_bid["s"]) if best_bid.get("s") is not None else None,
-                timestamp=datetime.now(timezone.utc),
+                timestamp=_parse_timestamp(timestamp_value) if timestamp_value else datetime.now(timezone.utc),
             )
 
         payload = self._request_json(f"/v2/stocks/{resolved_symbol}/quotes/latest", params={"feed": "iex"})

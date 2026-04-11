@@ -117,6 +117,8 @@ class AutoTrader:
                 "broker_mode": self.settings.broker_mode,
                 "broker_backend": self.settings.broker_backend,
                 "active_strategy": self.settings.active_strategy,
+                "primary_runtime_strategy": self.settings.primary_runtime_strategy,
+                "crypto_only_mode": self.settings.crypto_only_mode,
                 "scan_interval_seconds": self.settings.scan_interval_seconds,
                 "trading_enabled": self.settings.trading_enabled,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
@@ -233,7 +235,7 @@ class AutoTrader:
                 self._last_run_time = now
                 self._last_error = None
                 self._last_scanned_symbols = [asset.symbol]
-                self._last_signals[asset.symbol] = signal.to_dict()
+                self._last_signals = {asset.symbol: signal.to_dict()}
                 self._last_cycle_id = cycle_id
                 self._last_run_result = self._summarize_results("manual_symbol", [result])
             return result
@@ -259,9 +261,14 @@ class AutoTrader:
                 "broker_backend": self.settings.broker_backend,
                 "trading_enabled": self.settings.trading_enabled,
                 "active_strategy": self.settings.active_strategy,
+                "primary_runtime_strategy": self.settings.primary_runtime_strategy,
                 "scan_interval_seconds": self.settings.scan_interval_seconds,
                 "last_run_time": self._last_run_time.isoformat() if self._last_run_time else None,
                 "active_symbols": self.settings.active_symbols,
+                "active_crypto_symbols": self.settings.active_crypto_symbols,
+                "active_asset_classes": self.settings.active_asset_classes,
+                "crypto_only_mode": self.settings.crypto_only_mode,
+                "primary_runtime_asset_class": self.settings.primary_runtime_asset_class.value,
                 "strategy_name": self.settings.active_strategy,
                 "dry_run": not self.settings.trading_enabled,
                 "last_scanned_symbols": self._last_scanned_symbols,
@@ -280,12 +287,11 @@ class AutoTrader:
                 "last_scan_overview": self._last_scan_overview,
                 "market_open": self._market_open,
                 "market_session_state": self._market_session_state,
-                "crypto_monitoring_active": self.settings.crypto_trading_enabled,
+                "crypto_monitoring_active": AssetClass.CRYPTO in self.settings.enabled_asset_class_set,
                 "quote_stale_after_seconds": self.settings.quote_stale_after_seconds,
                 "strategy_routing": {
-                    "equity": self.settings.strategy_for_asset_class(AssetClass.EQUITY),
-                    "etf": self.settings.strategy_for_asset_class(AssetClass.ETF),
-                    "crypto": self.settings.strategy_for_asset_class(AssetClass.CRYPTO),
+                    asset_class.value: self.settings.strategy_for_asset_class(asset_class)
+                    for asset_class in sorted(self.settings.enabled_asset_class_set, key=lambda item: item.value)
                 },
                 "allow_extended_hours": self.settings.allow_extended_hours,
                 "scan_summary_notifications_enabled": self.settings.discord_notify_scan_summary,
@@ -376,12 +382,13 @@ class AutoTrader:
         except Exception as exc:
             logger.warning("Failed to refresh asset catalog: %s", exc)
 
+        runtime_asset_class = self.settings.primary_runtime_asset_class
         try:
-            self._market_open = self.broker.is_market_open(AssetClass.EQUITY)
+            self._market_open = self.broker.is_market_open(runtime_asset_class)
         except Exception:
             self._market_open = True
         try:
-            session = self.market_data_service.get_session_status(AssetClass.EQUITY)
+            session = self.market_data_service.get_session_status(runtime_asset_class)
             self._market_session_state = getattr(session.session_state, "value", str(session.session_state))
         except Exception:
             self._market_session_state = None
@@ -600,7 +607,8 @@ class AutoTrader:
             normalized_snapshot.quote_timestamp.isoformat() if normalized_snapshot.quote_timestamp else None
         )
         signal.metrics["quote_age_seconds"] = normalized_snapshot.quote_age_seconds
-        signal.metrics.setdefault("exchange", asset.exchange)
+        signal.metrics["exchange"] = normalized_snapshot.exchange or asset.exchange
+        signal.metrics["source"] = normalized_snapshot.source
         return signal
 
     def _normalize_signal_for_long_only(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
@@ -676,6 +684,8 @@ class AutoTrader:
                     "cycle_id": cycle_id,
                     "mode": mode,
                     "active_symbols": self.settings.active_symbols,
+                    "active_asset_classes": self.settings.active_asset_classes,
+                    "crypto_only_mode": self.settings.crypto_only_mode,
                     "strategy_name": self.settings.active_strategy,
                     "dry_run": not self.settings.trading_enabled,
                     "universe_scan_enabled": self.settings.universe_scan_enabled,
@@ -694,8 +704,18 @@ class AutoTrader:
                     )
 
                 candidate_symbols = [item.symbol for item in scan_result.opportunities]
-                open_symbols = list(self.portfolio.positions.keys())
-                all_symbols = list(dict.fromkeys(candidate_symbols + open_symbols))
+                selected_scan_symbols = list((scan_result.symbol_snapshots or {}).keys())
+                if self.settings.crypto_only_mode or not self.settings.universe_scan_enabled:
+                    monitored_symbols = selected_scan_symbols or candidate_symbols
+                else:
+                    monitored_symbols = candidate_symbols
+                allowed_asset_classes = self.settings.enabled_asset_class_set
+                open_symbols = [
+                    position.symbol
+                    for position in self.portfolio.positions.values()
+                    if position.asset_class in allowed_asset_classes
+                ]
+                all_symbols = list(dict.fromkeys(monitored_symbols + open_symbols))
                 assets = [self._resolve_asset(symbol) for symbol in all_symbols]
                 snapshot_by_symbol = scan_result.symbol_snapshots or {}
                 opportunity_by_symbol = {item.symbol: item for item in scan_result.opportunities}
@@ -703,6 +723,7 @@ class AutoTrader:
 
                 signals: list[TradeSignal] = []
                 symbol_evaluations: list[dict[str, Any]] = []
+                latest_signals: dict[str, Any] = {}
                 for asset in assets:
                     signal = self._evaluate_asset(
                         asset,
@@ -721,23 +742,28 @@ class AutoTrader:
                         regime_snapshot=scan_result.regime_status,
                         news_features=news_features_by_symbol.get(asset.symbol),
                     )
-                    self._last_signals[asset.symbol] = signal.to_dict()
+                    latest_signals[asset.symbol] = signal.to_dict()
                     decision_code = str((signal.metrics or {}).get("decision_code") or "")
                     evaluation_action = self._classify_evaluation_action(signal)
+                    signal_snapshot = (signal.metrics or {}).get("normalized_snapshot", {})
+                    price_source_used = (signal.metrics or {}).get("price_source_used") or signal_snapshot.get("price_source_used")
                     symbol_evaluations.append(
                         {
                             "symbol": asset.symbol,
                             "asset_class": asset.asset_class.value,
                             "strategy_selected": (signal.metrics or {}).get("strategy_selected", signal.strategy_name),
-                            "market_session_state": (signal.metrics or {}).get("normalized_snapshot", {}).get("session_state"),
-                            "latest_normalized_snapshot": (signal.metrics or {}).get("normalized_snapshot"),
+                            "market_session_state": signal_snapshot.get("session_state"),
+                            "latest_normalized_snapshot": signal_snapshot,
                             "quote_available": (signal.metrics or {}).get("quote_available"),
+                            "exchange": (signal.metrics or {}).get("exchange") or signal_snapshot.get("exchange"),
+                            "data_source": (signal.metrics or {}).get("source") or signal_snapshot.get("source"),
                             "price_source_for_ranking": (
                                 (scan_result.symbol_snapshots.get(asset.symbol, {}) if scan_result.symbol_snapshots else {}).get("price_source_used")
+                                or price_source_used
                             ),
-                            "price_source_for_signal": (signal.metrics or {}).get("price_source_used"),
-                            "price_source_for_order_proposal": None,
-                            "price_source_for_spread_check": None,
+                            "price_source_for_signal": price_source_used,
+                            "price_source_for_order_proposal": price_source_used,
+                            "price_source_for_spread_check": price_source_used,
                             "latest_price": signal.price,
                             "signal": signal.signal.value,
                             "action": evaluation_action,
@@ -793,9 +819,11 @@ class AutoTrader:
                             row["decision_reason"] = (execution.get("risk") or {}).get("reason")
                             row["price_source_for_order_proposal"] = (
                                 (execution.get("risk") or {}).get("details", {}).get("price_source_used")
+                                or row.get("price_source_for_order_proposal")
                             )
                             row["price_source_for_spread_check"] = (
                                 (execution.get("risk") or {}).get("details", {}).get("price_source_used")
+                                or row.get("price_source_for_spread_check")
                             )
                             row["classification"] = action_result.get("classification")
                             row["ml_score"] = ((signal.metrics or {}).get("ml") or {}).get("score")
@@ -818,6 +846,7 @@ class AutoTrader:
                     self._last_run_time = now
                     self._last_cycle_id = cycle_id
                     self._last_scanned_symbols = all_symbols
+                    self._last_signals = latest_signals
                     self._last_ranked_candidates = [item.to_dict() for item in scan_result.opportunities]
                     self._last_regime_snapshot = scan_result.regime_status
                     self._last_scan_overview = scan_result.to_dict()
@@ -877,10 +906,12 @@ class AutoTrader:
             "market_session_state": snapshot.get("session_state"),
             "latest_normalized_snapshot": snapshot,
             "quote_available": snapshot.get("quote_available"),
+            "exchange": (signal.metrics or {}).get("exchange") or snapshot.get("exchange"),
+            "data_source": (signal.metrics or {}).get("source") or snapshot.get("source"),
             "price_source_for_ranking": snapshot.get("price_source_used"),
             "price_source_for_signal": snapshot.get("price_source_used"),
-            "price_source_for_order_proposal": (execution.get("risk") or {}).get("details", {}).get("price_source_used"),
-            "price_source_for_spread_check": (execution.get("risk") or {}).get("details", {}).get("price_source_used"),
+            "price_source_for_order_proposal": (execution.get("risk") or {}).get("details", {}).get("price_source_used") or snapshot.get("price_source_used"),
+            "price_source_for_spread_check": (execution.get("risk") or {}).get("details", {}).get("price_source_used") or snapshot.get("price_source_used"),
             "latest_price": execution.get("latest_price"),
             "signal": signal.signal.value,
             "action": execution.get("action"),

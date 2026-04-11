@@ -35,9 +35,15 @@ def config() -> dict[str, Any]:
         "short_selling_enabled": settings.short_selling_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
         "active_strategy": settings.active_strategy,
+        "primary_runtime_strategy": settings.primary_runtime_strategy,
         "active_strategy_by_asset_class": settings.active_strategy_by_asset_class,
         "default_symbols": settings.default_symbols,
-        "enabled_asset_classes": sorted(item.value for item in settings.enabled_asset_class_set),
+        "active_symbols": settings.active_symbols,
+        "active_crypto_symbols": settings.active_crypto_symbols,
+        "enabled_asset_classes": settings.active_asset_classes,
+        "crypto_only_mode": settings.crypto_only_mode,
+        "crypto_symbols": settings.crypto_symbols,
+        "primary_runtime_asset_class": settings.primary_runtime_asset_class.value,
         "universe_scan_enabled": settings.universe_scan_enabled,
         "universe_refresh_minutes": settings.universe_refresh_minutes,
         "scan_interval_seconds": settings.scan_interval_seconds,
@@ -100,6 +106,9 @@ def diagnostics_universe() -> dict[str, Any]:
     runtime = get_runtime()
     assets = runtime.asset_catalog.get_scan_universe()
     return {
+        "crypto_only_mode": runtime.settings.crypto_only_mode,
+        "active_symbols": runtime.settings.active_symbols,
+        "active_asset_classes": runtime.settings.active_asset_classes,
         "stats": runtime.asset_catalog.get_stats(),
         "sample_assets": [asset.to_dict() for asset in assets[:20]],
     }
@@ -120,7 +129,7 @@ def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = N
                 ),
             )
         resolved_symbol = active_symbols[0]
-    resolved_asset_class = asset_class or "equity"
+    resolved_asset_class = asset_class or runtime.settings.primary_runtime_asset_class.value
     return {
         "symbol": resolved_symbol,
         "asset_class": resolved_asset_class,
@@ -154,10 +163,13 @@ def diagnostics_strategies() -> dict[str, Any]:
 @router.get("/diagnostics/strategy")
 def diagnostics_strategy() -> dict[str, Any]:
     runtime = get_runtime()
-    strategy = runtime.strategy
+    strategy_name = runtime.settings.primary_runtime_strategy
+    strategy = runtime.strategy_registry.get(strategy_name)
     trader_status = runtime.get_auto_trader().get_status()
     return {
         "active_strategy": runtime.settings.active_strategy,
+        "primary_runtime_strategy": strategy_name,
+        "primary_runtime_asset_class": runtime.settings.primary_runtime_asset_class.value,
         "broker_mode": runtime.settings.broker_mode,
         "broker_backend": runtime.settings.broker_backend,
         "supported_asset_classes": sorted(item.value for item in strategy.supported_asset_classes),
@@ -185,6 +197,12 @@ def diagnostics_auto() -> dict[str, Any]:
         "broker_mode": runtime.settings.broker_mode,
         "broker_backend": runtime.settings.broker_backend,
         "active_strategy": runtime.settings.active_strategy,
+        "primary_runtime_strategy": status["primary_runtime_strategy"],
+        "primary_runtime_asset_class": status["primary_runtime_asset_class"],
+        "active_symbols": status["active_symbols"],
+        "active_crypto_symbols": status["active_crypto_symbols"],
+        "active_asset_classes": status["active_asset_classes"],
+        "crypto_only_mode": status["crypto_only_mode"],
         "market_open": status["market_open"],
         "market_session_state": status["market_session_state"],
         "allow_extended_hours": runtime.settings.allow_extended_hours,
