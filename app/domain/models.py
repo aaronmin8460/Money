@@ -5,6 +5,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from app.utils.datetime_parser import parse_iso_datetime
+
 
 class AssetClass(str, Enum):
     EQUITY = "equity"
@@ -195,13 +197,8 @@ class NormalizedMarketSnapshot:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "NormalizedMarketSnapshot":
         def _parse_ts(value: Any) -> datetime | None:
-            if value is None:
-                return None
-            if isinstance(value, datetime):
-                return value
-            text = str(value).replace("Z", "+00:00")
             try:
-                return datetime.fromisoformat(text)
+                return parse_iso_datetime(value)
             except ValueError:
                 return None
 

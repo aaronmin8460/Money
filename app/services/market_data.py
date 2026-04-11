@@ -20,6 +20,7 @@ from app.domain.models import (
     TradeSnapshot,
 )
 from app.monitoring.logger import get_logger
+from app.utils.datetime_parser import parse_iso_datetime
 
 logger = get_logger("market_data")
 NY_TZ = ZoneInfo("America/New_York")
@@ -139,12 +140,9 @@ def bars_to_dataframe(bars: list[NormalizedBar]) -> pd.DataFrame:
 
 
 def _parse_timestamp(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if value is None:
-        return datetime.now(timezone.utc)
-    text = str(value).replace("Z", "+00:00")
-    return datetime.fromisoformat(text)
+    fallback_timestamp = datetime.now(timezone.utc)
+    parsed = parse_iso_datetime(value, default_none=fallback_timestamp)
+    return parsed or fallback_timestamp
 
 
 def _timeframe_to_timedelta(timeframe: str) -> timedelta:

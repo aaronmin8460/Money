@@ -1,10 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
 
 from app.config.settings import Settings
+from app.domain.models import AssetClass
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService
 from app.strategies.base import Signal
 
@@ -216,6 +217,62 @@ class TestAlpacaMarketDataService:
 
         price = service.get_latest_price("AAPL")
         assert price == 150.75
+
+    def test_get_normalized_snapshot_parses_nanosecond_stock_timestamps(self, service):
+        service._request_json = MagicMock(
+            side_effect=[
+                {"trade": {"t": "2026-04-11T17:24:46.344345659+00:00", "p": 150.75, "s": 10}},
+                {"quote": {"t": "2026-04-11T17:24:46.344345659+00:00", "bp": 150.5, "bs": 12, "ap": 151.0, "as": 8}},
+                {
+                    "bars": [
+                        {
+                            "t": "2026-04-11T17:24:46.344345659+00:00",
+                            "o": 150.0,
+                            "h": 151.5,
+                            "l": 149.8,
+                            "c": 150.9,
+                            "v": 1000,
+                        }
+                    ]
+                },
+            ]
+        )
+
+        snapshot = service.get_normalized_snapshot("AAPL", AssetClass.EQUITY)
+
+        expected_timestamp = datetime(2026, 4, 11, 17, 24, 46, 344345, tzinfo=timezone.utc)
+        assert snapshot.trade_timestamp == expected_timestamp
+        assert snapshot.quote_timestamp == expected_timestamp
+        assert snapshot.source_timestamp == expected_timestamp
+
+    def test_get_normalized_snapshot_parses_nanosecond_crypto_timestamps(self, service):
+        service._request_json = MagicMock(
+            side_effect=[
+                {"trades": {"BTC/USD": {"t": "2026-04-10T19:59:56.248717591+00:00", "p": 84000.0, "s": 0.25}}},
+                {"orderbooks": {"BTC/USD": {"a": [{"p": 84010.0, "s": 0.5}], "b": [{"p": 83990.0, "s": 0.4}]}}},
+                {
+                    "bars": {
+                        "BTC/USD": [
+                            {
+                                "t": "2026-04-10T19:59:56.248717591+00:00",
+                                "o": 83800.0,
+                                "h": 84200.0,
+                                "l": 83750.0,
+                                "c": 84050.0,
+                                "v": 12.5,
+                            }
+                        ]
+                    }
+                },
+            ]
+        )
+
+        snapshot = service.get_normalized_snapshot("BTC/USD", AssetClass.CRYPTO)
+
+        expected_trade_timestamp = datetime(2026, 4, 10, 19, 59, 56, 248717, tzinfo=timezone.utc)
+        assert snapshot.trade_timestamp == expected_trade_timestamp
+        assert snapshot.last_trade_price == 84000.0
+        assert snapshot.evaluation_price == 84000.0
 
 
 class TestCSVMarketDataService:
