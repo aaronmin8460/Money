@@ -45,7 +45,7 @@
   },
   "notes": "Candidate met promotion thresholds.",
   "evaluation": {
-    "evaluated_at": "2026-04-11T01:36:34.920823Z",
+    "evaluated_at": "2026-04-11T01:38:12.475930Z",
     "dataset_path": "/Users/byeongilmin/Desktop/Project/Money/models/training_data.jsonl",
     "candidate_metrics": {
       "rows": 191,
