@@ -470,6 +470,48 @@ def test_evaluate_asset_rebases_crypto_buy_levels_to_live_snapshot_price(monkeyp
     assert decision.rule == "approved"
 
 
+def test_auto_trader_normalizes_buy_to_short_exit_when_short_position_exists() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        short_selling_enabled=True,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader.portfolio.positions["TSLA"] = Position(
+        symbol="TSLA",
+        quantity=5.0,
+        entry_price=100.0,
+        side="SHORT",
+        current_price=90.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    asset = AssetMetadata(
+        symbol="TSLA",
+        name="Tesla",
+        asset_class=AssetClass.EQUITY,
+        exchange="NASDAQ",
+        tradable=True,
+    )
+    signal = TradeSignal(
+        symbol="TSLA",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="ema_crossover",
+        price=90.0,
+        entry_price=90.0,
+        reason="Bullish crossover",
+    )
+
+    normalized = trader._normalize_signal_for_position_context(asset, signal)
+
+    assert normalized.order_intent == "short_exit"
+    assert normalized.reduce_only is True
+    assert normalized.metrics["has_coverable_short_position"] is True
+    assert normalized.metrics["position_direction"] == "short"
+
+
 def test_evaluate_asset_uses_snapshot_exchange_metadata_and_normalizes_bad_timestamp(monkeypatch) -> None:
     settings = Settings(
         _env_file=None,

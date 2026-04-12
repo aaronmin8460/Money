@@ -9,10 +9,11 @@ from typing import Any, Optional
 from app.config.settings import Settings, get_settings
 from app.db.models import RiskEvent as RiskEventRecord
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass
+from app.domain.models import AssetClass, AssetMetadata
 from app.monitoring.logger import get_logger
 from app.portfolio.portfolio import Portfolio
 from app.services.market_data import normalize_asset_class
+from app.strategies.base import ENTRY_ORDER_INTENTS, EXIT_ORDER_INTENTS
 
 logger = get_logger("risk")
 
@@ -185,19 +186,22 @@ class RiskManager:
         data_age_seconds: float | None = None,
         exchange: str | None = None,
         sizing: dict[str, Any] | None = None,
+        asset_metadata: AssetMetadata | None = None,
     ) -> RiskDecision:
         normalized_side = side.value if hasattr(side, "value") else str(side)
         normalized_side = normalized_side.upper()
         resolved_asset_class = normalize_asset_class(asset_class)
         if resolved_asset_class == AssetClass.UNKNOWN:
             resolved_asset_class = AssetClass.EQUITY
-        reduces_exposure = self._is_risk_reducing_sell(
+        resolved_order_profile = self._classify_order(
             symbol,
             normalized_side,
             quantity,
             order_intent=order_intent,
             reduce_only=reduce_only,
         )
+        reduces_exposure = resolved_order_profile in EXIT_ORDER_INTENTS
+        increases_exposure = resolved_order_profile in ENTRY_ORDER_INTENTS
         account = self.get_account_snapshot()
         quantity_decimal = self._decimal(quantity)
         price_decimal = self._decimal(price)
@@ -227,8 +231,11 @@ class RiskManager:
             dollar_volume=dollar_volume,
             data_age_seconds=data_age_seconds,
             exchange=exchange,
+            resolved_order_profile=resolved_order_profile,
             reduces_exposure=reduces_exposure,
+            increases_exposure=increases_exposure,
             sizing=sizing,
+            asset_metadata=asset_metadata,
         )
 
         if self.settings.kill_switch_enabled:
@@ -250,20 +257,45 @@ class RiskManager:
                 details=decision_details,
             )
 
-        if normalized_side == "SELL" and not reduces_exposure:
+        if resolved_order_profile == "long_exit" and not self.portfolio.is_sellable_long_position(symbol):
+            return RiskDecision(
+                False,
+                "No tracked long position to sell.",
+                rule="no_position_to_sell",
+                details=decision_details,
+            )
+
+        if resolved_order_profile == "short_exit" and not self.portfolio.is_coverable_short_position(symbol):
+            return RiskDecision(
+                False,
+                "No tracked short position to cover.",
+                rule="no_position_to_cover",
+                details=decision_details,
+            )
+
+        if resolved_order_profile == "short_entry":
             if not self.settings.short_selling_enabled:
+                if order_intent == "short_entry":
+                    return RiskDecision(
+                        False,
+                        "Short selling is disabled.",
+                        rule="short_selling_disabled",
+                        details=decision_details,
+                    )
                 return RiskDecision(
                     False,
                     "No tracked long position to sell while short selling is disabled.",
                     rule="no_position_to_sell",
                     details=decision_details,
                 )
-            return RiskDecision(
-                False,
-                "Short selling is enabled in settings, but true short entries are not implemented end-to-end.",
-                rule="short_selling_not_supported",
-                details=decision_details,
+            short_entry_validation = self._validate_short_entry(
+                symbol=symbol,
+                asset_class=resolved_asset_class,
+                decision_details=decision_details,
+                asset_metadata=asset_metadata,
             )
+            if short_entry_validation is not None:
+                return short_entry_validation
 
         if quantity_decimal <= 0 or price_decimal <= 0:
             return RiskDecision(False, "Invalid order quantity or price.", rule="input_validation", details=decision_details)
@@ -348,11 +380,33 @@ class RiskManager:
             order_notional = self._round_money(self._decimal(decision_details["final_submitted_notional"]))
         allow_duplicate_buy_for_scale_in = bool(decision_details.get("allow_duplicate_buy_for_scale_in"))
         tranche_consumes_new_slot = bool(decision_details.get("tranche_consumes_new_slot", True))
-        if normalized_side == "BUY":
-            if symbol in self.portfolio.positions and not allow_duplicate_buy_for_scale_in:
+        if increases_exposure:
+            existing_position = self.portfolio.get_position(symbol)
+            if resolved_order_profile == "long_entry" and self.portfolio.is_coverable_short_position(symbol):
+                return RiskDecision(
+                    False,
+                    "Opposing short position must be covered before opening a long position.",
+                    rule="position_direction_conflict",
+                    details=decision_details,
+                )
+            if resolved_order_profile == "short_entry" and self.portfolio.is_sellable_long_position(symbol):
+                return RiskDecision(
+                    False,
+                    "Opposing long position must be exited before opening a short position.",
+                    rule="position_direction_conflict",
+                    details=decision_details,
+                )
+            if resolved_order_profile == "long_entry" and existing_position is not None and not allow_duplicate_buy_for_scale_in:
                 return RiskDecision(
                     False,
                     "Duplicate buy order blocked for existing position.",
+                    rule="duplicate_position",
+                    details=decision_details,
+                )
+            if resolved_order_profile == "short_entry" and existing_position is not None:
+                return RiskDecision(
+                    False,
+                    "Duplicate short entry blocked for existing position.",
                     rule="duplicate_position",
                     details=decision_details,
                 )
@@ -432,7 +486,11 @@ class RiskManager:
                         details=decision_details,
                     )
 
-            if self.settings.is_simulated_mode and order_notional > self._decimal(account["cash"]):
+            if (
+                resolved_order_profile == "long_entry"
+                and self.settings.is_simulated_mode
+                and order_notional > self._decimal(account["cash"])
+            ):
                 return RiskDecision(
                     False,
                     f"Order notional ({float(order_notional):.2f}) exceeds available cash ({account['cash']:.2f}).",
@@ -449,11 +507,17 @@ class RiskManager:
                 )
 
             if stop_price is not None:
-                risk_per_share = price - stop_price
+                risk_per_share = (
+                    stop_price - price
+                    if resolved_order_profile == "short_entry"
+                    else price - stop_price
+                )
                 if risk_per_share <= 0:
+                    direction = "short" if resolved_order_profile == "short_entry" else "long"
+                    comparator = "above" if resolved_order_profile == "short_entry" else "below"
                     return RiskDecision(
                         False,
-                        "Stop price must be below entry price for a long position.",
+                        f"Stop price must be {comparator} entry price for a {direction} position.",
                         rule="stop_validation",
                         details=decision_details,
                     )
@@ -501,7 +565,7 @@ class RiskManager:
             return self.settings.option_trading_enabled
         return False
 
-    def _is_risk_reducing_sell(
+    def _classify_order(
         self,
         symbol: str,
         side: str,
@@ -509,22 +573,93 @@ class RiskManager:
         *,
         order_intent: str | None = None,
         reduce_only: bool = False,
-    ) -> bool:
-        if side != "SELL" or quantity <= 0:
-            return False
+    ) -> str | None:
+        if order_intent in ENTRY_ORDER_INTENTS | EXIT_ORDER_INTENTS:
+            return order_intent
+        if quantity <= 0:
+            return None
+        if reduce_only:
+            if side == "SELL":
+                return "long_exit"
+            if side == "BUY":
+                return "short_exit"
 
-        position = self.portfolio.get_position(symbol)
-        if position is None:
-            return False
+        if side == "SELL" and self.portfolio.is_sellable_long_position(symbol):
+            position = self.portfolio.get_position(symbol)
+            if position is not None and quantity <= (position.quantity + 1e-9):
+                return "long_exit"
+        if side == "BUY" and self.portfolio.is_coverable_short_position(symbol):
+            position = self.portfolio.get_position(symbol)
+            if position is not None and quantity <= (position.quantity + 1e-9):
+                return "short_exit"
+        if side == "BUY":
+            return "long_entry"
+        if side == "SELL":
+            return "short_entry"
+        return None
 
-        position_side = str(position.side).upper()
-        if position_side in {"SELL", "SHORT"}:
-            return False
+    def _validate_short_entry(
+        self,
+        *,
+        symbol: str,
+        asset_class: AssetClass,
+        decision_details: dict[str, Any],
+        asset_metadata: AssetMetadata | None = None,
+    ) -> RiskDecision | None:
+        asset = asset_metadata or self._load_asset_metadata(symbol, asset_class)
+        if asset is None:
+            return RiskDecision(
+                False,
+                "Short entry requires asset borrowability metadata.",
+                rule="asset_validation_missing",
+                details=decision_details,
+            )
 
-        if order_intent not in {None, "long_exit"} and not reduce_only:
-            return False
+        decision_details["asset_shortable"] = asset.shortable
+        decision_details["asset_easy_to_borrow"] = asset.easy_to_borrow
+        decision_details["asset_marginable"] = asset.marginable
+        decision_details["require_easy_to_borrow_for_shorts"] = self.settings.require_easy_to_borrow_for_shorts
+        decision_details["require_marginable_for_shorts"] = self.settings.require_marginable_for_shorts
 
-        return quantity <= (position.quantity + 1e-9)
+        if not asset.shortable:
+            return RiskDecision(
+                False,
+                "Asset is not shortable.",
+                rule="asset_not_shortable",
+                details=decision_details,
+            )
+        if self.settings.require_easy_to_borrow_for_shorts and not asset.easy_to_borrow:
+            return RiskDecision(
+                False,
+                "Asset is not easy to borrow for short entry.",
+                rule="asset_not_easy_to_borrow",
+                details=decision_details,
+            )
+        if (
+            asset_class in {AssetClass.EQUITY, AssetClass.ETF}
+            and self.settings.require_marginable_for_shorts
+            and not asset.marginable
+        ):
+            return RiskDecision(
+                False,
+                "Asset is not marginable for short entry.",
+                rule="asset_not_marginable",
+                details=decision_details,
+            )
+        return None
+
+    def _load_asset_metadata(
+        self,
+        symbol: str,
+        asset_class: AssetClass,
+    ) -> AssetMetadata | None:
+        broker = self.broker
+        if broker is None or not hasattr(broker, "get_asset"):
+            return None
+        try:
+            return broker.get_asset(symbol, asset_class)
+        except Exception:
+            return None
 
     def record_event(self, symbol: Optional[str], reason: str, details: Any = None) -> None:
         event_payload = {
@@ -621,14 +756,23 @@ class RiskManager:
         dollar_volume: float | None,
         data_age_seconds: float | None,
         exchange: str | None,
+        resolved_order_profile: str | None,
         reduces_exposure: bool,
+        increases_exposure: bool,
         sizing: dict[str, Any] | None,
+        asset_metadata: AssetMetadata | None,
     ) -> dict[str, Any]:
         position = self.portfolio.get_position(symbol)
         current_daily_loss_amount = self.portfolio.current_daily_loss_amount(equity=account["equity"])
         current_daily_loss_pct = self.portfolio.current_daily_loss_pct(equity=account["equity"])
         has_tracked_position = position is not None
         has_tracked_long_position = self.portfolio.is_sellable_long_position(symbol)
+        has_coverable_short_position = self.portfolio.is_coverable_short_position(symbol)
+        candidate_position_direction = None
+        if resolved_order_profile in {"long_entry", "long_exit"}:
+            candidate_position_direction = "long"
+        elif resolved_order_profile in {"short_entry", "short_exit"}:
+            candidate_position_direction = "short"
         details = {
             "symbol": symbol,
             "side": side,
@@ -647,18 +791,25 @@ class RiskManager:
             "asset_class": asset_class.value,
             "strategy_name": strategy_name,
             "order_intent": order_intent,
+            "resolved_order_profile": resolved_order_profile,
+            "position_direction": candidate_position_direction,
             "reduce_only": reduce_only,
             "exit_stage": exit_stage,
             "short_selling_enabled": self.settings.short_selling_enabled,
-            "is_risk_reducing_sell": reduces_exposure,
+            "is_risk_reducing_order": reduces_exposure,
+            "is_risk_reducing_sell": side == "SELL" and reduces_exposure,
+            "is_exposure_increasing_order": increases_exposure,
             "has_tracked_position": has_tracked_position,
             "has_tracked_long_position": has_tracked_long_position,
+            "has_coverable_short_position": has_coverable_short_position,
             "tracked_position_quantity": position.quantity if position is not None else 0.0,
             "tracked_position_side": str(position.side) if position is not None else None,
+            "tracked_position_direction": position.direction.value if position is not None else None,
             "tracked_position_entry_price": position.entry_price if position is not None else None,
             "tracked_position_asset_class": position.asset_class.value if position is not None else None,
             "tracked_position_exchange": position.exchange if position is not None else None,
             "tracked_position_sellable": has_tracked_long_position,
+            "tracked_position_coverable": has_coverable_short_position,
             "cash": account["cash"],
             "equity": account["equity"],
             "buying_power": account["buying_power"],
@@ -687,6 +838,10 @@ class RiskManager:
             "data_age_seconds": data_age_seconds,
             "exchange": exchange,
         }
+        if asset_metadata is not None:
+            details["asset_shortable"] = asset_metadata.shortable
+            details["asset_easy_to_borrow"] = asset_metadata.easy_to_borrow
+            details["asset_marginable"] = asset_metadata.marginable
         if sizing:
             details.update(sizing)
             details.setdefault(

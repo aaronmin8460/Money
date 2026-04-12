@@ -154,7 +154,10 @@ class PaperBroker(BrokerInterface):
                     **pos.copy(),
                     "qty": pos["quantity"],
                     "avg_entry_price": pos["entry_price"],
-                    "market_value": pos["quantity"] * pos["current_price"],
+                    "position_direction": "short" if str(pos.get("side", "")).upper() in {"SELL", "SHORT"} else "long",
+                    "market_value": (
+                        -1 if str(pos.get("side", "")).upper() in {"SELL", "SHORT"} else 1
+                    ) * pos["quantity"] * pos["current_price"],
                 }
                 for pos in self.positions.values()
             ]
@@ -192,7 +195,14 @@ class PaperBroker(BrokerInterface):
             self.orders.append(result)
 
             if not order.is_dry_run:
-                self.apply_trade(result["symbol"], resolved_asset_class, result["side"], filled_qty, price)
+                self.apply_trade(
+                    result["symbol"],
+                    resolved_asset_class,
+                    result["side"],
+                    filled_qty,
+                    price,
+                    metadata=dict(order.metadata or {}),
+                )
 
             return result
 
@@ -212,11 +222,26 @@ class PaperBroker(BrokerInterface):
         side: str,
         quantity: float,
         price: float,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         normalized_side = side.value if hasattr(side, "value") else str(side)
         normalized_side = normalized_side.upper()
-        if normalized_side == "BUY":
-            existing = self.positions.get(symbol)
+        existing = self.positions.get(symbol)
+        resolved_intent = str((metadata or {}).get("order_intent") or "").strip().lower() or None
+        if resolved_intent is None:
+            if normalized_side == "BUY":
+                if existing and str(existing.get("side", "")).upper() in {"SELL", "SHORT"}:
+                    resolved_intent = "short_exit"
+                else:
+                    resolved_intent = "long_entry"
+            elif existing and str(existing.get("side", "")).upper() not in {"SELL", "SHORT"}:
+                resolved_intent = "long_exit"
+            else:
+                resolved_intent = "short_entry"
+
+        if resolved_intent == "long_entry":
+            if existing and str(existing.get("side", "")).upper() in {"SELL", "SHORT"}:
+                return
             if existing:
                 total_quantity = existing["quantity"] + quantity
                 average_entry_price = (
@@ -233,7 +258,31 @@ class PaperBroker(BrokerInterface):
                 "exchange": "MOCK",
                 "quantity": total_quantity,
                 "entry_price": average_entry_price,
-                "side": normalized_side,
+                "side": "BUY",
+                "current_price": price,
+            }
+            return
+
+        if resolved_intent == "short_entry":
+            if existing and str(existing.get("side", "")).upper() not in {"SELL", "SHORT"}:
+                return
+            if existing:
+                total_quantity = existing["quantity"] + quantity
+                average_entry_price = (
+                    (existing["quantity"] * existing["entry_price"]) + (quantity * price)
+                ) / total_quantity
+            else:
+                total_quantity = quantity
+                average_entry_price = price
+
+            self.cash += quantity * price
+            self.positions[symbol] = {
+                "symbol": symbol,
+                "asset_class": asset_class.value,
+                "exchange": "MOCK",
+                "quantity": total_quantity,
+                "entry_price": average_entry_price,
+                "side": "SHORT",
                 "current_price": price,
             }
             return
@@ -243,7 +292,10 @@ class PaperBroker(BrokerInterface):
 
         position = self.positions[symbol]
         remaining_quantity = position["quantity"] - quantity
-        self.cash += quantity * price
+        if resolved_intent == "short_exit":
+            self.cash -= quantity * price
+        else:
+            self.cash += quantity * price
         if remaining_quantity <= 0:
             self.positions.pop(symbol, None)
             return
@@ -258,7 +310,10 @@ class PaperBroker(BrokerInterface):
 
             position = self.positions[symbol]
             price = self.get_latest_price(symbol, position.get("asset_class"))
-            self.cash += position["quantity"] * price
+            if str(position.get("side", "")).upper() in {"SELL", "SHORT"}:
+                self.cash -= position["quantity"] * price
+            else:
+                self.cash += position["quantity"] * price
             self.positions.pop(symbol, None)
             return {
                 "symbol": symbol,
@@ -303,7 +358,11 @@ class PaperBroker(BrokerInterface):
     def calculate_equity(self) -> float:
         total = self.cash
         for position in self.positions.values():
-            total += position["quantity"] * position["current_price"]
+            market_value = position["quantity"] * position["current_price"]
+            if str(position.get("side", "")).upper() in {"SELL", "SHORT"}:
+                total -= market_value
+            else:
+                total += market_value
         return total
 
     def close(self) -> None:

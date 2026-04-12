@@ -99,6 +99,34 @@ def test_ema_crossover_keeps_bearish_sell_as_exit_when_long_position_exists() ->
     assert signals[-1].signal_type == "exit"
 
 
+def test_ema_crossover_emits_short_entry_when_short_selling_is_enabled() -> None:
+    dates = pd.date_range(start="2024-01-01", periods=30, freq="D")
+    closes = [130 - i for i in range(30)]
+    data = pd.DataFrame(
+        {
+            "Date": dates,
+            "Open": closes,
+            "High": [c + 1 for c in closes],
+            "Low": [c - 1 for c in closes],
+            "Close": closes,
+            "Volume": [10_000 for _ in range(30)],
+        }
+    )
+    strategy = EMACrossoverStrategy(short_selling_enabled=True)
+    context = StrategyContext(
+        asset=AssetMetadata(symbol="AAPL", name="Apple", asset_class=AssetClass.EQUITY),
+        metadata={"has_sellable_long_position": False, "short_selling_enabled": True},
+    )
+
+    signals = strategy.generate_signals("AAPL", data, context=context)
+
+    assert signals[-1].signal == Signal.SELL
+    assert signals[-1].signal_type == "entry"
+    assert signals[-1].order_intent == "short_entry"
+    assert signals[-1].stop_price is not None
+    assert signals[-1].stop_price > (signals[-1].entry_price or 0.0)
+
+
 def test_crypto_momentum_trend_buy_signal_has_stop_below_entry_and_target_above_entry() -> None:
     dates = pd.date_range(start="2024-01-01", periods=30, freq="D")
     closes = [2000 + (index * 15) for index in range(30)]

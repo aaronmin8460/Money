@@ -185,6 +185,8 @@ class Settings(BaseSettings):
     allow_extended_hours: bool = Field(False, env="ALLOW_EXTENDED_HOURS")
     kill_switch_enabled: bool = Field(False, env="KILL_SWITCH_ENABLED")
     short_selling_enabled: bool = Field(False, env="SHORT_SELLING_ENABLED")
+    require_easy_to_borrow_for_shorts: bool = Field(True, env="REQUIRE_EASY_TO_BORROW_FOR_SHORTS")
+    require_marginable_for_shorts: bool = Field(True, env="REQUIRE_MARGINABLE_FOR_SHORTS")
     universe_scan_enabled: bool = Field(True, env="UNIVERSE_SCAN_ENABLED")
     universe_refresh_minutes: int = Field(60, env="UNIVERSE_REFRESH_MINUTES")
     enabled_asset_classes: list[str] = Field(

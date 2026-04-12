@@ -88,3 +88,38 @@ def test_hard_stop_exit_removes_full_remaining_quantity() -> None:
     )
 
     assert portfolio.get_position("QQQ") is None
+
+
+def test_short_entry_and_partial_cover_updates_quantity_and_realized_pnl() -> None:
+    portfolio = Portfolio(cash=100_000.0)
+
+    portfolio.update_position(
+        "TSLA",
+        "SELL",
+        10.0,
+        100.0,
+        asset_class=AssetClass.EQUITY,
+        order_intent="short_entry",
+        signal_metadata={"stop_price": 110.0},
+    )
+    portfolio.update_position(
+        "TSLA",
+        "BUY",
+        4.0,
+        90.0,
+        asset_class=AssetClass.EQUITY,
+        order_intent="short_exit",
+        reduce_only=True,
+        exit_stage="tp1",
+        signal_metadata={"next_stop": 98.0},
+    )
+
+    position = portfolio.get_position("TSLA")
+
+    assert position is not None
+    assert portfolio.is_coverable_short_position("TSLA") is True
+    assert position.direction.value == "short"
+    assert position.quantity == 6.0
+    assert position.current_stop == 98.0
+    assert portfolio.realized_pnl == 40.0
+    assert portfolio.cash == 100_640.0

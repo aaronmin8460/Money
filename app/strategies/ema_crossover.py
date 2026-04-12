@@ -42,6 +42,9 @@ class EMACrossoverStrategy(BaseStrategy):
 
         signals: list[TradeSignal] = []
         has_sellable_long_position = bool(context and context.metadata.get("has_sellable_long_position"))
+        short_selling_enabled = self.short_selling_enabled
+        if context is not None:
+            short_selling_enabled = bool(context.metadata.get("short_selling_enabled", short_selling_enabled))
         for index, row in df.iterrows():
             if pd.isna(row["ema_short"]) or pd.isna(row["ema_long"]):
                 continue
@@ -49,22 +52,30 @@ class EMACrossoverStrategy(BaseStrategy):
             direction = Signal.HOLD
             reason = "No crossover"
             signal_type = "entry"
+            order_intent: str | None = None
             if row["ema_short"] > row["ema_long"]:
                 direction = Signal.BUY
                 reason = "Bullish EMA crossover"
             elif row["ema_short"] < row["ema_long"]:
-                if self.short_selling_enabled:
+                if short_selling_enabled:
                     direction = Signal.SELL
+                    order_intent = "short_entry"
                     reason = "Bearish EMA crossover"
                 elif has_sellable_long_position:
                     direction = Signal.SELL
                     signal_type = "exit"
+                    order_intent = "long_exit"
                     reason = "Bearish EMA crossover exit"
                 else:
                     signal_type = "exit"
+                    order_intent = "long_exit"
                     reason = "Bearish EMA crossover ignored because no tracked long position is available to exit"
 
-            stop_loss = row["Close"] - row["atr"] * self.atr_multiplier
+            stop_loss = (
+                row["Close"] + row["atr"] * self.atr_multiplier
+                if order_intent == "short_entry"
+                else row["Close"] - row["atr"] * self.atr_multiplier
+            )
             signals.append(
                 TradeSignal(
                     symbol=symbol,
@@ -72,6 +83,7 @@ class EMACrossoverStrategy(BaseStrategy):
                     asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
                     strategy_name=self.name,
                     signal_type=signal_type,
+                    order_intent=order_intent,
                     strength=abs(row["ema_short"] - row["ema_long"]),
                     price=float(row["Close"]),
                     reason=f"{reason}. ATR stop {stop_loss:.2f}",

@@ -16,6 +16,20 @@ class Signal(str, Enum):
     HOLD = "HOLD"
 
 
+ENTRY_ORDER_INTENTS = frozenset({"long_entry", "short_entry"})
+EXIT_ORDER_INTENTS = frozenset({"long_exit", "short_exit"})
+ORDER_INTENT_TO_DIRECTION = {
+    "long_entry": SignalDirection.LONG,
+    "long_exit": SignalDirection.LONG,
+    "short_entry": SignalDirection.SHORT,
+    "short_exit": SignalDirection.SHORT,
+}
+
+
+def resolve_signal_direction(order_intent: str | None) -> SignalDirection:
+    return ORDER_INTENT_TO_DIRECTION.get(order_intent, SignalDirection.FLAT)
+
+
 @dataclass
 class StrategyContext:
     asset: AssetMetadata
@@ -67,30 +81,25 @@ class TradeSignal:
 
     def apply_intent_defaults(self) -> None:
         self.order_intent = self._resolve_order_intent()
-        if self.order_intent == "long_exit":
+        if self.order_intent in EXIT_ORDER_INTENTS:
             self.signal_type = "exit"
             self.reduce_only = True
+        elif self.order_intent in ENTRY_ORDER_INTENTS:
+            self.signal_type = "entry"
         self.direction = self._resolve_direction()
 
     def _resolve_order_intent(self) -> str | None:
         if self.order_intent:
             return self.order_intent
-        if self.reduce_only or self.exit_fraction is not None or self.exit_stage is not None:
-            return "long_exit"
-        if self.signal == Signal.BUY and self.signal_type == "entry":
-            return "long_entry"
-        if self.signal == Signal.SELL and self.signal_type == "exit":
-            return "long_exit"
+        if self.reduce_only or self.exit_fraction is not None or self.exit_stage is not None or self.signal_type == "exit":
+            if self.signal == Signal.SELL:
+                return "long_exit"
+            if self.signal == Signal.BUY:
+                return "short_exit"
         return None
 
     def _resolve_direction(self) -> SignalDirection:
-        if self.order_intent in {"long_entry", "long_exit"}:
-            return SignalDirection.LONG
-        if self.signal == Signal.BUY:
-            return SignalDirection.LONG
-        if self.signal == Signal.SELL:
-            return SignalDirection.SHORT
-        return SignalDirection.FLAT
+        return resolve_signal_direction(self.order_intent)
 
     @staticmethod
     def _normalize_timestamp(value: datetime | str | None) -> str | None:

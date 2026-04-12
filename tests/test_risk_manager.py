@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from dataclasses import dataclass
 
 from app.config.settings import Settings
-from app.domain.models import AssetClass
+from app.domain.models import AssetClass, AssetMetadata
 from app.portfolio.portfolio import Portfolio, Position
 from app.risk.risk_manager import RiskManager
 
@@ -73,8 +73,18 @@ class FakeAccount:
 
 
 class FakeBroker:
+    def __init__(self, asset: AssetMetadata | None = None):
+        self.asset = asset
+
     def get_account(self) -> FakeAccount:
         return FakeAccount()
+
+    def get_asset(self, symbol: str, asset_class: AssetClass | str | None = None) -> AssetMetadata | None:
+        if self.asset is None:
+            return None
+        if self.asset.symbol != symbol:
+            return None
+        return self.asset
 
 
 def test_risk_manager_blocks_stop_based_risk_when_it_exceeds_budget() -> None:
@@ -218,6 +228,107 @@ def test_explicit_long_exit_is_treated_as_risk_reducing() -> None:
     assert decision.approved is True
     assert decision.details["order_intent"] == "long_exit"
     assert decision.details["reduce_only"] is True
+
+
+def test_short_entry_is_rejected_when_short_selling_is_disabled() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        short_selling_enabled=False,
+    )
+    asset = AssetMetadata(
+        symbol="TSLA",
+        name="Tesla",
+        asset_class=AssetClass.EQUITY,
+        shortable=True,
+        easy_to_borrow=True,
+        marginable=True,
+    )
+    manager = RiskManager(Portfolio(), settings=settings, broker=FakeBroker(asset=asset))
+
+    decision = manager.evaluate_order(
+        "TSLA",
+        "SELL",
+        1.0,
+        250.0,
+        order_intent="short_entry",
+        asset_class=AssetClass.EQUITY,
+    )
+
+    assert decision.approved is False
+    assert decision.rule == "short_selling_disabled"
+
+
+def test_short_entry_is_rejected_for_non_shortable_asset() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        short_selling_enabled=True,
+    )
+    asset = AssetMetadata(
+        symbol="TSLA",
+        name="Tesla",
+        asset_class=AssetClass.EQUITY,
+        shortable=False,
+        easy_to_borrow=True,
+        marginable=True,
+    )
+    manager = RiskManager(Portfolio(), settings=settings, broker=FakeBroker(asset=asset))
+
+    decision = manager.evaluate_order(
+        "TSLA",
+        "SELL",
+        1.0,
+        250.0,
+        order_intent="short_entry",
+        asset_class=AssetClass.EQUITY,
+    )
+
+    assert decision.approved is False
+    assert decision.rule == "asset_not_shortable"
+
+
+def test_short_exit_buy_is_treated_as_risk_reducing() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        max_daily_loss=1_000.0,
+        max_daily_loss_pct=0.01,
+        short_selling_enabled=True,
+    )
+    portfolio = Portfolio(cash=100_000.0)
+    baseline_time = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    portfolio.positions["TSLA"] = Position(
+        symbol="TSLA",
+        quantity=5.0,
+        entry_price=100.0,
+        side="SHORT",
+        current_price=130.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    portfolio.reset_daily_baseline(
+        equity=100_000.0,
+        as_of=baseline_time,
+    )
+    manager = RiskManager(portfolio, settings=settings, broker=FakeBroker())
+
+    decision = manager.evaluate_order(
+        "TSLA",
+        "BUY",
+        2.0,
+        130.0,
+        order_intent="short_exit",
+        reduce_only=True,
+        asset_class=AssetClass.EQUITY,
+    )
+
+    assert decision.approved is True
+    assert decision.rule == "approved"
+    assert decision.details["is_risk_reducing_order"] is True
+    assert decision.details["position_direction"] == "short"
 
 
 def test_sell_without_tracked_long_position_is_rejected_when_short_selling_disabled() -> None:

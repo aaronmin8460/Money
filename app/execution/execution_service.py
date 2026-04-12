@@ -15,7 +15,7 @@ from app.db.models import (
     SignalEvent,
 )
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass, SessionState
+from app.domain.models import AssetClass, SessionState, SignalDirection
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.events import build_signal_id
 from app.monitoring.logger import get_logger
@@ -26,7 +26,14 @@ from app.risk.risk_manager import RiskDecision, RiskManager
 from app.services.broker import BrokerInterface, OrderRequest
 from app.services.market_data import MarketDataService, infer_asset_class
 from app.services.tranche_state import TranchePlanState, TrancheStateStore
-from app.strategies.base import BaseStrategy, Signal, TradeSignal
+from app.strategies.base import (
+    ENTRY_ORDER_INTENTS,
+    EXIT_ORDER_INTENTS,
+    BaseStrategy,
+    Signal,
+    TradeSignal,
+    resolve_signal_direction,
+)
 
 
 logger = get_logger("execution")
@@ -35,6 +42,12 @@ MONEY_QUANTUM = Decimal("0.01")
 PRICE_QUANTUM = Decimal("0.0001")
 FRACTIONAL_QTY_QUANTUM = Decimal("0.000001")
 WHOLE_QTY_QUANTUM = Decimal("1")
+ORDER_INTENT_TO_BROKER_SIDE = {
+    "long_entry": Signal.BUY.value,
+    "long_exit": Signal.SELL.value,
+    "short_entry": Signal.SELL.value,
+    "short_exit": Signal.BUY.value,
+}
 
 
 @dataclass
@@ -77,6 +90,8 @@ class ExecutionService:
                     "market_closed_extended_hours_disabled",
                     "extended_hours_not_supported_for_asset",
                     "no_position_to_sell",
+                    "no_position_to_cover",
+                    "short_selling_disabled",
                     "skipped_low_ml_score",
                     "ml_inference_error",
                 }
@@ -191,8 +206,8 @@ class ExecutionService:
 
         proposal = self._build_order_request(signal, asset_class, price)
         
-        # Attempt quantity reduction if stop-based risk exceeds max_risk_per_trade
-        if self._resolve_order_side(signal) == Signal.BUY.value and signal.stop_price is not None:
+        # Attempt quantity reduction if stop-based risk exceeds max_risk_per_trade.
+        if self._is_exposure_increasing_signal(signal) and signal.stop_price is not None:
             proposal = self._attempt_risk_compliant_sizing(signal, proposal, price, asset_class)
         
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
@@ -202,7 +217,7 @@ class ExecutionService:
 
         if not risk_decision.approved:
             logger.warning("Order blocked by risk manager", extra={"reason": risk_decision.reason, "symbol": proposal.symbol})
-            if signal.signal == Signal.BUY:
+            if self._is_long_entry_signal(signal):
                 self.tranche_state.mark_decision(
                     signal.symbol,
                     reason="Tranche blocked by risk manager.",
@@ -322,16 +337,29 @@ class ExecutionService:
             "is_dry_run": proposal.is_dry_run,
             "extended_hours": bool((proposal.metadata or {}).get("extended_hours")),
             "order_intent": (proposal.metadata or {}).get("order_intent"),
+            "position_direction": (proposal.metadata or {}).get("position_direction"),
             "reduce_only": bool((proposal.metadata or {}).get("reduce_only")),
             "exit_stage": (proposal.metadata or {}).get("exit_stage"),
         }
 
     def _resolve_order_side(self, signal: TradeSignal) -> str:
-        if signal.order_intent == "long_exit":
-            return Signal.SELL.value
-        if signal.order_intent == "long_entry":
-            return Signal.BUY.value
+        mapped_side = ORDER_INTENT_TO_BROKER_SIDE.get(signal.order_intent)
+        if mapped_side is not None:
+            return mapped_side
         return signal.signal.value
+
+    def _resolve_position_direction(self, signal: TradeSignal) -> str | None:
+        direction = resolve_signal_direction(signal.order_intent)
+        return None if direction == SignalDirection.FLAT else direction.value
+
+    def _is_exposure_reducing_signal(self, signal: TradeSignal) -> bool:
+        return signal.order_intent in EXIT_ORDER_INTENTS or signal.reduce_only
+
+    def _is_exposure_increasing_signal(self, signal: TradeSignal) -> bool:
+        return signal.order_intent in ENTRY_ORDER_INTENTS and not signal.reduce_only
+
+    def _is_long_entry_signal(self, signal: TradeSignal) -> bool:
+        return signal.order_intent == "long_entry"
 
     def _build_order_metadata(
         self,
@@ -341,6 +369,7 @@ class ExecutionService:
         combined_metadata = dict(metadata or {})
         combined_metadata["signal_type"] = signal.signal_type
         combined_metadata["order_intent"] = signal.order_intent
+        combined_metadata["position_direction"] = self._resolve_position_direction(signal)
         combined_metadata["reduce_only"] = signal.reduce_only
         combined_metadata["exit_stage"] = signal.exit_stage
         combined_metadata["exit_fraction"] = signal.exit_fraction
@@ -352,6 +381,7 @@ class ExecutionService:
             "strategy_name": signal.strategy_name,
             "signal_type": signal.signal_type,
             "order_intent": signal.order_intent,
+            "position_direction": self._resolve_position_direction(signal),
             "reduce_only": signal.reduce_only,
             "exit_stage": signal.exit_stage,
             "exit_fraction": signal.exit_fraction,
@@ -385,7 +415,11 @@ class ExecutionService:
         max_trade_risk = self._round_money(
             self._decimal(account["equity"]) * self._decimal(self.settings.max_risk_per_trade)
         )
-        risk_per_share = price - signal.stop_price
+        risk_per_share = (
+            signal.stop_price - price
+            if signal.order_intent == "short_entry"
+            else price - signal.stop_price
+        )
         if risk_per_share <= 0:
             return proposal
         
@@ -564,8 +598,7 @@ class ExecutionService:
         price: float,
         asset_class: AssetClass,
     ) -> None:
-        resolved_side = self._resolve_order_side(signal)
-        if resolved_side == Signal.BUY.value:
+        if signal.order_intent == "long_entry":
             tranche_meta = ((proposal.metadata or {}).get("tranche") or {})
             is_valid_next_tranche = bool(tranche_meta.get("is_valid_next_tranche"))
             if is_valid_next_tranche and proposal.quantity and proposal.price:
@@ -579,7 +612,7 @@ class ExecutionService:
                     bar_index=self.tranche_state.get_scan_bar_index(),
                     reason=tranche_meta.get("decision_reason") or "Tranche submitted.",
                 )
-        elif resolved_side == Signal.SELL.value:
+        elif signal.order_intent == "long_exit":
             if not self.portfolio.is_sellable_long_position(signal.symbol):
                 self.tranche_state.mark_position_closed(
                     signal.symbol,
@@ -603,7 +636,6 @@ class ExecutionService:
         asset_class: AssetClass,
         price: float,
     ) -> OrderSizing:
-        resolved_side = self._resolve_order_side(signal)
         raw_price = self._decimal(price)
         rounded_price = self._round_price(raw_price, asset_class)
         hard_max_notional = self._decimal(self.settings.max_position_notional)
@@ -631,7 +663,7 @@ class ExecutionService:
             "allow_duplicate_buy_for_scale_in": bool(scale_in_meta.get("is_valid_next_tranche", False)),
         }
         existing_position = self.portfolio.get_position(signal.symbol)
-        if resolved_side == Signal.SELL.value and self.portfolio.is_sellable_long_position(signal.symbol):
+        if signal.order_intent == "long_exit" and self.portfolio.is_sellable_long_position(signal.symbol):
             requested_quantity = (
                 signal.position_size
                 if signal.position_size is not None and signal.position_size > 0
@@ -660,7 +692,36 @@ class ExecutionService:
                 metadata={"sizing": sizing_details},
             )
 
-        if resolved_side == Signal.SELL.value:
+        if signal.order_intent == "short_exit" and self.portfolio.is_coverable_short_position(signal.symbol):
+            requested_quantity = (
+                signal.position_size
+                if signal.position_size is not None and signal.position_size > 0
+                else existing_position.quantity
+            )
+            cover_quantity = min(requested_quantity, existing_position.quantity)
+            raw_quantity = self._decimal(cover_quantity)
+            rounded_quantity = self._round_quantity(raw_quantity, fractionable=fractionable)
+            final_notional = self._round_money(rounded_quantity * rounded_price)
+            sizing_details.update(
+                {
+                    "raw_calculated_qty": float(raw_quantity),
+                    "raw_notional_before_rounding": float(raw_quantity * raw_price),
+                    "rounded_qty": float(rounded_quantity),
+                    "rounded_quantity": float(rounded_quantity),
+                    "final_submitted_notional": float(final_notional),
+                    "rounded_notional": float(final_notional),
+                    "max_allowed_notional": float(self._round_money(hard_max_notional)),
+                    "quantity_reduced_to_fit_cap": False,
+                }
+            )
+            return OrderSizing(
+                quantity=float(rounded_quantity),
+                notional=None,
+                price=float(rounded_price),
+                metadata={"sizing": sizing_details},
+            )
+
+        if signal.order_intent in EXIT_ORDER_INTENTS:
             sizing_details.update(
                 {
                     "raw_calculated_qty": 0.0,
@@ -986,6 +1047,8 @@ class ExecutionService:
         asset_class: AssetClass,
         price: float,
     ) -> ScaleInDecision:
+        if signal.order_intent not in {None, "long_entry"}:
+            return ScaleInDecision(approved=True, reason="Not a long-entry signal.", rule="not_long_entry")
         if signal.signal != Signal.BUY:
             return ScaleInDecision(approved=True, reason="Not a BUY signal.", rule="not_buy")
 
@@ -1088,6 +1151,9 @@ class ExecutionService:
         exchange = signal.metrics.get("exchange") if signal.metrics else None
         normalized_snapshot = signal.metrics.get("normalized_snapshot", {}) if signal.metrics else {}
         quantity = proposal.quantity or ((proposal.notional or 0.0) / max(price, 1e-9))
+        asset = None
+        if hasattr(self.broker, "get_asset"):
+            asset = self.broker.get_asset(proposal.symbol, proposal.asset_class)
         return self.risk_manager.guard_against(
             proposal.symbol,
             proposal.side,
@@ -1115,6 +1181,7 @@ class ExecutionService:
             price_source_used=normalized_snapshot.get("price_source_used"),
             fallback_pricing_used=normalized_snapshot.get("fallback_pricing_used"),
             sizing=proposal.metadata.get("sizing") if proposal.metadata else None,
+            asset_metadata=asset,
         )
 
     def _decimal(self, value: Any) -> Decimal:
@@ -1143,30 +1210,50 @@ class ExecutionService:
         position = self.portfolio.get_position(signal.symbol)
         has_tracked_position = position is not None
         has_tracked_long_position = self.portfolio.is_sellable_long_position(signal.symbol)
+        has_coverable_short_position = self.portfolio.is_coverable_short_position(signal.symbol)
         signal.metrics.setdefault("has_tracked_position", has_tracked_position)
         signal.metrics.setdefault("has_tracked_long_position", has_tracked_long_position)
         signal.metrics.setdefault("has_sellable_long_position", has_tracked_long_position)
+        signal.metrics.setdefault("has_coverable_short_position", has_coverable_short_position)
         signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
-
-        if signal.order_intent == "long_exit":
-            signal.signal_type = "exit"
-            signal.reduce_only = True
-
-        if signal.signal != Signal.SELL and signal.order_intent != "long_exit":
-            signal.metrics["order_intent"] = signal.order_intent
-            signal.metrics["reduce_only"] = signal.reduce_only
-            signal.metrics["exit_stage"] = signal.exit_stage
-            signal.metrics["exit_fraction"] = signal.exit_fraction
-            return
-
-        signal.metrics["is_risk_reducing_sell"] = has_tracked_long_position
         signal.metrics["tracked_position_quantity"] = position.quantity if position is not None else 0.0
         signal.metrics["tracked_position_side"] = str(position.side) if position is not None else None
-        if has_tracked_long_position and signal.signal_type == "entry" and signal.order_intent != "short_entry":
-            signal.signal_type = "exit"
-            signal.order_intent = "long_exit"
-            signal.reduce_only = True
-            signal.apply_intent_defaults()
+        signal.metrics["tracked_position_direction"] = (
+            position.direction.value if position is not None else None
+        )
+
+        if signal.signal == Signal.BUY:
+            if has_coverable_short_position:
+                signal.signal_type = "exit"
+                signal.order_intent = "short_exit"
+                signal.reduce_only = True
+            elif signal.order_intent == "short_exit":
+                signal.signal_type = "exit"
+                signal.reduce_only = True
+            else:
+                signal.signal_type = "entry"
+                signal.order_intent = "long_entry"
+                signal.reduce_only = False
+        elif signal.signal == Signal.SELL:
+            if has_tracked_long_position:
+                signal.signal_type = "exit"
+                signal.order_intent = "long_exit"
+                signal.reduce_only = True
+            elif signal.order_intent == "short_entry" or self.settings.short_selling_enabled:
+                signal.signal_type = "entry"
+                signal.order_intent = "short_entry"
+                signal.reduce_only = False
+            else:
+                signal.signal_type = "exit"
+                signal.order_intent = "long_exit"
+                signal.reduce_only = True
+
+        signal.apply_intent_defaults()
+        signal.metrics["position_direction"] = self._resolve_position_direction(signal)
+        signal.metrics["is_risk_reducing_order"] = self._is_exposure_reducing_signal(signal)
+        signal.metrics["is_risk_reducing_sell"] = (
+            signal.signal == Signal.SELL and signal.metrics["is_risk_reducing_order"]
+        )
         signal.metrics["order_intent"] = signal.order_intent
         signal.metrics["reduce_only"] = signal.reduce_only
         signal.metrics["exit_stage"] = signal.exit_stage
@@ -1213,6 +1300,7 @@ class ExecutionService:
                             {
                                 **signal.metrics,
                                 "order_intent": signal.order_intent,
+                                "position_direction": self._resolve_position_direction(signal),
                                 "reduce_only": signal.reduce_only,
                                 "exit_stage": signal.exit_stage,
                                 "exit_fraction": signal.exit_fraction,
@@ -1282,7 +1370,7 @@ class ExecutionService:
                             quantity=position.quantity,
                             entry_price=position.entry_price,
                             current_price=position.current_price,
-                            market_value=position.quantity * position.current_price,
+                            market_value=self.portfolio.position_market_value(position.symbol) or 0.0,
                             side=position.side,
                             exchange=position.exchange,
                         )

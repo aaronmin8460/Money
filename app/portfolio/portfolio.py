@@ -2,9 +2,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from enum import Enum
 from typing import Any, Dict, List
 
 from app.domain.models import AssetClass
+
+
+class PositionDirection(str, Enum):
+    LONG = "long"
+    SHORT = "short"
+
+
+def _coerce_position_direction(
+    value: PositionDirection | str | None,
+    *,
+    quantity: float | None = None,
+) -> PositionDirection:
+    if isinstance(value, PositionDirection):
+        return value
+    if value is not None:
+        normalized = str(value).strip().upper()
+        if normalized in {"SHORT", "SELL"}:
+            return PositionDirection.SHORT
+        if normalized in {"LONG", "BUY"}:
+            return PositionDirection.LONG
+    if quantity is not None and float(quantity) < 0:
+        return PositionDirection.SHORT
+    return PositionDirection.LONG
 
 
 @dataclass
@@ -16,6 +40,7 @@ class Position:
     current_price: float
     asset_class: AssetClass = AssetClass.EQUITY
     exchange: str | None = None
+    direction: PositionDirection | str | None = None
     initial_quantity: float | None = None
     highest_price_since_entry: float | None = None
     current_stop: float | None = None
@@ -24,9 +49,11 @@ class Position:
     entry_signal_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        self.quantity = float(self.quantity)
+        self.direction = _coerce_position_direction(self.direction or self.side, quantity=self.quantity)
+        self.quantity = abs(float(self.quantity))
         self.entry_price = float(self.entry_price)
         self.current_price = float(self.current_price)
+        self.side = "SELL" if self.direction == PositionDirection.SHORT else "BUY"
         if self.initial_quantity is None:
             self.initial_quantity = float(self.quantity)
         if self.highest_price_since_entry is None:
@@ -58,10 +85,11 @@ class Portfolio:
                 "entry_price": position.entry_price,
                 "avg_entry_price": position.entry_price,
                 "side": position.side,
+                "position_direction": position.direction.value,
                 "current_price": position.current_price,
                 "asset_class": position.asset_class.value,
                 "exchange": position.exchange,
-                "market_value": position.quantity * position.current_price,
+                "market_value": self._position_market_value(position),
                 "initial_quantity": position.initial_quantity,
                 "highest_price_since_entry": position.highest_price_since_entry,
                 "current_stop": position.current_stop,
@@ -90,7 +118,12 @@ class Portfolio:
         if normalized_side not in {"BUY", "SELL"} and order_intent is None:
             self._recalculate_equity()
             return
-        resolved_intent = order_intent or ("long_entry" if normalized_side == "BUY" else "long_exit")
+        resolved_intent = self._resolve_update_order_intent(
+            symbol=symbol,
+            side=normalized_side,
+            order_intent=order_intent,
+            reduce_only=reduce_only,
+        )
         metadata = dict(signal_metadata or {})
 
         if resolved_intent == "long_entry":
@@ -111,8 +144,44 @@ class Portfolio:
                 exit_stage=exit_stage,
                 signal_metadata=metadata,
             )
+        elif resolved_intent == "short_entry":
+            self._apply_short_entry(
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                asset_class=asset_class,
+                exchange=exchange,
+                signal_metadata=metadata,
+            )
+        elif resolved_intent == "short_exit":
+            self._apply_short_exit(
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                reduce_only=reduce_only,
+                exit_stage=exit_stage,
+                signal_metadata=metadata,
+            )
 
         self._recalculate_equity()
+
+    def _resolve_update_order_intent(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        order_intent: str | None,
+        reduce_only: bool,
+    ) -> str:
+        if order_intent:
+            return order_intent
+        if side == "BUY":
+            if reduce_only or self.is_coverable_short_position(symbol):
+                return "short_exit"
+            return "long_entry"
+        if reduce_only or self.is_sellable_long_position(symbol):
+            return "long_exit"
+        return "short_entry"
 
     def _apply_long_entry(
         self,
@@ -126,6 +195,8 @@ class Portfolio:
     ) -> None:
         existing = self.positions.get(symbol)
         if existing:
+            if existing.direction != PositionDirection.LONG:
+                return
             total_quantity = existing.quantity + quantity
             average_entry = (
                 (existing.entry_price * existing.quantity) + (price * quantity)
@@ -138,6 +209,7 @@ class Portfolio:
             existing.entry_price = average_entry
             existing.current_price = price
             existing.side = "BUY"
+            existing.direction = PositionDirection.LONG
             existing.asset_class = asset_class
             existing.exchange = exchange
             existing.initial_quantity = max(existing.initial_quantity or 0.0, total_quantity)
@@ -155,6 +227,7 @@ class Portfolio:
                 current_price=price,
                 asset_class=asset_class,
                 exchange=exchange,
+                direction=PositionDirection.LONG,
                 initial_quantity=quantity,
                 highest_price_since_entry=price,
                 current_stop=signal_metadata.get("stop_price"),
@@ -174,7 +247,7 @@ class Portfolio:
         signal_metadata: dict[str, Any],
     ) -> None:
         position = self.positions.get(symbol)
-        if position is None:
+        if position is None or position.direction != PositionDirection.LONG:
             return
 
         if reduce_only and not self.is_sellable_long_position(symbol):
@@ -188,6 +261,100 @@ class Portfolio:
         self.realized_pnl += pnl
         self.cash += sold_quantity * price
         remaining_quantity = position.quantity - sold_quantity
+        self.last_trade_time = datetime.utcnow()
+
+        self.update_stop_target_state(
+            symbol,
+            current_stop=signal_metadata.get("next_stop", signal_metadata.get("current_stop")),
+            tp1_hit=True if exit_stage == "tp1" else None,
+            tp2_hit=True if exit_stage == "tp2" else None,
+            metadata_updates=signal_metadata,
+        )
+
+        if remaining_quantity <= 0:
+            self.positions.pop(symbol, None)
+            return
+
+        position.quantity = remaining_quantity
+        position.current_price = price
+
+    def _apply_short_entry(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+        asset_class: AssetClass,
+        exchange: str | None,
+        signal_metadata: dict[str, Any],
+    ) -> None:
+        existing = self.positions.get(symbol)
+        if existing:
+            if existing.direction != PositionDirection.SHORT:
+                return
+            total_quantity = existing.quantity + quantity
+            average_entry = (
+                (existing.entry_price * existing.quantity) + (price * quantity)
+            ) / total_quantity
+            merged_metadata = {
+                **existing.entry_signal_metadata,
+                **{key: value for key, value in signal_metadata.items() if value is not None},
+            }
+            existing.quantity = total_quantity
+            existing.entry_price = average_entry
+            existing.current_price = price
+            existing.side = "SELL"
+            existing.direction = PositionDirection.SHORT
+            existing.asset_class = asset_class
+            existing.exchange = exchange
+            existing.initial_quantity = max(existing.initial_quantity or 0.0, total_quantity)
+            existing.entry_signal_metadata = merged_metadata
+            stop_price = merged_metadata.get("stop_price")
+            if stop_price is not None:
+                existing.current_stop = min(existing.current_stop or float(stop_price), float(stop_price))
+        else:
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                quantity=quantity,
+                entry_price=price,
+                side="SELL",
+                current_price=price,
+                asset_class=asset_class,
+                exchange=exchange,
+                direction=PositionDirection.SHORT,
+                initial_quantity=quantity,
+                highest_price_since_entry=max(price, signal_metadata.get("stop_price", price)),
+                current_stop=signal_metadata.get("stop_price"),
+                entry_signal_metadata=signal_metadata,
+            )
+        self.cash += quantity * price
+        self.last_trade_time = datetime.utcnow()
+
+    def _apply_short_exit(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+        reduce_only: bool,
+        exit_stage: str | None,
+        signal_metadata: dict[str, Any],
+    ) -> None:
+        position = self.positions.get(symbol)
+        if position is None or position.direction != PositionDirection.SHORT:
+            return
+
+        if reduce_only and not self.is_coverable_short_position(symbol):
+            return
+
+        covered_quantity = min(quantity, position.quantity)
+        if covered_quantity <= 0:
+            return
+
+        pnl = (position.entry_price - price) * covered_quantity
+        self.realized_pnl += pnl
+        self.cash -= covered_quantity * price
+        remaining_quantity = position.quantity - covered_quantity
         self.last_trade_time = datetime.utcnow()
 
         self.update_stop_target_state(
@@ -241,6 +408,8 @@ class Portfolio:
         return {
             "has_tracked_position": position is not None,
             "has_sellable_long_position": self.is_sellable_long_position(symbol),
+            "has_coverable_short_position": self.is_coverable_short_position(symbol),
+            "position_direction": position.direction.value if position is not None else None,
             "highest_price_since_entry": position.highest_price_since_entry if position is not None else None,
             "current_stop": position.current_stop if position is not None else None,
             "tp1_hit": position.tp1_hit if position is not None else False,
@@ -256,9 +425,8 @@ class Portfolio:
             current_price = prices.get(symbol, position.current_price)
             position.current_price = current_price
             self._record_position_high(position, current_price)
-            value = position.quantity * current_price
-            total += value
-            unrealized += (current_price - position.entry_price) * position.quantity
+            total += self._position_market_value(position)
+            unrealized += self._position_unrealized_pnl(position)
 
         self.unrealized_pnl = unrealized
         self._record_equity_snapshot(total)
@@ -282,7 +450,7 @@ class Portfolio:
     def calculate_equity(self) -> float:
         total = self.cash
         for position in self.positions.values():
-            total += position.quantity * position.current_price
+            total += self._position_market_value(position)
         return total
 
     def get_position(self, symbol: str) -> Position | None:
@@ -292,15 +460,31 @@ class Portfolio:
         position = self.get_position(symbol)
         if position is None or position.quantity <= 0:
             return False
-        return str(position.side).upper() not in {"SELL", "SHORT"}
+        return position.direction == PositionDirection.LONG
 
     def is_sellable_long_position(self, symbol: str) -> bool:
         return self.is_long_position(symbol)
+
+    def is_short_position(self, symbol: str) -> bool:
+        position = self.get_position(symbol)
+        if position is None or position.quantity <= 0:
+            return False
+        return position.direction == PositionDirection.SHORT
+
+    def is_coverable_short_position(self, symbol: str) -> bool:
+        return self.is_short_position(symbol)
+
+    def position_market_value(self, symbol: str) -> float | None:
+        position = self.get_position(symbol)
+        if position is None:
+            return None
+        return self._position_market_value(position)
 
     def positions_diagnostics(self) -> List[Dict[str, Any]]:
         diagnostics: List[Dict[str, Any]] = []
         for position in self.positions.values():
             is_long = self.is_long_position(position.symbol)
+            is_short = self.is_short_position(position.symbol)
             diagnostics.append(
                 {
                     "symbol": position.symbol,
@@ -308,28 +492,31 @@ class Portfolio:
                     "entry_price": position.entry_price,
                     "current_price": position.current_price,
                     "side": position.side,
+                    "position_direction": position.direction.value,
                     "asset_class": position.asset_class.value,
                     "exchange": position.exchange,
-                    "market_value": position.quantity * position.current_price,
+                    "market_value": self._position_market_value(position),
                     "initial_quantity": position.initial_quantity,
                     "highest_price_since_entry": position.highest_price_since_entry,
                     "current_stop": position.current_stop,
                     "tp1_hit": position.tp1_hit,
                     "tp2_hit": position.tp2_hit,
                     "is_long": is_long,
+                    "is_short": is_short,
                     "sellable": is_long and position.quantity > 0,
+                    "coverable": is_short and position.quantity > 0,
                 }
             )
         return diagnostics
 
     def exposure(self) -> float:
-        return sum(position.quantity * position.current_price for position in self.positions.values())
+        return sum(abs(self._position_market_value(position)) for position in self.positions.values())
 
     def exposure_by_asset_class(self) -> Dict[str, float]:
         exposure: Dict[str, float] = {}
         for position in self.positions.values():
             key = position.asset_class.value
-            exposure[key] = exposure.get(key, 0.0) + (position.quantity * position.current_price)
+            exposure[key] = exposure.get(key, 0.0) + abs(self._position_market_value(position))
         return exposure
 
     def position_counts_by_asset_class(self) -> Dict[str, int]:
@@ -426,7 +613,11 @@ class Portfolio:
                 current_price = float(
                     pos.get("current_price", pos.get("last_price", pos.get("price", entry_price)))
                 )
-                side = pos.get("side", "long")
+                direction = _coerce_position_direction(
+                    pos.get("position_direction") or pos.get("side"),
+                    quantity=qty,
+                )
+                side = pos.get("side", "SELL" if direction == PositionDirection.SHORT else "BUY")
                 asset_class = pos.get("asset_class", AssetClass.EQUITY.value)
                 try:
                     normalized_asset_class = AssetClass(str(asset_class))
@@ -434,13 +625,14 @@ class Portfolio:
                     normalized_asset_class = AssetClass.EQUITY
                 self.positions[symbol] = Position(
                     symbol,
-                    qty,
+                    abs(qty),
                     entry_price,
                     side,
                     current_price,
                     asset_class=normalized_asset_class,
                     exchange=pos.get("exchange"),
-                    initial_quantity=max(existing.initial_quantity or 0.0, qty) if existing is not None else qty,
+                    direction=direction,
+                    initial_quantity=max(existing.initial_quantity or 0.0, abs(qty)) if existing is not None else abs(qty),
                     highest_price_since_entry=(
                         max(existing.highest_price_since_entry or 0.0, current_price, entry_price)
                         if existing is not None
@@ -497,3 +689,16 @@ class Portfolio:
             self.daily_baseline_equity = current_equity
             self.daily_baseline_date = self._normalize_timestamp(None).date()
             self.equity_history.append(current_equity)
+
+    @staticmethod
+    def _position_market_value(position: Position) -> float:
+        market_value = position.quantity * position.current_price
+        if position.direction == PositionDirection.SHORT:
+            return -market_value
+        return market_value
+
+    @staticmethod
+    def _position_unrealized_pnl(position: Position) -> float:
+        if position.direction == PositionDirection.SHORT:
+            return (position.entry_price - position.current_price) * position.quantity
+        return (position.current_price - position.entry_price) * position.quantity

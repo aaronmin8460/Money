@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from app.config.settings import Settings, get_settings
 from app.db.models import AutoTraderRun, BotRunHistory
 from app.db.session import SessionLocal
-from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot, SessionState
+from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot, SessionState, SignalDirection
 from app.ml.inference import SignalScorer
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.events import build_signal_id, normalize_outcome_classification
@@ -497,6 +497,7 @@ class AutoTrader:
                         "symbol": tracked_position.symbol,
                         "quantity": tracked_position.quantity,
                         "side": tracked_position.side,
+                        "position_direction": tracked_position.direction.value,
                         "entry_price": tracked_position.entry_price,
                         "current_price": tracked_position.current_price,
                         "asset_class": tracked_position.asset_class.value,
@@ -533,7 +534,7 @@ class AutoTrader:
     ) -> TradeSignal:
         if normalized_snapshot.evaluation_price is not None:
             evaluation_price = float(normalized_snapshot.evaluation_price)
-            if signal.signal == Signal.BUY:
+            if signal.signal_type == "entry" and signal.signal in {Signal.BUY, Signal.SELL}:
                 self._rebase_signal_levels(signal, evaluation_price)
             signal.price = evaluation_price
             signal.entry_price = evaluation_price
@@ -691,7 +692,7 @@ class AutoTrader:
             ),
             reverse=True,
         )[0]
-        signal = self._normalize_signal_for_long_only(asset, signal)
+        signal = self._normalize_signal_for_position_context(asset, signal)
         signal = self._apply_snapshot_metadata(
             signal,
             asset=asset,
@@ -728,47 +729,107 @@ class AutoTrader:
         if signal.target_price is not None:
             signal.target_price = float(new_entry_price + (float(signal.target_price) - original_entry_price))
 
-    def _normalize_signal_for_long_only(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
-        if signal.signal != Signal.SELL and signal.order_intent != "long_exit":
-            signal.apply_intent_defaults()
-            return signal
-
+    def _normalize_signal_for_position_context(self, asset: AssetMetadata, signal: TradeSignal) -> TradeSignal:
         has_tracked_position = self.portfolio.get_position(asset.symbol) is not None
         has_sellable_long_position = self.portfolio.is_sellable_long_position(asset.symbol)
+        has_coverable_short_position = self.portfolio.is_coverable_short_position(asset.symbol)
+        tracked_position = self.portfolio.get_position(asset.symbol)
         if signal.metrics is None:
             signal.metrics = {}
         signal.metrics.setdefault("has_tracked_position", has_tracked_position)
         signal.metrics.setdefault("has_tracked_long_position", has_sellable_long_position)
         signal.metrics.setdefault("has_sellable_long_position", has_sellable_long_position)
+        signal.metrics.setdefault("has_coverable_short_position", has_coverable_short_position)
         signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
-        signal.metrics["is_risk_reducing_sell"] = has_sellable_long_position
+        signal.metrics.setdefault(
+            "tracked_position_direction",
+            tracked_position.direction.value if tracked_position is not None else None,
+        )
 
-        if has_sellable_long_position:
-            signal.signal_type = "exit"
-            signal.order_intent = signal.order_intent or "long_exit"
-            signal.reduce_only = True
-            signal.apply_intent_defaults()
-            return signal
+        if signal.signal == Signal.SELL:
+            if has_sellable_long_position:
+                signal.signal_type = "exit"
+                signal.order_intent = "long_exit"
+                signal.reduce_only = True
+            elif signal.order_intent == "long_exit":
+                return self._build_blocked_hold_signal(
+                    signal,
+                    decision_code="no_position_to_sell",
+                    blocked_rule="no_position_to_sell",
+                    blocked_reason="Exit-only sell ignored: no tracked long position is available to exit.",
+                )
+            elif signal.order_intent == "short_entry":
+                if not self.settings.short_selling_enabled:
+                    return self._build_blocked_hold_signal(
+                        signal,
+                        decision_code="short_selling_disabled",
+                        blocked_rule="short_selling_disabled",
+                        blocked_reason="Short entry ignored because short selling is disabled.",
+                    )
+                signal.signal_type = "entry"
+                signal.reduce_only = False
+            elif self.settings.short_selling_enabled:
+                signal.signal_type = "entry"
+                signal.order_intent = "short_entry"
+                signal.reduce_only = False
+            else:
+                return self._build_blocked_hold_signal(
+                    signal,
+                    decision_code="no_position_to_sell",
+                    blocked_rule="no_position_to_sell",
+                    blocked_reason="Exit-only sell ignored: no tracked long position and short selling is disabled.",
+                )
+        elif signal.signal == Signal.BUY:
+            if has_coverable_short_position:
+                signal.signal_type = "exit"
+                signal.order_intent = "short_exit"
+                signal.reduce_only = True
+            elif signal.order_intent == "short_exit":
+                return self._build_blocked_hold_signal(
+                    signal,
+                    decision_code="no_position_to_cover",
+                    blocked_rule="no_position_to_cover",
+                    blocked_reason="Cover-only buy ignored: no tracked short position is available to cover.",
+                )
+            else:
+                signal.signal_type = "entry"
+                signal.order_intent = "long_entry"
+                signal.reduce_only = False
 
-        if self.settings.short_selling_enabled:
-            signal.apply_intent_defaults()
-            return signal
+        signal.apply_intent_defaults()
+        signal.metrics["position_direction"] = (
+            signal.direction.value
+            if signal.direction != SignalDirection.FLAT
+            else (tracked_position.direction.value if tracked_position is not None else None)
+        )
+        signal.metrics["is_risk_reducing_order"] = signal.order_intent in {"long_exit", "short_exit"} or signal.reduce_only
+        signal.metrics["is_risk_reducing_sell"] = (
+            signal.signal == Signal.SELL and signal.metrics["is_risk_reducing_order"]
+        )
+        return signal
 
-        hold_reason = "Exit-only sell ignored: no tracked long position and short selling is disabled."
+    def _build_blocked_hold_signal(
+        self,
+        signal: TradeSignal,
+        *,
+        decision_code: str,
+        blocked_rule: str,
+        blocked_reason: str,
+    ) -> TradeSignal:
         hold_signal = TradeSignal(
             symbol=signal.symbol,
             signal=Signal.HOLD,
             asset_class=signal.asset_class,
             strategy_name=signal.strategy_name,
-            signal_type="exit",
-            order_intent="long_exit",
-            reduce_only=True,
+            signal_type=signal.signal_type,
+            order_intent=signal.order_intent,
+            reduce_only=signal.reduce_only,
             exit_fraction=signal.exit_fraction,
             exit_stage=signal.exit_stage,
             confidence_score=0.0,
             price=signal.price,
             entry_price=signal.entry_price,
-            reason=f"{signal.reason} {hold_reason}".strip() if signal.reason else hold_reason,
+            reason=f"{signal.reason} {blocked_reason}".strip() if signal.reason else blocked_reason,
             timestamp=signal.timestamp,
             atr=signal.atr,
             stop_price=signal.stop_price,
@@ -781,11 +842,11 @@ class AutoTrader:
             regime_state=signal.regime_state,
             generated_at=signal.generated_at,
             metrics={
-                **signal.metrics,
+                **(signal.metrics or {}),
                 "original_signal": signal.signal.value,
-                "decision_code": "no_position_to_sell",
-                "blocked_rule": "no_position_to_sell",
-                "blocked_reason": hold_reason,
+                "decision_code": decision_code,
+                "blocked_rule": blocked_rule,
+                "blocked_reason": blocked_reason,
             },
         )
         hold_signal.apply_intent_defaults()
@@ -1389,6 +1450,9 @@ class AutoTrader:
         signal.metrics["market_overview"] = dict(regime_snapshot or {})
         signal.metrics.setdefault("has_tracked_position", position_state["has_tracked_position"])
         signal.metrics.setdefault("has_sellable_long_position", position_state["has_sellable_long_position"])
+        signal.metrics.setdefault("has_coverable_short_position", position_state["has_coverable_short_position"])
+        signal.metrics.setdefault("position_direction", position_state["position_direction"])
+        signal.metrics.setdefault("tracked_position_direction", position_state["position_direction"])
         signal.metrics.setdefault("highest_price_since_entry", position_state["highest_price_since_entry"])
         signal.metrics.setdefault("current_stop", position_state["current_stop"])
         signal.metrics.setdefault("tp1_hit", position_state["tp1_hit"])

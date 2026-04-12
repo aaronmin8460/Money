@@ -655,7 +655,70 @@ def test_persisted_order_metadata_includes_order_intent_and_exit_stage(tmp_path)
     signal_metrics = json.loads(signal_row.metrics_json)
 
     assert raw_payload["metadata"]["order_intent"] == "long_exit"
+    assert raw_payload["metadata"]["position_direction"] == "long"
     assert raw_payload["metadata"]["exit_stage"] == "tp1"
     assert raw_payload["metadata"]["reduce_only"] is True
     assert signal_metrics["order_intent"] == "long_exit"
+    assert signal_metrics["position_direction"] == "long"
     assert signal_metrics["exit_stage"] == "tp1"
+
+
+def test_execution_maps_short_exit_to_buy_and_preserves_partial_cover_size(tmp_path) -> None:
+    (tmp_path / "TSLA.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2024-01-01,100,101,99,100,10000\n"
+        "2024-01-02,90,91,89,90,10000\n",
+        encoding="utf-8",
+    )
+
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        short_selling_enabled=True,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    market_data = CSVMarketDataService(data_dir=tmp_path)
+    broker = PaperBroker(settings=settings, market_data_service=market_data)
+    portfolio = Portfolio()
+    portfolio.positions["TSLA"] = Position(
+        symbol="TSLA",
+        quantity=5.0,
+        entry_price=100.0,
+        side="SHORT",
+        current_price=90.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        market_data_service=market_data,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="TSLA",
+            signal=Signal.BUY,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="ema_crossover",
+            signal_type="exit",
+            order_intent="short_exit",
+            reduce_only=True,
+            position_size=2.0,
+            price=90.0,
+            entry_price=90.0,
+            reason="Partial short cover",
+        )
+    )
+
+    assert result["action"] == "dry_run"
+    assert result["proposal"]["side"] == "BUY"
+    assert result["proposal"]["quantity"] == 2.0
+    assert result["proposal"]["order_intent"] == "short_exit"
+    assert result["proposal"]["position_direction"] == "short"
