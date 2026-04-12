@@ -472,6 +472,23 @@ class RiskManager:
                     details=decision_details,
                 )
 
+            max_position_notional = self._decimal(self.settings.max_position_notional)
+            comparison_operator = decision_details.get("comparison_operator", ">")
+            # Surface the hard per-position notional cap before percentage-allocation
+            # checks so diagnostics remain stable when both limits would reject.
+            if order_notional > max_position_notional:
+                submitted_notional_text = str(order_notional.normalize())
+                max_notional_text = str(max_position_notional.normalize())
+                return RiskDecision(
+                    False,
+                    (
+                        f"Final submitted notional ({submitted_notional_text}) exceeds max position notional "
+                        f"({max_notional_text}) using comparison '{comparison_operator}'."
+                    ),
+                    rule="position_notional",
+                    details=decision_details,
+                )
+
             class_exposure = self._decimal(self.portfolio.exposure_by_asset_class().get(resolved_asset_class.value, 0.0))
             symbol_position = self.portfolio.get_position(symbol)
             symbol_exposure = self._decimal(abs(self.portfolio.position_market_value(symbol) or 0.0))
@@ -519,21 +536,6 @@ class RiskManager:
             max_total_exposure = self._decimal(self.settings.max_total_exposure)
             if total_exposure + order_notional > max_total_exposure:
                 return RiskDecision(False, "Max total exposure would be exceeded.", rule="total_exposure", details=decision_details)
-
-            max_position_notional = self._decimal(self.settings.max_position_notional)
-            comparison_operator = decision_details.get("comparison_operator", ">")
-            if order_notional > max_position_notional:
-                submitted_notional_text = str(order_notional.normalize())
-                max_notional_text = str(max_position_notional.normalize())
-                return RiskDecision(
-                    False,
-                    (
-                        f"Final submitted notional ({submitted_notional_text}) exceeds max position notional "
-                        f"({max_notional_text}) using comparison '{comparison_operator}'."
-                    ),
-                    rule="position_notional",
-                    details=decision_details,
-                )
 
             if tranche_consumes_new_slot:
                 correlated_open_positions = sum(

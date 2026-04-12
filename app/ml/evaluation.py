@@ -93,6 +93,7 @@ def compute_trade_metrics(trade_returns: list[float]) -> dict[str, Any]:
             "average_trade_return": 0.0,
             "max_drawdown": 0.0,
             "sharpe_like": 0.0,
+            "equity_curve": [],
         }
 
     gross_profit = sum(value for value in trade_returns if value > 0)
@@ -222,13 +223,23 @@ def calibrate_threshold(
     return {"threshold": best_threshold, "metrics": best_metrics}
 
 
-def promotion_thresholds_pass(settings: Any, metrics: dict[str, Any]) -> tuple[bool, dict[str, float | None]]:
+def promotion_thresholds_pass(
+    settings: Any,
+    metrics: dict[str, Any],
+    *,
+    current_metrics: dict[str, Any] | None = None,
+) -> tuple[bool, dict[str, float | None]]:
     auc = metrics.get("auc")
     precision = metrics.get("precision")
     profit_factor = metrics.get("profit_factor")
     expectancy = metrics.get("expectancy")
     max_drawdown = metrics.get("max_drawdown")
-    winrate = metrics.get("winrate") or 0.0
+    candidate_winrate = float(metrics.get("winrate") or 0.0)
+    current_winrate_raw = (current_metrics or {}).get("winrate")
+    current_winrate = float(current_winrate_raw) if current_winrate_raw is not None else None
+    winrate_lift = candidate_winrate - current_winrate if current_winrate is not None else None
+    # Promotions always require absolute floors. Win-rate lift is only enforced
+    # when a current same-purpose model already has comparable holdout metrics.
     passed = (
         auc is not None
         and float(auc) >= settings.ml_promotion_min_auc
@@ -240,7 +251,10 @@ def promotion_thresholds_pass(settings: Any, metrics: dict[str, Any]) -> tuple[b
         and float(expectancy) >= settings.ml_promotion_min_expectancy
         and max_drawdown is not None
         and float(max_drawdown) <= settings.ml_promotion_max_drawdown
-        and float(winrate) >= settings.ml_promotion_min_winrate_lift
+        and (
+            winrate_lift is None
+            or float(winrate_lift) >= float(settings.ml_promotion_min_winrate_lift)
+        )
     )
     return (
         passed,
@@ -250,7 +264,10 @@ def promotion_thresholds_pass(settings: Any, metrics: dict[str, Any]) -> tuple[b
             "profit_factor": float(profit_factor) if profit_factor is not None else None,
             "expectancy": float(expectancy) if expectancy is not None else None,
             "max_drawdown": float(max_drawdown) if max_drawdown is not None else None,
-            "winrate": float(winrate),
+            "winrate": candidate_winrate,
+            "current_winrate": current_winrate,
+            "winrate_lift": float(winrate_lift) if winrate_lift is not None else None,
+            "required_winrate_lift": float(settings.ml_promotion_min_winrate_lift),
         },
     )
 

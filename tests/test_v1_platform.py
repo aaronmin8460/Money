@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.config.settings import Settings
@@ -271,6 +272,8 @@ def test_news_pipeline_works_without_openai_key(tmp_path: Path) -> None:
         openai_api_key=None,
     )
 
+    published_at = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
     class FakeParser:
         @staticmethod
         def parse(_url: str):
@@ -283,14 +286,14 @@ def test_news_pipeline_works_without_openai_key(tmp_path: Path) -> None:
                         type(
                             "Entry",
                             (),
-                            {
-                                "title": "$AAPL surges after earnings beat",
-                                "summary": "AAPL posted strong growth.",
-                                "link": "https://example.com/aapl",
-                                "published": "Fri, 10 Apr 2026 14:05:00 GMT",
-                            },
-                        )()
-                    ],
+                                {
+                                    "title": "$AAPL surges after earnings beat",
+                                    "summary": "AAPL posted strong growth.",
+                                    "link": "https://example.com/aapl",
+                                    "published": published_at,
+                                },
+                            )()
+                        ],
                 },
             )()
 

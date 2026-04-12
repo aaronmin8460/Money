@@ -758,7 +758,7 @@ def test_auto_trader_prefers_exit_signals_before_new_entries(monkeypatch) -> Non
         ),
     )
 
-    def fake_evaluate_exit(asset, *, normalized_snapshot, evaluation_mode):
+    def fake_evaluate_exit(asset, *, normalized_snapshot, evaluation_mode, regime_snapshot=None, news_features=None):
         if asset.symbol != "MSFT":
             return None
         return TradeSignal(

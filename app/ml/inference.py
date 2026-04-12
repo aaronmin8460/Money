@@ -146,15 +146,15 @@ class SignalScorer:
                 "error": str(exc),
             },
         )
-        return ModelScoreResult(
-            enabled=True,
-            score=None,
-            threshold=threshold,
-            passed=False,
-            purpose=purpose,
-            model_type=str(bundle.get("model_type")),
-            reason="ml_inference_error",
-        )
+            return ModelScoreResult(
+                enabled=True,
+                score=None,
+                threshold=threshold,
+                passed=False,
+                purpose=purpose,
+                model_type=str(bundle.get("model_type")),
+                reason="ml_inference_error",
+            )
         threshold = float(bundle.get("threshold") or threshold)
         return ModelScoreResult(
             enabled=True,

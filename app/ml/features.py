@@ -5,7 +5,7 @@ from typing import Any
 
 from app.ml.schema import FEATURE_VERSION, SignalFeatureRow
 from app.monitoring.events import build_signal_id
-from app.strategies.base import TradeSignal
+from app.strategies.base import EXIT_ORDER_INTENTS, Signal, TradeSignal
 
 CATEGORICAL_FEATURES = [
     "model_purpose",
@@ -82,6 +82,24 @@ def _safe_str(value: Any) -> str | None:
     return str(value)
 
 
+def resolve_model_purpose(signal: TradeSignal) -> str:
+    metrics = signal.metrics or {}
+    has_tracked_position = bool(
+        metrics.get("has_tracked_position")
+        or metrics.get("has_tracked_long_position")
+        or metrics.get("has_sellable_long_position")
+        or metrics.get("has_coverable_short_position")
+    )
+    is_exit_context = (
+        signal.signal_type == "exit"
+        or signal.reduce_only
+        or bool(signal.exit_stage)
+        or signal.order_intent in EXIT_ORDER_INTENTS
+        or (signal.signal == Signal.HOLD and has_tracked_position)
+    )
+    return "exit" if is_exit_context else "entry"
+
+
 def build_signal_feature_row(
     signal: TradeSignal,
     *,
@@ -105,12 +123,7 @@ def build_signal_feature_row(
 
     regime_counts = market_overview or {}
     latest = latest_price if latest_price is not None else signal.price or signal.entry_price
-    has_tracked_position = bool(metrics.get("has_sellable_long_position") or metrics.get("has_coverable_short_position"))
-    model_purpose = (
-        "exit"
-        if signal.signal_type == "exit" or signal.reduce_only or (signal.signal == signal.signal.HOLD and has_tracked_position)
-        else "entry"
-    )
+    model_purpose = resolve_model_purpose(signal)
     trend_pipeline = pipeline.get("trend", {}) if isinstance(pipeline, dict) else {}
     volatility_pipeline = pipeline.get("volatility", {}) if isinstance(pipeline, dict) else {}
     liquidity_pipeline = pipeline.get("liquidity", {}) if isinstance(pipeline, dict) else {}

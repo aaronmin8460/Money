@@ -9,8 +9,13 @@ from app.ml.evaluation import promotion_thresholds_pass
 from app.ml.registry import load_registry, promote_candidate, rollback_candidate
 
 
-def candidate_meets_promotion_thresholds(settings, metrics: dict[str, object]) -> tuple[bool, dict[str, float | None]]:
-    return promotion_thresholds_pass(settings, metrics)
+def candidate_meets_promotion_thresholds(
+    settings,
+    metrics: dict[str, object],
+    *,
+    current_metrics: dict[str, object] | None = None,
+) -> tuple[bool, dict[str, float | None]]:
+    return promotion_thresholds_pass(settings, metrics, current_metrics=current_metrics)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,13 +29,19 @@ def main() -> None:
     settings = get_settings()
     registry = load_registry(settings.ml_registry_path)
     purpose = args.purpose
-    candidate = registry.get("models", {}).get(purpose, {}).get("candidate_model")
+    purpose_registry = registry.get("models", {}).get(purpose, {})
+    candidate = purpose_registry.get("candidate_model")
     if not candidate:
         print(f"promotion_skipped=true purpose={purpose} reason=no_candidate_model")
         return
 
     metrics = candidate.get("metrics") or {}
-    passed, metric_snapshot = candidate_meets_promotion_thresholds(settings, metrics)
+    current_metrics = (purpose_registry.get("current_model") or {}).get("metrics") or None
+    passed, metric_snapshot = candidate_meets_promotion_thresholds(
+        settings,
+        metrics,
+        current_metrics=current_metrics,
+    )
     if passed:
         current_model_path = settings.ml_entry_current_model_path if purpose == "entry" else settings.ml_exit_current_model_path
         candidate_model_path = (
@@ -40,7 +51,15 @@ def main() -> None:
             settings.ml_registry_path,
             current_model_path=current_model_path,
             candidate_model_path=candidate_model_path,
-            notes=f"{purpose} candidate met promotion thresholds.",
+            notes=(
+                f"{purpose} candidate met promotion thresholds. "
+                "Absolute ML/trading floors passed"
+                + (
+                    f" and win-rate lift vs current ({metric_snapshot['winrate_lift']:.4f}) cleared the requirement."
+                    if metric_snapshot.get("winrate_lift") is not None
+                    else "; no current same-purpose win-rate baseline was available."
+                )
+            ),
             model_purpose=purpose,
         )
         print(

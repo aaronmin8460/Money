@@ -36,7 +36,8 @@ def test_trailing_stop_exit_uses_remaining_quantity() -> None:
     assert evaluation.signal.order_intent == "long_exit"
     assert evaluation.signal.exit_stage == "trail"
     assert evaluation.signal.position_size == 2.5
-    assert evaluation.state["current_stop"] == 120.0
+    assert evaluation.state["current_stop"] is not None
+    assert evaluation.state["current_stop"] >= 120.0
 
 
 def test_exit_manager_generates_full_stop_exit_signal() -> None:

@@ -6,9 +6,11 @@ from pathlib import Path
 from app.config.settings import Settings
 from app.domain.models import AssetClass
 from app.ml.evaluation import predict_scores, promotion_thresholds_pass, walk_forward_split
+from app.ml.features import build_signal_feature_row
 from app.ml.inference import SignalScorer
 from app.ml.registry import load_registry, update_candidate
 from app.ml.training import load_model_bundle, save_model_bundle, train_model
+from app.monitoring.outcome_logger import derive_bootstrap_label
 from app.services.auto_trader import AutoTrader
 from app.strategies.base import Signal, TradeSignal
 
@@ -158,6 +160,107 @@ def test_signal_scorer_does_not_crash_on_buy_candidate_with_missing_features() -
     assert scored.enabled is True
     assert scored.reason in {"score_above_threshold", "below_threshold"}
     assert scored.score is not None
+
+
+def test_hold_with_tracked_position_routes_to_exit_model_purpose() -> None:
+    signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.HOLD,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=100.0,
+        metrics={
+            "has_tracked_position": True,
+            "has_sellable_long_position": True,
+        },
+    )
+
+    row = build_signal_feature_row(signal)
+
+    assert row.model_purpose == "exit"
+
+
+def test_hold_without_tracked_position_stays_entry_model_purpose() -> None:
+    signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.HOLD,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=100.0,
+        metrics={},
+    )
+
+    row = build_signal_feature_row(signal)
+
+    assert row.model_purpose == "entry"
+
+
+def test_reduce_only_sell_signal_stays_exit_model_purpose() -> None:
+    signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.SELL,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=103.0,
+        reduce_only=True,
+        exit_stage="tp1",
+    )
+
+    row = build_signal_feature_row(signal)
+
+    assert row.model_purpose == "exit"
+
+
+def test_exit_hold_examples_remain_unlabeled_without_realized_history() -> None:
+    signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.HOLD,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=100.0,
+        metrics={"has_tracked_position": True},
+    )
+    feature_row = build_signal_feature_row(signal)
+
+    label, source = derive_bootstrap_label(
+        signal=signal,
+        action="hold",
+        classification="hold",
+        feature_snapshot=feature_row,
+    )
+
+    assert feature_row.model_purpose == "exit"
+    assert label is None
+    assert source is None
+
+
+def test_authoritative_exit_paths_are_labeled_positive_for_exit_research() -> None:
+    signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.SELL,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="test_strategy",
+        price=94.0,
+        reduce_only=True,
+        exit_stage="stop",
+        metrics={
+            "exit_state": {"unrealized_return": -0.05},
+            "has_tracked_position": True,
+            "has_sellable_long_position": True,
+        },
+    )
+    feature_row = build_signal_feature_row(signal)
+
+    label, source = derive_bootstrap_label(
+        signal=signal,
+        action="submitted",
+        classification="submitted",
+        feature_snapshot=feature_row,
+    )
+
+    assert feature_row.model_purpose == "exit"
+    assert label == 1
+    assert source == "exit_authoritative_bootstrap"
 
 
 def test_ml_inference_error_does_not_crash_auto_trader_buy_candidate() -> None:
@@ -343,6 +446,61 @@ def test_promotion_gating_respects_ml_and_trading_thresholds() -> None:
 
     assert promotion_thresholds_pass(settings, passing_metrics)[0] is True
     assert promotion_thresholds_pass(settings, failing_metrics)[0] is False
+
+
+def test_promotion_gating_enforces_winrate_lift_when_current_metrics_exist() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        ml_promotion_min_auc=0.6,
+        ml_promotion_min_precision=0.55,
+        ml_promotion_min_profit_factor=1.1,
+        ml_promotion_min_expectancy=0.01,
+        ml_promotion_max_drawdown=0.2,
+        ml_promotion_min_winrate_lift=0.03,
+    )
+    candidate_metrics = {
+        "auc": 0.7,
+        "precision": 0.6,
+        "profit_factor": 1.4,
+        "expectancy": 0.02,
+        "max_drawdown": 0.1,
+        "winrate": 0.61,
+    }
+
+    assert promotion_thresholds_pass(settings, candidate_metrics, current_metrics={"winrate": 0.57})[0] is True
+    assert promotion_thresholds_pass(settings, candidate_metrics, current_metrics={"winrate": 0.59})[0] is False
+
+
+def test_sparse_unlabeled_exit_dataset_fails_safely() -> None:
+    result = train_model(
+        [
+            {
+                "symbol": "AAPL",
+                "asset_class": "equity",
+                "strategy_name": "test_strategy",
+                "signal": "HOLD",
+                "direction": "long",
+                "model_purpose": "exit",
+                "label": None,
+            },
+            {
+                "symbol": "MSFT",
+                "asset_class": "equity",
+                "strategy_name": "test_strategy",
+                "signal": "SELL",
+                "direction": "long",
+                "model_purpose": "exit",
+                "label": None,
+            },
+        ],
+        model_type="logistic_regression",
+        min_train_rows=1,
+        purpose="exit",
+    )
+
+    assert result["trained"] is False
 
 
 def test_registry_stores_exit_candidate_metrics_separately(tmp_path: Path) -> None:

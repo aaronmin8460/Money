@@ -59,7 +59,11 @@ def test_local_reset_clears_runtime_state() -> None:
     assert runtime.portfolio.risk_events == []
     assert runtime.portfolio.daily_baseline_equity == 100_000.0
     assert runtime.risk_manager.get_recent_rejections() == []
-    assert runtime.risk_manager.get_active_cooldowns() == {"symbols": [], "strategies": []}
+    assert runtime.risk_manager.get_active_cooldowns() == {
+        "symbols": [],
+        "strategies": [],
+        "stop_out_symbols": [],
+    }
     assert runtime.broker.list_orders() == []
     assert trader.get_status()["last_signals"] == {}
     assert trader.get_status()["last_order"] is None

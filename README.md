@@ -187,6 +187,7 @@ ML scoring is optional and disabled by default.
 - strategies still generate the primary signal
 - the entry model scores BUY candidates and can filter/rank entries
 - the optional exit model can assist partial/full de-risking, but it does not block hard stops or emergency exits
+- exit-model research uses explicit exit signals plus `HOLD` rows for symbols that already have a tracked open position; `HOLD` rows without a tracked position stay entry-context
 - if the entry score is below `ML_MIN_SCORE_THRESHOLD`, the candidate becomes `skipped_low_ml_score`
 - risk controls still run independently and remain authoritative
 
@@ -251,6 +252,12 @@ python scripts/evaluate_model.py --dataset models/training_data.jsonl --purpose 
 source .venv/bin/activate
 python scripts/promote_model.py --purpose entry
 ```
+
+Promotion stays conservative:
+
+- candidate models must clear absolute ML and trading-outcome floors
+- `ML_PROMOTION_MIN_WINRATE_LIFT` is treated as lift versus the current same-purpose model when that model already has comparable evaluation metrics
+- if there is no current same-purpose win-rate baseline yet, promotion falls back to the absolute floors only
 
 ### Nightly Retrain Wrapper
 
