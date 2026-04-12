@@ -37,9 +37,19 @@ def export_dataset(output_path: Path) -> int:
         feature_snapshot = row.get("feature_snapshot")
         if not isinstance(feature_snapshot, dict):
             continue
-        if feature_snapshot.get("label") not in {0, 1}:
-            continue
-        dataset_rows.append(feature_snapshot)
+        exported_row = dict(feature_snapshot)
+        if exported_row.get("label") not in {0, 1}:
+            realized_proxy = exported_row.get("realized_return", exported_row.get("forward_return"))
+            if realized_proxy is not None:
+                try:
+                    exported_row["label"] = 1 if float(realized_proxy) > 0 else 0
+                    exported_row["label_source"] = exported_row.get("label_source") or "realized_outcome_proxy"
+                except (TypeError, ValueError):
+                    continue
+            else:
+                continue
+        exported_row["model_purpose"] = str(exported_row.get("model_purpose") or "entry")
+        dataset_rows.append(exported_row)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:

@@ -1,6 +1,7 @@
 import tempfile
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 
@@ -15,6 +16,27 @@ from app.strategies.base import Signal, TradeSignal
 
 def _test_lock_path() -> str:
     return f"{tempfile.gettempdir()}/money-auto-trader-{uuid.uuid4().hex}.lock"
+
+
+def _build_broker_notifier(calls: list[dict[str, object]]):
+    class StubNotifier:
+        def send_system_notification(self, **kwargs):
+            return True
+
+        def send_error_notification(self, **kwargs):
+            return True
+
+        def send_scan_summary_notification(self, **kwargs):
+            return True
+
+        def send_broker_lifecycle_notification(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+        def diagnostics(self):
+            return {}
+
+    return StubNotifier()
 
 
 def test_auto_trader_run_now_returns_result() -> None:
@@ -793,3 +815,224 @@ def test_auto_trader_prefers_exit_signals_before_new_entries(monkeypatch) -> Non
     assert processed_signals == [("MSFT", "SELL", "stop")]
     aapl_evaluation = next(item for item in trader.get_status()["last_symbol_evaluations"] if item["symbol"] == "AAPL")
     assert aapl_evaluation["action"] == "skipped"
+
+
+def test_broker_order_status_cache_persists_and_reloads_correctly(tmp_path: Path) -> None:
+    cache_path = tmp_path / "broker_order_status_memory.json"
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        log_dir=str(tmp_path),
+        broker_order_status_cache_path=str(cache_path),
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader._order_status_memory = {
+        "broker-1": {
+            "status": "filled",
+            "last_seen_at": "2026-04-11T12:00:00Z",
+            "symbol": "AAPL",
+            "side": "buy",
+        }
+    }
+
+    trader._persist_broker_order_status_memory()
+    reloaded = AutoTrader(settings)
+
+    assert reloaded._order_status_memory["broker-1"]["status"] == "filled"
+    assert reloaded._order_status_memory["broker-1"]["symbol"] == "AAPL"
+
+
+def test_restarting_with_existing_filled_order_does_not_resend_alert(tmp_path: Path, monkeypatch) -> None:
+    cache_path = tmp_path / "broker_order_status_memory.json"
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        log_dir=str(tmp_path),
+        broker_order_status_cache_path=str(cache_path),
+        broker_order_status_suppress_startup_replay=True,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    order = {
+        "id": "broker-1",
+        "symbol": "AAPL",
+        "side": "buy",
+        "status": "filled",
+        "filled_at": "2026-04-11T11:00:00Z",
+    }
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(auto_trader_module, "get_discord_notifier", lambda _settings: _build_broker_notifier(calls))
+
+    first_trader = AutoTrader(settings)
+    monkeypatch.setattr(first_trader.broker, "list_orders", lambda: [order])
+    first_trader._observe_broker_order_statuses(cycle_id="cycle-1")
+
+    restarted_trader = AutoTrader(settings)
+    monkeypatch.setattr(restarted_trader.broker, "list_orders", lambda: [order])
+    restarted_trader._observe_broker_order_statuses(cycle_id="cycle-2")
+
+    assert calls == []
+
+
+def test_real_status_transition_after_startup_sends_alert(tmp_path: Path, monkeypatch) -> None:
+    cache_path = tmp_path / "broker_order_status_memory.json"
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        log_dir=str(tmp_path),
+        broker_order_status_cache_path=str(cache_path),
+        broker_order_status_suppress_startup_replay=True,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    states = [
+        [
+            {
+                "id": "broker-2",
+                "symbol": "MSFT",
+                "side": "buy",
+                "status": "accepted",
+                "submitted_at": "2026-04-11T11:00:00Z",
+            }
+        ],
+        [
+            {
+                "id": "broker-2",
+                "symbol": "MSFT",
+                "side": "buy",
+                "status": "filled",
+                "filled_at": "2026-04-11T11:05:00Z",
+            }
+        ],
+    ]
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(auto_trader_module, "get_discord_notifier", lambda _settings: _build_broker_notifier(calls))
+
+    trader = AutoTrader(settings)
+    monkeypatch.setattr(trader.broker, "list_orders", lambda: states.pop(0))
+    trader._observe_broker_order_statuses(cycle_id="cycle-1")
+    trader._observe_broker_order_statuses(cycle_id="cycle-2")
+
+    assert [call["status"] for call in calls] == ["filled"]
+
+
+def test_newly_submitted_order_after_startup_sends_notification_on_first_poll(tmp_path: Path, monkeypatch) -> None:
+    cache_path = tmp_path / "broker_order_status_memory.json"
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        log_dir=str(tmp_path),
+        broker_order_status_cache_path=str(cache_path),
+        broker_order_status_suppress_startup_replay=True,
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(auto_trader_module, "get_discord_notifier", lambda _settings: _build_broker_notifier(calls))
+
+    trader = AutoTrader(settings)
+    trader._record_order({"id": "broker-3", "symbol": "NVDA"})
+    monkeypatch.setattr(
+        trader.broker,
+        "list_orders",
+        lambda: [
+            {
+                "id": "broker-3",
+                "symbol": "NVDA",
+                "side": "buy",
+                "status": "accepted",
+                "submitted_at": "2026-04-11T11:15:00Z",
+            }
+        ],
+    )
+
+    trader._observe_broker_order_statuses(cycle_id="cycle-1")
+
+    assert [call["status"] for call in calls] == ["accepted"]
+
+
+def test_corrupt_broker_status_cache_fails_safely(tmp_path: Path) -> None:
+    cache_path = tmp_path / "broker_order_status_memory.json"
+    cache_path.write_text("{not-json", encoding="utf-8")
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        log_dir=str(tmp_path),
+        broker_order_status_cache_path=str(cache_path),
+        auto_trader_lock_path=_test_lock_path(),
+    )
+
+    trader = AutoTrader(settings)
+
+    assert trader._order_status_memory == {}
+
+
+def test_buy_ranking_and_exposure_gating_behavior() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        max_position_notional=5_000.0,
+        max_symbol_allocation_pct=0.05,
+        max_asset_class_allocation_pct={"equity": 0.05, "etf": 0.05, "crypto": 0.10, "option": 0.02},
+        max_concurrent_positions=2,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader.portfolio.positions["AAPL"] = Position(
+        symbol="AAPL",
+        quantity=50.0,
+        entry_price=100.0,
+        side="BUY",
+        current_price=100.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    equity_candidate = TradeSignal(
+        symbol="MSFT",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="equity_momentum_breakout",
+        price=100.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        liquidity_score=0.9,
+        confidence_score=0.8,
+        metrics={
+            "strategy_score": 0.8,
+            "reward_risk_ratio": 2.0,
+            "breakout_distance_atr": 0.2,
+            "ml": {"score": 0.9},
+        },
+    )
+    crypto_candidate = TradeSignal(
+        symbol="BTC/USD",
+        signal=Signal.BUY,
+        asset_class=AssetClass.CRYPTO,
+        strategy_name="crypto_momentum_trend",
+        price=50_000.0,
+        entry_price=50_000.0,
+        stop_price=48_000.0,
+        liquidity_score=0.5,
+        confidence_score=0.6,
+        metrics={
+            "strategy_score": 0.5,
+            "reward_risk_ratio": 1.4,
+            "breakout_distance_atr": 0.3,
+            "ml": {"score": 0.55},
+        },
+    )
+
+    selected = trader._select_ranked_buy_signals([equity_candidate, crypto_candidate])
+
+    assert [signal.symbol for signal in selected] == ["BTC/USD"]
+    assert equity_candidate.metrics["buy_ranking"]["selection_rule"] == "portfolio_exposure_limit"
+    assert crypto_candidate.metrics["buy_ranking"]["selection_rule"] == "selected_by_rank"

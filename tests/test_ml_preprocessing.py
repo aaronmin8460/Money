@@ -5,8 +5,9 @@ from pathlib import Path
 
 from app.config.settings import Settings
 from app.domain.models import AssetClass
-from app.ml.evaluation import predict_scores
+from app.ml.evaluation import predict_scores, promotion_thresholds_pass, walk_forward_split
 from app.ml.inference import SignalScorer
+from app.ml.registry import load_registry, update_candidate
 from app.ml.training import load_model_bundle, save_model_bundle, train_model
 from app.services.auto_trader import AutoTrader
 from app.strategies.base import Signal, TradeSignal
@@ -277,3 +278,96 @@ def test_model_bundle_save_and_load_preserves_missing_value_safe_scoring(tmp_pat
 
     assert len(scores) == 1
     assert math.isfinite(scores[0])
+
+
+def test_entry_and_exit_model_loading_paths_are_independent(tmp_path: Path) -> None:
+    result = train_model(_training_rows(), model_type="logistic_regression", min_train_rows=10)
+    assert result["trained"] is True
+
+    entry_bundle = {**result["bundle"], "purpose": "entry"}
+    exit_bundle = {**result["bundle"], "purpose": "exit"}
+    entry_path = tmp_path / "entry.joblib"
+    exit_path = tmp_path / "exit.joblib"
+    save_model_bundle(entry_bundle, entry_path)
+    save_model_bundle(exit_bundle, exit_path)
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        ml_enabled=True,
+        exit_model_enabled=True,
+        ml_entry_current_model_path=str(entry_path),
+        ml_exit_current_model_path=str(exit_path),
+        ml_registry_path=str(tmp_path / "registry.json"),
+    )
+
+    scorer = SignalScorer(settings=settings)
+
+    assert scorer._load_bundle("entry")["purpose"] == "entry"
+    assert scorer._load_bundle("exit")["purpose"] == "exit"
+
+
+def test_walk_forward_split_does_not_leak_future_rows() -> None:
+    rows = [
+        {"generated_at": f"2026-01-{day:02d}T00:00:00Z", "label": day % 2}
+        for day in range(1, 11)
+    ]
+
+    training, validation = walk_forward_split(rows, validation_ratio=0.3)
+
+    assert len(training) == 7
+    assert len(validation) == 3
+    assert max(row["generated_at"] for row in training) < min(row["generated_at"] for row in validation)
+
+
+def test_promotion_gating_respects_ml_and_trading_thresholds() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        ml_promotion_min_auc=0.6,
+        ml_promotion_min_precision=0.55,
+        ml_promotion_min_profit_factor=1.1,
+        ml_promotion_min_expectancy=0.01,
+        ml_promotion_max_drawdown=0.2,
+    )
+    passing_metrics = {
+        "auc": 0.7,
+        "precision": 0.6,
+        "profit_factor": 1.4,
+        "expectancy": 0.02,
+        "max_drawdown": 0.1,
+        "winrate": 0.6,
+    }
+    failing_metrics = {**passing_metrics, "max_drawdown": 0.35}
+
+    assert promotion_thresholds_pass(settings, passing_metrics)[0] is True
+    assert promotion_thresholds_pass(settings, failing_metrics)[0] is False
+
+
+def test_registry_stores_exit_candidate_metrics_separately(tmp_path: Path) -> None:
+    registry_path = tmp_path / "registry.json"
+
+    update_candidate(
+        registry_path,
+        model_path=str(tmp_path / "exit_candidate.joblib"),
+        model_type="logistic_regression",
+        feature_version="v2",
+        train_rows=120,
+        validation_rows=24,
+        metrics={"auc": 0.66, "precision": 0.58},
+        trading_metrics={"profit_factor": 1.2},
+        notes="exit candidate",
+        model_purpose="exit",
+    )
+
+    registry = load_registry(registry_path)
+
+    assert registry["models"]["exit"]["candidate_model"]["metrics"]["auc"] == 0.66
+    assert registry["models"]["exit"]["candidate_model"]["trading_metrics"]["profit_factor"] == 1.2
+
+
+def test_sparse_dataset_fails_safely() -> None:
+    result = train_model(_training_rows()[:4], model_type="logistic_regression", min_train_rows=10)
+
+    assert result["trained"] is False

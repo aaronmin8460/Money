@@ -352,3 +352,38 @@ def test_broker_lifecycle_notifications_are_deduped(mock_post: Mock) -> None:
     assert first is True
     assert second is False
     assert mock_post.call_count == 1
+
+
+@patch("app.monitoring.discord_notifier.httpx.post")
+def test_configurable_broker_lifecycle_dedupe_ttl_is_respected(mock_post: Mock, monkeypatch) -> None:
+    mock_post.return_value = build_response()
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        log_dir=f"{tempfile.gettempdir()}/money-discord-tests-{uuid.uuid4().hex}",
+        discord_notifications_enabled=True,
+        discord_webhook_url="https://discord.com/api/webhooks/test-id/test-token",
+        discord_dedupe_ttl_seconds=30.0,
+    )
+    notifier = DiscordNotifier(settings)
+    order_payload = {
+        "id": "order-ttl",
+        "symbol": "AAPL",
+        "side": "buy",
+        "status": "filled",
+        "filled_qty": 1,
+        "filled_avg_price": 150.0,
+        "filled_at": "2026-04-10T14:05:00Z",
+    }
+    clock = iter([0.0, 0.0, 10.0, 61.0, 61.0])
+    monkeypatch.setattr("app.monitoring.discord_notifier.time.time", lambda: next(clock))
+
+    first = notifier.send_broker_lifecycle_notification(status="filled", order=order_payload)
+    second = notifier.send_broker_lifecycle_notification(status="filled", order=order_payload)
+    third = notifier.send_broker_lifecycle_notification(status="filled", order=order_payload)
+
+    assert first is True
+    assert second is False
+    assert third is True
+    assert mock_post.call_count == 2

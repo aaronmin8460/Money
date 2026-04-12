@@ -1,31 +1,56 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import pandas as pd
 
 from app.domain.models import AssetClass
 from app.strategies.base import BaseStrategy, Signal, StrategyContext, TradeSignal
+from app.strategies.signal_pipeline import (
+    AssetSignalProfile,
+    BreakoutState,
+    LiquidityState,
+    RiskPlan,
+    SignalQualityScore,
+    TrendState,
+    VolatilityState,
+    add_pipeline_indicators,
+    build_signal_quality_score,
+    compute_risk_plan,
+    default_signal_profiles,
+    resolve_breakout_state,
+    resolve_liquidity_state,
+    resolve_trend_state,
+    resolve_volatility_state,
+    safe_float,
+)
+
+
+@dataclass(frozen=True)
+class PipelineEvaluation:
+    passed: bool
+    decision_code: str
+    reason: str
+    trend: TrendState
+    volatility: VolatilityState
+    liquidity: LiquidityState
+    breakout: BreakoutState
+    risk_plan: RiskPlan
+    quality: SignalQualityScore
 
 
 class RegimeMomentumBreakoutStrategy(BaseStrategy):
-    """Advanced strategy using regime filter, momentum ranking, and breakout entries."""
+    """Disciplined breakout strategy with modular filters and risk-reward planning."""
 
     name = "equity_momentum_breakout"
     supported_asset_classes = {AssetClass.EQUITY, AssetClass.ETF}
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.regime_symbol = "SPY"
         self.regime_long_sma = 20
         self.regime_short_sma = 10
-        self.ema_window = 8
-        self.sma_short = 10
-        self.sma_long = 20
-        self.atr_window = 14
-        self.breakout_window = 10
-        self.volume_window = 10
-        self.return_window = 5
-        self.return_3m_window = 15
+        self.profiles: dict[AssetClass, AssetSignalProfile] = default_signal_profiles()
 
     def generate_signals(
         self,
@@ -34,190 +59,239 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
         context: StrategyContext | None = None,
     ) -> list[TradeSignal]:
         symbol_df, benchmark_df = self._unpack_data(data)
-        if symbol_df.empty or len(symbol_df) < self.regime_long_sma:
-            return [
-                TradeSignal(
-                    symbol=symbol,
-                    signal=Signal.HOLD,
-                    asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
-                    strategy_name=self.name,
-                    reason="Insufficient data",
-                )
-            ]
+        asset_class = context.asset.asset_class if context else AssetClass.EQUITY
+        profile = self._profile_for(asset_class)
+        if symbol_df.empty or len(symbol_df) < max(profile.sma_long_window, self.regime_long_sma):
+            return [self._build_hold_signal(symbol, asset_class, "insufficient_data", "Insufficient data.")]
 
-        symbol_df = symbol_df.copy()
-        symbol_df = self._add_indicators(symbol_df)
-        regime_state = self._get_regime_state(symbol_df, benchmark_df)
+        evaluated_df = add_pipeline_indicators(symbol_df, profile)
+        latest = evaluated_df.iloc[-1]
+        regime_state = self._get_regime_state(evaluated_df, benchmark_df)
+        has_tracked_long_position = bool((context.metadata if context else {}).get("has_sellable_long_position"))
 
-        if regime_state == "bearish":
-            return self._generate_exit_signals(
-                symbol,
-                symbol_df,
-                regime_state,
-                context.asset.asset_class if context else AssetClass.EQUITY,
-            )
-        if regime_state == "unknown":
-            return [
-                TradeSignal(
-                    symbol=symbol,
-                    signal=Signal.HOLD,
-                    asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
-                    strategy_name=self.name,
-                    reason="Regime unknown",
-                    regime_state=regime_state,
-                )
-            ]
-
-        signals: list[TradeSignal] = []
-        for _, row in symbol_df.iterrows():
-            candidate = self._evaluate_entry(
-                symbol,
-                row,
-                regime_state,
-                context.asset.asset_class if context else AssetClass.EQUITY,
-            )
-            if candidate:
-                signals.append(candidate)
-
-        if signals:
-            return [signals[-1]]
-
-        return [
-            TradeSignal(
-                symbol=symbol,
-                signal=Signal.HOLD,
-                asset_class=context.asset.asset_class if context else AssetClass.EQUITY,
-                strategy_name=self.name,
-                reason="No valid entry signal",
-                regime_state=regime_state,
-            )
-        ]
-
-    def _unpack_data(self, data: Any) -> tuple[pd.DataFrame, pd.DataFrame | None]:
-        if isinstance(data, dict):
-            return data.get("symbol", pd.DataFrame()), data.get("benchmark")
-        return data, None
-
-    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df["ema"] = df["Close"].ewm(span=self.ema_window, adjust=False).mean()
-        df["sma_short"] = df["Close"].rolling(window=self.sma_short).mean()
-        df["sma_long"] = df["Close"].rolling(window=self.sma_long).mean()
-
-        df["high_low"] = df["High"] - df["Low"]
-        df["high_close"] = (df["High"] - df["Close"].shift()).abs()
-        df["low_close"] = (df["Low"] - df["Close"].shift()).abs()
-        df["true_range"] = df[["high_low", "high_close", "low_close"]].max(axis=1)
-        df["atr"] = df["true_range"].rolling(window=self.atr_window).mean()
-
-        df["prev_breakout_high"] = df["High"].rolling(window=self.breakout_window).max().shift(1)
-        df["avg_volume"] = df["Volume"].rolling(window=self.volume_window).mean()
-
-        df["return_1m"] = df["Close"].pct_change(periods=self.return_window)
-        df["return_3m"] = df["Close"].pct_change(periods=self.return_3m_window)
-
-        return df
-
-    def _get_regime_state(self, symbol_df: pd.DataFrame, benchmark_df: pd.DataFrame | None) -> str:
-        if benchmark_df is not None and len(benchmark_df) >= self.regime_long_sma:
-            benchmark = benchmark_df.copy()
-            benchmark["sma_short"] = benchmark["Close"].rolling(window=self.regime_short_sma).mean()
-            benchmark["sma_long"] = benchmark["Close"].rolling(window=self.regime_long_sma).mean()
-            latest = benchmark.iloc[-1]
-            if (
-                pd.notna(latest["sma_long"])
-                and pd.notna(latest["sma_short"])
-                and latest["Close"] > latest["sma_long"]
-                and latest["sma_short"] > latest["sma_long"]
-            ):
-                return "bullish"
-            return "bearish"
-
-        latest_symbol = symbol_df.iloc[-1]
-        if pd.isna(latest_symbol["sma_long"]) or pd.isna(latest_symbol["sma_short"]):
-            return "unknown"
-        if (
-            latest_symbol["Close"] > latest_symbol["sma_long"]
-            and latest_symbol["sma_short"] > latest_symbol["sma_long"]
-        ):
-            return "bullish"
-        return "bearish"
-
-    def _evaluate_entry(
-        self,
-        symbol: str,
-        row: pd.Series,
-        regime_state: str,
-        asset_class: AssetClass,
-    ) -> TradeSignal | None:
-        if pd.isna(row["ema"]) or pd.isna(row["sma_short"]) or pd.isna(row["sma_long"]) or pd.isna(row["atr"]):
-            return None
-
-        close_above_ema = row["Close"] > row["ema"]
-        close_above_sma_short = row["Close"] > row["sma_short"]
-        sma_short_above_long = row["sma_short"] > row["sma_long"]
-        breakout = pd.notna(row["prev_breakout_high"]) and row["Close"] > row["prev_breakout_high"]
-        volume_ok = pd.notna(row["avg_volume"]) and row["Volume"] >= 1.2 * row["avg_volume"]
-
-        if close_above_ema and close_above_sma_short and sma_short_above_long and breakout and volume_ok:
-            momentum_score = 0.0
-            if pd.notna(row["return_1m"]):
-                momentum_score += 0.5 * row["return_1m"]
-            if pd.notna(row["return_3m"]):
-                momentum_score += 0.3 * row["return_3m"]
-            distance_above_sma = (
-                row["Close"] - row["sma_short"]
-            ) / row["sma_short"] if row["sma_short"] > 0 else 0.0
-            momentum_score += 0.2 * distance_above_sma
-
-            initial_stop = float(row["Close"] - 2.0 * row["atr"])
-            trailing_stop = float(row["Close"] - 2.5 * row["atr"])
-
-            return TradeSignal(
-                symbol=symbol,
-                signal=Signal.BUY,
-                asset_class=asset_class,
-                strategy_name=self.name,
-                strength=momentum_score,
-                confidence_score=min(1.0, max(0.0, momentum_score * 10)),
-                price=float(row["Close"]),
-                reason="Regime bullish, breakout above 20-day high with volume",
-                atr=float(row["atr"]),
-                stop_price=initial_stop,
-                target_price=float(row["Close"] + 3.0 * row["atr"]),
-                trailing_stop=trailing_stop,
-                momentum_score=momentum_score,
-                regime_state=regime_state,
-                timestamp=str(row.name),
-            )
-        return None
-
-    def _generate_exit_signals(
-        self,
-        symbol: str,
-        df: pd.DataFrame,
-        regime_state: str,
-        asset_class: AssetClass,
-    ) -> list[TradeSignal]:
-        latest = df.iloc[-1]
-        if pd.notna(latest["ema"]) and latest["Close"] < latest["ema"]:
+        if regime_state == "bearish" and has_tracked_long_position:
             return [
                 TradeSignal(
                     symbol=symbol,
                     signal=Signal.SELL,
                     asset_class=asset_class,
                     strategy_name=self.name,
-                    price=float(latest["Close"]),
-                    reason="Bearish regime and close below EMA",
+                    signal_type="exit",
+                    order_intent="long_exit",
+                    reduce_only=True,
+                    exit_stage="regime_deterioration",
+                    price=safe_float(latest.get("Close")),
+                    reason="Regime deteriorated and a tracked long position is open.",
+                    regime_state=regime_state,
+                    metrics={
+                        "decision_code": "regime_deterioration",
+                        "regime_state": regime_state,
+                    },
+                )
+            ]
+        if regime_state != "bullish":
+            return [
+                self._build_hold_signal(
+                    symbol,
+                    asset_class,
+                    "regime_filter",
+                    "Broad market regime is not supportive for fresh long breakouts.",
                     regime_state=regime_state,
                 )
             ]
-        return [
-            TradeSignal(
-                symbol=symbol,
-                signal=Signal.HOLD,
-                asset_class=asset_class,
-                strategy_name=self.name,
-                reason="Bearish regime, no exit signal",
-                regime_state=regime_state,
+
+        evaluation = self._evaluate_pipeline(evaluated_df, profile)
+        if not evaluation.passed:
+            return [
+                self._build_hold_signal(
+                    symbol,
+                    asset_class,
+                    evaluation.decision_code,
+                    evaluation.reason,
+                    regime_state=regime_state,
+                    metrics=self._pipeline_metrics(evaluation),
+                )
+            ]
+
+        latest_close = safe_float(latest.get("Close")) or 0.0
+        signal = TradeSignal(
+            symbol=symbol,
+            signal=Signal.BUY,
+            asset_class=asset_class,
+            strategy_name=self.name,
+            strength=evaluation.quality.total,
+            confidence_score=evaluation.quality.total,
+            price=latest_close,
+            entry_price=latest_close,
+            reason="Trend, liquidity, breakout trigger, and reward/risk all aligned.",
+            atr=evaluation.volatility.atr,
+            stop_price=evaluation.risk_plan.stop_price,
+            target_price=evaluation.risk_plan.target_price,
+            trailing_stop=self._initial_trailing_stop(latest_close, evaluation.risk_plan),
+            momentum_score=evaluation.quality.breakout_component + evaluation.quality.trend_component,
+            liquidity_score=evaluation.liquidity.score,
+            regime_state=regime_state,
+            timestamp=str(latest.name),
+            metrics={
+                **self._pipeline_metrics(evaluation),
+                "decision_code": "signal",
+                "strategy_score": evaluation.quality.total,
+                "breakout_level": evaluation.breakout.breakout_level,
+                "breakout_distance_atr": evaluation.breakout.breakout_distance_atr,
+                "extended_move": evaluation.breakout.extended_move,
+                "reward_risk_ratio": evaluation.risk_plan.reward_risk_ratio,
+                "stop_distance_atr": evaluation.risk_plan.stop_distance_atr,
+                "target_distance_atr": evaluation.risk_plan.target_distance_atr,
+                "relative_volume": evaluation.liquidity.relative_volume,
+                "volatility_compression_ratio": evaluation.volatility.compression_ratio,
+            },
+        )
+        return [signal]
+
+    def _profile_for(self, asset_class: AssetClass) -> AssetSignalProfile:
+        return self.profiles.get(asset_class, self.profiles[AssetClass.EQUITY])
+
+    def _unpack_data(self, data: Any) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+        if isinstance(data, dict):
+            return data.get("symbol", pd.DataFrame()), data.get("benchmark")
+        return data, None
+
+    def _get_regime_state(self, symbol_df: pd.DataFrame, benchmark_df: pd.DataFrame | None) -> str:
+        candidate = benchmark_df.copy() if benchmark_df is not None and not benchmark_df.empty else symbol_df.copy()
+        if len(candidate) < self.regime_long_sma:
+            return "unknown"
+        candidate["sma_short"] = candidate["Close"].rolling(self.regime_short_sma, min_periods=1).mean()
+        candidate["sma_long"] = candidate["Close"].rolling(self.regime_long_sma, min_periods=1).mean()
+        latest = candidate.iloc[-1]
+        sma_short = safe_float(latest.get("sma_short"))
+        sma_long = safe_float(latest.get("sma_long"))
+        close = safe_float(latest.get("Close")) or 0.0
+        if sma_short is None or sma_long is None:
+            return "unknown"
+        if close > sma_long and sma_short >= sma_long:
+            return "bullish"
+        return "bearish"
+
+    def _evaluate_pipeline(self, df: pd.DataFrame, profile: AssetSignalProfile) -> PipelineEvaluation:
+        latest = df.iloc[-1]
+        latest_close = safe_float(latest.get("Close")) or 0.0
+        trend = resolve_trend_state(df)
+        volatility = resolve_volatility_state(df, profile)
+        liquidity = resolve_liquidity_state(df, latest_close, profile)
+        breakout = resolve_breakout_state(df, profile)
+        risk_plan = compute_risk_plan(
+            latest_close=latest_close,
+            atr=volatility.atr,
+            breakout_level=breakout.breakout_level,
+            reference_support=trend.reference_support,
+            profile=profile,
+        )
+        quality = build_signal_quality_score(
+            trend=trend,
+            breakout=breakout,
+            volatility=volatility,
+            liquidity=liquidity,
+            risk_plan=risk_plan,
+        )
+
+        if not trend.is_aligned:
+            return PipelineEvaluation(False, "weak_trend", trend.reason, trend, volatility, liquidity, breakout, risk_plan, quality)
+        if not volatility.is_tradeable:
+            return PipelineEvaluation(
+                False,
+                "volatility_filter",
+                volatility.reason,
+                trend,
+                volatility,
+                liquidity,
+                breakout,
+                risk_plan,
+                quality,
             )
-        ]
+        if not liquidity.is_confirmed:
+            return PipelineEvaluation(
+                False,
+                "volume_confirmation",
+                liquidity.reason,
+                trend,
+                volatility,
+                liquidity,
+                breakout,
+                risk_plan,
+                quality,
+            )
+        if not breakout.is_valid:
+            return PipelineEvaluation(
+                False,
+                "breakout_trigger",
+                breakout.reason,
+                trend,
+                volatility,
+                liquidity,
+                breakout,
+                risk_plan,
+                quality,
+            )
+        if not risk_plan.viable:
+            return PipelineEvaluation(
+                False,
+                "reward_risk",
+                risk_plan.reason,
+                trend,
+                volatility,
+                liquidity,
+                breakout,
+                risk_plan,
+                quality,
+            )
+        return PipelineEvaluation(
+            True,
+            "signal",
+            "Pipeline passed.",
+            trend,
+            volatility,
+            liquidity,
+            breakout,
+            risk_plan,
+            quality,
+        )
+
+    def _pipeline_metrics(self, evaluation: PipelineEvaluation) -> dict[str, Any]:
+        return {
+            "pipeline": {
+                "trend": asdict(evaluation.trend),
+                "volatility": asdict(evaluation.volatility),
+                "liquidity": asdict(evaluation.liquidity),
+                "breakout": asdict(evaluation.breakout),
+                "risk_plan": asdict(evaluation.risk_plan),
+                "quality": asdict(evaluation.quality),
+            }
+        }
+
+    def _initial_trailing_stop(self, entry_price: float, risk_plan: RiskPlan) -> float | None:
+        if risk_plan.stop_price is None:
+            return None
+        risk_per_share = entry_price - risk_plan.stop_price
+        if risk_per_share <= 0:
+            return None
+        return entry_price - (risk_per_share * 1.2)
+
+    def _build_hold_signal(
+        self,
+        symbol: str,
+        asset_class: AssetClass,
+        decision_code: str,
+        reason: str,
+        *,
+        regime_state: str | None = None,
+        metrics: dict[str, Any] | None = None,
+    ) -> TradeSignal:
+        return TradeSignal(
+            symbol=symbol,
+            signal=Signal.HOLD,
+            asset_class=asset_class,
+            strategy_name=self.name,
+            reason=reason,
+            regime_state=regime_state,
+            metrics={"decision_code": decision_code, **(metrics or {})},
+        )

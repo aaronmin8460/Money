@@ -21,6 +21,7 @@ from app.news.feature_store import NewsFeatureStore
 from app.services.exit_manager import ExitManager
 from app.services.market_data import infer_asset_class, normalize_asset_class
 from app.strategies.base import Signal, StrategyContext, TradeSignal
+from app.utils.datetime_parser import parse_iso_datetime
 
 if TYPE_CHECKING:
     from app.services.runtime import RuntimeContainer
@@ -46,7 +47,7 @@ class AutoTrader:
         self.risk_manager = runtime.risk_manager
         self.market_data_service = runtime.market_data_service
         self.execution_service = runtime.execution_service
-        self.exit_manager = ExitManager(self.portfolio)
+        self.exit_manager = ExitManager(self.portfolio, settings=self.settings)
         self.tranche_state = runtime.tranche_state
         self.asset_catalog = runtime.asset_catalog
         self.scanner = runtime.scanner
@@ -86,7 +87,10 @@ class AutoTrader:
         self._latest_skipped_reason: str | None = None
         self._latest_rejected_reason: str | None = None
         self._last_submitted_order: Dict[str, Any] | None = None
-        self._order_status_memory: Dict[str, str] = {}
+        self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
+        self._session_order_ids: set[str] = set()
+        self._broker_status_baseline_synced: bool = False
+        self._order_status_memory: Dict[str, Dict[str, Any]] = self._load_broker_order_status_memory()
         self._latest_broker_order_status_updates: List[Dict[str, Any]] = []
         self._broker_status_dedupe_suppressed: int = 0
         self._process_lock_handle: Any | None = None
@@ -103,6 +107,10 @@ class AutoTrader:
                 )
                 return False
 
+            self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
+            self._session_order_ids.clear()
+            self._broker_status_baseline_synced = False
+            self._order_status_memory = self._load_broker_order_status_memory()
             self._running = True
             self._loop_thread_ident = None
             self._wake_event.clear()
@@ -208,13 +216,16 @@ class AutoTrader:
         cycle_id = self._next_cycle_id("manual_symbol")
         try:
             with self._execution_lock:
-                self.tranche_state.increment_scan_bar_index()
+                scan_bar_index = self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
                 normalized_snapshot = self._get_normalized_snapshot(asset)
+                news_features = self._load_news_features([asset.symbol]).get(asset.symbol)
                 signal = self._evaluate_exit_signal(
                     asset,
                     normalized_snapshot=normalized_snapshot,
                     evaluation_mode="manual",
+                    regime_snapshot=self._last_regime_snapshot,
+                    news_features=news_features,
                 )
                 if signal is None:
                     signal = self._evaluate_asset(
@@ -223,10 +234,10 @@ class AutoTrader:
                         evaluation_mode="manual",
                         precomputed_snapshot=normalized_snapshot.to_dict(),
                     )
-                news_features = self._load_news_features([asset.symbol]).get(asset.symbol)
                 self._enrich_signal(
                     signal,
                     cycle_id=cycle_id,
+                    scan_bar_index=scan_bar_index,
                     regime_snapshot=self._last_regime_snapshot,
                     ranked_opportunity=None,
                     news_features=news_features,
@@ -562,11 +573,31 @@ class AutoTrader:
         *,
         normalized_snapshot: NormalizedMarketSnapshot,
         evaluation_mode: str,
+        regime_snapshot: dict[str, Any] | None = None,
+        news_features: dict[str, Any] | None = None,
     ) -> TradeSignal | None:
+        exit_model_result = None
+        position = self.portfolio.get_position(asset.symbol)
+        if position is not None and self.settings.ml_enabled and self.settings.exit_model_enabled:
+            exit_probe = self._build_exit_model_probe(
+                asset=asset,
+                position=position,
+                evaluation_price=normalized_snapshot.evaluation_price,
+            )
+            exit_model_result = self.ml_scorer.score_exit_signal(
+                exit_probe,
+                market_overview=regime_snapshot,
+                news_features=news_features,
+                latest_price=normalized_snapshot.evaluation_price,
+            )
         evaluation = self.exit_manager.evaluate_long_position(
             asset.symbol,
             normalized_snapshot.evaluation_price,
             asset_class=asset.asset_class,
+            current_bar_index=self.tranche_state.get_scan_bar_index(),
+            regime_state=self._resolve_market_regime_label(regime_snapshot),
+            news_features=news_features,
+            exit_model_score=exit_model_result.score if exit_model_result is not None else None,
         )
         signal = evaluation.signal
         if signal is None:
@@ -583,7 +614,74 @@ class AutoTrader:
         signal.metrics["decision_code"] = signal.metrics.get("decision_code") or "exit_signal"
         signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
         signal.metrics["exit_state"] = evaluation.state
+        if exit_model_result is not None:
+            signal.metrics["exit_ml"] = exit_model_result.to_dict()
         return signal
+
+    def _build_exit_model_probe(
+        self,
+        *,
+        asset: AssetMetadata,
+        position: Any,
+        evaluation_price: float | None,
+    ) -> TradeSignal:
+        metadata = dict(position.entry_signal_metadata)
+        return TradeSignal(
+            symbol=asset.symbol,
+            signal=Signal.SELL,
+            asset_class=asset.asset_class,
+            strategy_name=str(metadata.get("strategy_name") or "exit_model"),
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            exit_stage="ml_exit",
+            price=evaluation_price,
+            entry_price=evaluation_price,
+            atr=self._safe_float(metadata.get("atr")),
+            stop_price=self._safe_float(position.current_stop or metadata.get("stop_price")),
+            target_price=self._safe_float(metadata.get("target_price")),
+            metrics={
+                "current_stop": position.current_stop,
+                "holding_duration_bars": (
+                    self.tranche_state.get_scan_bar_index() - int(metadata.get("entry_scan_bar_index"))
+                    if metadata.get("entry_scan_bar_index") not in {None, ""}
+                    else None
+                ),
+                "unrealized_return": (
+                    ((evaluation_price or position.current_price) - position.entry_price) / position.entry_price
+                    if position.entry_price
+                    else None
+                ),
+                "favorable_excursion_r": (
+                    ((position.highest_price_since_entry or position.entry_price) - position.entry_price)
+                    / max(position.entry_price - float(metadata.get("stop_price") or position.current_stop or position.entry_price), 1e-9)
+                    if metadata.get("stop_price") is not None or position.current_stop is not None
+                    else None
+                ),
+                "hit_target_stages": list(metadata.get("hit_target_stages") or []),
+            },
+        )
+
+    @staticmethod
+    def _resolve_market_regime_label(regime_snapshot: dict[str, Any] | None) -> str | None:
+        if not regime_snapshot:
+            return None
+        bullish = float(regime_snapshot.get("bullish") or 0.0)
+        bearish = float(regime_snapshot.get("bearish") or 0.0)
+        if bearish > bullish:
+            return "bearish"
+        if bullish > bearish:
+            return "bullish"
+        return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value in {None, ""}:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _evaluate_asset(
         self,
@@ -938,6 +1036,8 @@ class AutoTrader:
                         asset,
                         normalized_snapshot=normalized_snapshot,
                         evaluation_mode="auto",
+                        regime_snapshot=scan_result.regime_status,
+                        news_features=news_features_by_symbol.get(asset.symbol),
                     )
                     if signal is None:
                         signal = self._evaluate_asset(
@@ -948,6 +1048,7 @@ class AutoTrader:
                     self._enrich_signal(
                         signal,
                         cycle_id=cycle_id,
+                        scan_bar_index=scan_bar_index,
                         regime_snapshot=scan_result.regime_status,
                         ranked_opportunity=opportunity_by_symbol.get(asset.symbol),
                         news_features=news_features_by_symbol.get(asset.symbol),
@@ -999,28 +1100,20 @@ class AutoTrader:
                 skipped_hold_signals = [signal for signal in signals if signal.signal == Signal.HOLD]
                 sell_signals = [signal for signal in signals if signal.signal == Signal.SELL]
                 buy_signals = [signal for signal in signals if signal.signal == Signal.BUY]
-                buy_signals = sorted(
-                    buy_signals,
-                    key=lambda item: (
-                        ((item.metrics or {}).get("ml") or {}).get("score") or 0.0,
-                        item.confidence_score or 0.0,
-                        item.momentum_score or 0.0,
-                    ),
-                    reverse=True,
-                )
-                open_symbols_set = set(self.portfolio.positions.keys())
-                scale_in_buy_signals = [
-                    signal
-                    for signal in buy_signals
-                    if signal.symbol in open_symbols_set and self.execution_service.has_pending_tranche(signal.symbol)
-                ]
-                new_symbol_buy_signals = [
-                    signal
-                    for signal in buy_signals
-                    if signal.symbol not in open_symbols_set
-                ]
-                available_slots = max(0, self.settings.max_positions_total - len(self.portfolio.positions))
-                selected_buy_signals = scale_in_buy_signals + new_symbol_buy_signals[:available_slots]
+                ranked_buy_signals = self._rank_buy_signals(buy_signals)
+                selected_buy_signals = self._select_ranked_buy_signals(ranked_buy_signals)
+                buy_ranking_by_symbol = {
+                    signal.symbol: dict((signal.metrics or {}).get("buy_ranking") or {})
+                    for signal in ranked_buy_signals
+                }
+                for row in symbol_evaluations:
+                    ranking = buy_ranking_by_symbol.get(row["symbol"])
+                    if ranking:
+                        row["ranking"] = ranking
+                        row["combined_score"] = ranking.get("combined_score")
+                        row["strategy_score"] = ranking.get("strategy_score")
+                        row["entry_ml_score"] = ranking.get("entry_ml_score")
+                        row["risk_quality_adjustment"] = ranking.get("risk_quality_adjustment")
                 selected_signals = skipped_hold_signals + sell_signals
                 if not sell_signals:
                     selected_signals += selected_buy_signals
@@ -1053,9 +1146,10 @@ class AutoTrader:
 
                 for row in symbol_evaluations:
                     if row.get("action") == "candidate":
+                        ranking = buy_ranking_by_symbol.get(row["symbol"]) or {}
                         row["action"] = "skipped"
-                        row["decision_rule"] = row.get("decision_rule") or "not_selected_by_rank"
-                        row["decision_reason"] = row.get("decision_reason") or "Candidate not selected this cycle."
+                        row["decision_rule"] = ranking.get("selection_rule") or "not_selected_by_rank"
+                        row["decision_reason"] = ranking.get("selection_reason") or "Candidate not selected this cycle."
 
                 outcome_counts = self._count_outcomes(symbol_evaluations)
                 self._observe_broker_order_statuses(cycle_id=cycle_id)
@@ -1065,7 +1159,20 @@ class AutoTrader:
                     self._last_cycle_id = cycle_id
                     self._last_scanned_symbols = all_symbols
                     self._last_signals = latest_signals
-                    self._last_ranked_candidates = [item.to_dict() for item in scan_result.opportunities]
+                    self._last_ranked_candidates = [
+                        {
+                            "symbol": signal.symbol,
+                            "asset_class": signal.asset_class.value,
+                            "signal": signal.signal.value,
+                            "combined_score": ((signal.metrics or {}).get("buy_ranking") or {}).get("combined_score"),
+                            "strategy_score": ((signal.metrics or {}).get("buy_ranking") or {}).get("strategy_score"),
+                            "entry_ml_score": ((signal.metrics or {}).get("buy_ranking") or {}).get("entry_ml_score"),
+                            "risk_quality_adjustment": ((signal.metrics or {}).get("buy_ranking") or {}).get("risk_quality_adjustment"),
+                            "selection_rule": ((signal.metrics or {}).get("buy_ranking") or {}).get("selection_rule"),
+                            "selection_reason": ((signal.metrics or {}).get("buy_ranking") or {}).get("selection_reason"),
+                        }
+                        for signal in ranked_buy_signals
+                    ] or [item.to_dict() for item in scan_result.opportunities]
                     self._last_regime_snapshot = scan_result.regime_status
                     self._last_scan_overview = scan_result.to_dict()
                     self._last_scan_overview["scan_bar_index"] = scan_bar_index
@@ -1148,9 +1255,12 @@ class AutoTrader:
         }
 
     def _record_order(self, order: Dict[str, Any]) -> None:
+        order_id = str(order.get("id") or order.get("client_order_id") or "")
         with self._state_lock:
             self._last_order = order
             self._last_submitted_order = order
+            if order_id:
+                self._session_order_ids.add(order_id)
 
     def _track_execution_result(self, result: Dict[str, Any]) -> None:
         with self._state_lock:
@@ -1262,6 +1372,140 @@ class AutoTrader:
         }
         return mappings.get(normalized)
 
+    def _broker_status_cache_path(self) -> Path:
+        path = Path(self.settings.broker_order_status_cache_path)
+        if not path.is_absolute():
+            return path
+        return path
+
+    def _load_broker_order_status_memory(self) -> Dict[str, Dict[str, Any]]:
+        cache_path = self._broker_status_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        if not cache_path.exists():
+            return {}
+
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "Failed to load broker order status cache; using empty state",
+                extra={"cache_path": str(cache_path), "error": str(exc)},
+            )
+            return {}
+
+        memory: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(payload, dict):
+            return memory
+
+        for order_id, raw_entry in payload.items():
+            if not isinstance(order_id, str) or not isinstance(raw_entry, dict):
+                continue
+            status = self._normalize_broker_status(raw_entry.get("status"))
+            if status is None:
+                continue
+            memory[order_id] = {
+                "status": status,
+                "last_seen_at": str(raw_entry.get("last_seen_at") or ""),
+                "symbol": str(raw_entry.get("symbol") or "") or None,
+                "side": str(raw_entry.get("side") or "") or None,
+                "ignored_on_startup": bool(raw_entry.get("ignored_on_startup", False)),
+            }
+        return memory
+
+    def _persist_broker_order_status_memory(self) -> None:
+        cache_path = self._broker_status_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cache_path.write_text(
+                json.dumps(self._order_status_memory, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.warning(
+                "Failed to persist broker order status cache",
+                extra={"cache_path": str(cache_path), "error": str(exc)},
+            )
+
+    def _resolve_broker_order_timestamp(self, order: dict[str, Any]) -> datetime.datetime | None:
+        for field_name in ("filled_at", "updated_at", "submitted_at", "executed_at", "created_at"):
+            raw_value = order.get(field_name)
+            if raw_value in {None, ""}:
+                continue
+            try:
+                parsed = parse_iso_datetime(raw_value)
+            except ValueError:
+                continue
+            if parsed is None:
+                continue
+            return parsed.astimezone(datetime.timezone.utc)
+        return None
+
+    def _build_broker_order_status_entry(
+        self,
+        *,
+        order: dict[str, Any],
+        status: str,
+        observed_at: datetime.datetime,
+        ignored_on_startup: bool = False,
+    ) -> Dict[str, Any]:
+        return {
+            "status": status,
+            "last_seen_at": observed_at.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+            "symbol": str(order.get("symbol") or "") or None,
+            "side": str(order.get("side") or "") or None,
+            "ignored_on_startup": ignored_on_startup,
+        }
+
+    def _should_ignore_terminal_baseline_order(
+        self,
+        *,
+        order: dict[str, Any],
+        status: str,
+        observed_at: datetime.datetime,
+    ) -> bool:
+        if status not in {"filled", "canceled", "rejected"}:
+            return False
+        threshold_minutes = self.settings.broker_order_status_ignore_terminal_older_than_minutes
+        if threshold_minutes <= 0:
+            return False
+        order_timestamp = self._resolve_broker_order_timestamp(order)
+        if order_timestamp is None:
+            return False
+        return order_timestamp <= (
+            observed_at - datetime.timedelta(minutes=threshold_minutes)
+        )
+
+    def _seed_broker_order_status_memory_from_existing_orders(
+        self,
+        orders: list[dict[str, Any]],
+        *,
+        observed_at: datetime.datetime,
+        exclude_order_ids: set[str] | None = None,
+    ) -> None:
+        excluded = exclude_order_ids or set()
+        changed = False
+        for order in orders:
+            order_id = str(order.get("id") or order.get("client_order_id") or "")
+            if not order_id or order_id in excluded:
+                continue
+            status = self._normalize_broker_status(order.get("status"))
+            if status is None:
+                continue
+            self._order_status_memory[order_id] = self._build_broker_order_status_entry(
+                order=order,
+                status=status,
+                observed_at=observed_at,
+                ignored_on_startup=self._should_ignore_terminal_baseline_order(
+                    order=order,
+                    status=status,
+                    observed_at=observed_at,
+                ),
+            )
+            changed = True
+
+        if changed:
+            self._persist_broker_order_status_memory()
+
     def _observe_broker_order_statuses(self, *, cycle_id: str) -> None:
         try:
             orders = self.broker.list_orders()
@@ -1271,20 +1515,42 @@ class AutoTrader:
 
         notifier = get_discord_notifier(self.settings)
         updates: list[dict[str, Any]] = []
+        observed_at = datetime.datetime.now(datetime.timezone.utc)
+        if not self._broker_status_baseline_synced:
+            if self.settings.broker_order_status_suppress_startup_replay:
+                self._seed_broker_order_status_memory_from_existing_orders(
+                    orders,
+                    observed_at=observed_at,
+                    exclude_order_ids=set(self._session_order_ids),
+                )
+            self._broker_status_baseline_synced = True
+
+        cache_dirty = False
         for order in orders:
             order_id = str(order.get("id") or order.get("client_order_id") or "")
             if not order_id:
                 continue
-            status = self._normalize_broker_status(str(order.get("status") or ""))
+            status = self._normalize_broker_status(order.get("status"))
             if status is None:
                 continue
 
             with self._state_lock:
-                previous = self._order_status_memory.get(order_id)
-                if previous == status:
+                previous = self._order_status_memory.get(order_id) or {}
+                previous_status = previous.get("status")
+                next_entry = self._build_broker_order_status_entry(
+                    order=order,
+                    status=status,
+                    observed_at=observed_at,
+                    ignored_on_startup=False,
+                )
+                if previous_status == status:
+                    next_entry["ignored_on_startup"] = bool(previous.get("ignored_on_startup", False))
+                    self._order_status_memory[order_id] = next_entry
+                    cache_dirty = True
                     self._broker_status_dedupe_suppressed += 1
                     continue
-                self._order_status_memory[order_id] = status
+                self._order_status_memory[order_id] = next_entry
+                cache_dirty = True
 
             updates.append(
                 {
@@ -1303,6 +1569,8 @@ class AutoTrader:
             ):
                 self._remember_notification_id(f"broker:{order_id}:{status}")
 
+        if cache_dirty:
+            self._persist_broker_order_status_memory()
         if updates:
             with self._state_lock:
                 self._latest_broker_order_status_updates.extend(updates)
@@ -1438,6 +1706,7 @@ class AutoTrader:
         signal: TradeSignal,
         *,
         cycle_id: str,
+        scan_bar_index: int | None = None,
         regime_snapshot: dict[str, Any] | None = None,
         ranked_opportunity: Any | None = None,
         news_features: dict[str, Any] | None = None,
@@ -1447,6 +1716,8 @@ class AutoTrader:
         position_state = self.portfolio.get_position_state(signal.symbol)
         signal.metrics.setdefault("signal_id", build_signal_id(signal.symbol, signal.strategy_name, signal.generated_at))
         signal.metrics["cycle_id"] = cycle_id
+        if scan_bar_index is not None:
+            signal.metrics["scan_bar_index"] = scan_bar_index
         signal.metrics["market_overview"] = dict(regime_snapshot or {})
         signal.metrics.setdefault("has_tracked_position", position_state["has_tracked_position"])
         signal.metrics.setdefault("has_sellable_long_position", position_state["has_sellable_long_position"])
@@ -1462,6 +1733,140 @@ class AutoTrader:
             signal.metrics["scan_tags"] = list(getattr(ranked_opportunity, "tags", []))
         if news_features:
             signal.metrics["news_features"] = dict(news_features)
+
+    def _strategy_signal_score(self, signal: TradeSignal) -> float:
+        metrics = signal.metrics or {}
+        return float(metrics.get("strategy_score") or signal.confidence_score or signal.strength or 0.0)
+
+    def _entry_ml_score(self, signal: TradeSignal) -> float:
+        ml_payload = (signal.metrics or {}).get("ml") or {}
+        score = ml_payload.get("score")
+        try:
+            return float(score) if score is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _risk_quality_adjustment(self, signal: TradeSignal) -> float:
+        metrics = signal.metrics or {}
+        reward_risk = float(metrics.get("reward_risk_ratio") or 0.0)
+        breakout_distance_atr = float(metrics.get("breakout_distance_atr") or 0.0)
+        spread_pct = float(metrics.get("spread_pct") or 0.0)
+        liquidity_score = float(signal.liquidity_score or 0.0)
+        extended_move = bool(metrics.get("extended_move"))
+        adjustment = 0.0
+        adjustment += max(0.0, min(0.4, (reward_risk - 1.0) * 0.2))
+        adjustment += max(-0.2, min(0.2, (0.4 - breakout_distance_atr) * 0.3))
+        adjustment += liquidity_score * 0.15
+        adjustment -= min(0.2, spread_pct * 10)
+        if extended_move:
+            adjustment -= 0.25
+        return adjustment
+
+    def _rank_buy_signals(self, buy_signals: list[TradeSignal]) -> list[TradeSignal]:
+        ranked_signals: list[TradeSignal] = []
+        for signal in buy_signals:
+            strategy_score = self._strategy_signal_score(signal)
+            entry_ml_score = self._entry_ml_score(signal)
+            risk_quality_adjustment = self._risk_quality_adjustment(signal)
+            combined_score = strategy_score + entry_ml_score + risk_quality_adjustment
+            if signal.metrics is None:
+                signal.metrics = {}
+            signal.metrics["buy_ranking"] = {
+                "strategy_score": strategy_score,
+                "entry_ml_score": entry_ml_score,
+                "risk_quality_adjustment": risk_quality_adjustment,
+                "combined_score": combined_score,
+            }
+            ranked_signals.append(signal)
+        return sorted(
+            ranked_signals,
+            key=lambda item: ((item.metrics or {}).get("buy_ranking") or {}).get("combined_score", 0.0),
+            reverse=True,
+        )
+
+    def _estimated_entry_notional(self, signal: TradeSignal, *, equity: float) -> float:
+        price = float(signal.entry_price or signal.price or 0.0)
+        if price <= 0:
+            return 0.0
+        reward_risk = float((signal.metrics or {}).get("reward_risk_ratio") or 1.0)
+        symbol_cap = equity * self.settings.max_symbol_allocation_pct
+        risk_budget = equity * self.settings.risk_per_trade_pct
+        stop_price = signal.stop_price
+        if stop_price is not None and price > stop_price:
+            stop_distance = price - float(stop_price)
+            if stop_distance > 0:
+                risk_budget = min(risk_budget / stop_distance * price, symbol_cap)
+        notional_cap = min(
+            self.settings.max_position_notional,
+            self.settings.effective_max_position_notional,
+            symbol_cap,
+            risk_budget if risk_budget > 0 else symbol_cap,
+        )
+        if reward_risk < 1.0:
+            notional_cap *= 0.5
+        return max(0.0, notional_cap)
+
+    def _select_ranked_buy_signals(self, buy_signals: list[TradeSignal]) -> list[TradeSignal]:
+        equity = float(self.risk_manager.get_account_snapshot()["equity"])
+        selected: list[TradeSignal] = []
+        selected_symbols: set[str] = set()
+        projected_symbol_exposure = {
+            symbol: abs(self.portfolio.position_market_value(symbol) or 0.0)
+            for symbol in self.portfolio.positions
+        }
+        projected_class_exposure = dict(self.portfolio.exposure_by_asset_class())
+        available_slots = max(0, self.settings.max_concurrent_positions - len(self.portfolio.positions))
+        new_slot_count = 0
+        active_symbol_cooldowns = {
+            item["symbol"]
+            for item in self.risk_manager.get_active_cooldowns().get("stop_out_symbols", [])
+        }
+
+        for signal in self._rank_buy_signals(buy_signals):
+            ranking = dict((signal.metrics or {}).get("buy_ranking") or {})
+            symbol = signal.symbol
+            asset_key = signal.asset_class.value
+            estimated_notional = self._estimated_entry_notional(signal, equity=equity)
+            ranking["estimated_notional"] = estimated_notional
+            selection_rule = "selected_by_rank"
+            selection_reason = "Candidate selected."
+            consumes_new_slot = symbol not in self.portfolio.positions
+
+            if symbol in selected_symbols:
+                selection_rule = "duplicate_same_cycle"
+                selection_reason = "Duplicate same-cycle entry blocked."
+            elif symbol in active_symbol_cooldowns:
+                selection_rule = "cooldown_active"
+                selection_reason = "Recent stop-out cooldown is active."
+            elif consumes_new_slot and new_slot_count >= available_slots:
+                selection_rule = "portfolio_exposure_limit"
+                selection_reason = "Portfolio max concurrent position limit reached for this cycle."
+            else:
+                symbol_cap = equity * self.settings.max_symbol_allocation_pct
+                class_cap = equity * self.settings.max_asset_class_allocation_pct.get(
+                    asset_key,
+                    self.settings.max_symbol_allocation_pct,
+                )
+                projected_symbol_total = projected_symbol_exposure.get(symbol, 0.0) + estimated_notional
+                projected_class_total = projected_class_exposure.get(asset_key, 0.0) + estimated_notional
+                if projected_symbol_total > symbol_cap:
+                    selection_rule = "portfolio_exposure_limit"
+                    selection_reason = "Per-symbol allocation cap would be exceeded."
+                elif projected_class_total > class_cap:
+                    selection_rule = "portfolio_exposure_limit"
+                    selection_reason = "Per-asset-class allocation cap would be exceeded."
+                else:
+                    selected.append(signal)
+                    selected_symbols.add(symbol)
+                    projected_symbol_exposure[symbol] = projected_symbol_total
+                    projected_class_exposure[asset_key] = projected_class_total
+                    if consumes_new_slot:
+                        new_slot_count += 1
+
+            ranking["selection_rule"] = selection_rule
+            ranking["selection_reason"] = selection_reason
+            signal.metrics["buy_ranking"] = ranking
+        return selected
 
     def _apply_ml_score_filter(
         self,
@@ -1604,7 +2009,10 @@ class AutoTrader:
             self._latest_skipped_reason = None
             self._latest_rejected_reason = None
             self._last_submitted_order = None
-            self._order_status_memory = {}
+            self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
+            self._session_order_ids = set()
+            self._broker_status_baseline_synced = False
+            self._order_status_memory = self._load_broker_order_status_memory()
             self._latest_broker_order_status_updates = []
             self._summary_dedupe_suppressed = 0
             self._broker_status_dedupe_suppressed = 0

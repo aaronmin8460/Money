@@ -46,6 +46,8 @@ class RiskManager:
         self.broker = broker
         self._symbol_cooldowns: dict[str, datetime] = {}
         self._strategy_cooldowns: dict[str, datetime] = {}
+        self._stop_out_cooldowns: dict[str, datetime] = {}
+        self._last_entry_times: dict[str, datetime] = {}
         self._recent_rejections: list[dict[str, Any]] = []
         self._latest_rejection: dict[str, Any] | None = None
 
@@ -123,9 +125,19 @@ class RiskManager:
             for strategy_name, expires_at in sorted(self._strategy_cooldowns.items())
             if expires_at > now
         ]
+        stop_out_cooldowns = [
+            {
+                "symbol": symbol,
+                "expires_at": expires_at.isoformat() + "Z",
+                "remaining_seconds": max(0.0, (expires_at - now).total_seconds()),
+            }
+            for symbol, expires_at in sorted(self._stop_out_cooldowns.items())
+            if expires_at > now
+        ]
         return {
             "symbols": symbol_cooldowns,
             "strategies": strategy_cooldowns,
+            "stop_out_symbols": stop_out_cooldowns,
         }
 
     def get_recent_rejections(self, limit: int = 10) -> list[dict[str, Any]]:
@@ -142,6 +154,8 @@ class RiskManager:
     def clear_runtime_state(self) -> None:
         self._symbol_cooldowns.clear()
         self._strategy_cooldowns.clear()
+        self._stop_out_cooldowns.clear()
+        self._last_entry_times.clear()
         self._recent_rejections.clear()
         self._latest_rejection = None
 
@@ -369,6 +383,28 @@ class RiskManager:
         if cooldown and datetime.utcnow() < cooldown:
             return RiskDecision(False, "Symbol cooldown is active.", rule="symbol_cooldown", details=decision_details)
 
+        stop_out_cooldown = self._stop_out_cooldowns.get(symbol.upper())
+        if increases_exposure and stop_out_cooldown and datetime.utcnow() < stop_out_cooldown:
+            return RiskDecision(
+                False,
+                "Recent stop-out cooldown is active for this symbol.",
+                rule="stop_out_cooldown",
+                details=decision_details,
+            )
+
+        if increases_exposure and self.settings.symbol_reentry_cooldown_minutes > 0:
+            last_entry_time = self._last_entry_times.get(symbol.upper())
+            if last_entry_time is not None:
+                elapsed_seconds = (datetime.utcnow() - last_entry_time).total_seconds()
+                cooldown_seconds = self.settings.symbol_reentry_cooldown_minutes * 60
+                if elapsed_seconds < cooldown_seconds:
+                    return RiskDecision(
+                        False,
+                        "Minimum time between successive buys on this symbol has not elapsed.",
+                        rule="symbol_reentry_cooldown",
+                        details=decision_details,
+                    )
+
         if strategy_name:
             strategy_key = strategy_name.lower()
             strategy_cooldown = self._strategy_cooldowns.get(strategy_key)
@@ -437,6 +473,34 @@ class RiskManager:
                 )
 
             class_exposure = self._decimal(self.portfolio.exposure_by_asset_class().get(resolved_asset_class.value, 0.0))
+            symbol_position = self.portfolio.get_position(symbol)
+            symbol_exposure = self._decimal(abs(self.portfolio.position_market_value(symbol) or 0.0))
+            symbol_allocation_limit = self._round_money(
+                self._decimal(account["equity"]) * self._decimal(self.settings.max_symbol_allocation_pct)
+            )
+            if symbol_exposure + order_notional > symbol_allocation_limit:
+                return RiskDecision(
+                    False,
+                    "Symbol allocation percentage limit would be exceeded.",
+                    rule="symbol_allocation",
+                    details=decision_details,
+                )
+
+            class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
+                resolved_asset_class.value,
+                self.settings.max_symbol_allocation_pct,
+            )
+            class_allocation_limit = self._round_money(
+                self._decimal(account["equity"]) * self._decimal(class_allocation_pct)
+            )
+            if class_exposure + order_notional > class_allocation_limit:
+                return RiskDecision(
+                    False,
+                    "Asset-class allocation percentage limit would be exceeded.",
+                    rule="asset_class_allocation_pct",
+                    details=decision_details,
+                )
+
             class_limit = self._decimal(
                 self.settings.max_notional_per_asset_class.get(
                     resolved_asset_class.value,
@@ -545,13 +609,33 @@ class RiskManager:
 
         return RiskDecision(True, "Order approved by risk manager.", rule="approved", details=decision_details)
 
-    def mark_executed(self, symbol: str, strategy_name: str | None = None) -> None:
-        self._symbol_cooldowns[symbol.upper()] = datetime.utcnow() + timedelta(
+    def mark_executed(
+        self,
+        symbol: str,
+        strategy_name: str | None = None,
+        *,
+        order_intent: str | None = None,
+        exit_stage: str | None = None,
+        trade_pnl: float | None = None,
+    ) -> None:
+        now = datetime.utcnow()
+        self._symbol_cooldowns[symbol.upper()] = now + timedelta(
             seconds=self.settings.cooldown_seconds_per_symbol
         )
         if strategy_name:
-            self._strategy_cooldowns[strategy_name.lower()] = datetime.utcnow() + timedelta(
+            self._strategy_cooldowns[strategy_name.lower()] = now + timedelta(
                 seconds=self.settings.cooldown_seconds_per_strategy
+            )
+        if order_intent in ENTRY_ORDER_INTENTS:
+            self._last_entry_times[symbol.upper()] = now
+        if (
+            order_intent in EXIT_ORDER_INTENTS
+            and self.settings.symbol_reentry_cooldown_minutes > 0
+            and exit_stage in {"stop", "trail", "break_even_stop", "emergency", "time_stop"}
+            and (trade_pnl is None or trade_pnl <= 0)
+        ):
+            self._stop_out_cooldowns[symbol.upper()] = now + timedelta(
+                minutes=self.settings.symbol_reentry_cooldown_minutes
             )
 
     def _asset_class_enabled(self, asset_class: AssetClass) -> bool:

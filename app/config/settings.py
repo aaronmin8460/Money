@@ -123,12 +123,27 @@ class Settings(BaseSettings):
     discord_notify_rejections: bool = Field(True, env="DISCORD_NOTIFY_REJECTIONS")
     discord_notify_errors: bool = Field(True, env="DISCORD_NOTIFY_ERRORS")
     discord_notify_start_stop: bool = Field(True, env="DISCORD_NOTIFY_START_STOP")
+    discord_dedupe_ttl_seconds: float = Field(45.0, env="DISCORD_DEDUPE_TTL_SECONDS")
+    broker_order_status_cache_path: str = Field(
+        "logs/broker_order_status_memory.json",
+        env="BROKER_ORDER_STATUS_CACHE_PATH",
+    )
+    broker_order_status_suppress_startup_replay: bool = Field(
+        True,
+        env="BROKER_ORDER_STATUS_SUPPRESS_STARTUP_REPLAY",
+    )
+    broker_order_status_ignore_terminal_older_than_minutes: int = Field(
+        180,
+        env="BROKER_ORDER_STATUS_IGNORE_TERMINAL_OLDER_THAN_MINUTES",
+    )
     max_risk_per_trade: float = Field(0.01, env="MAX_RISK_PER_TRADE")
+    risk_per_trade_pct: float = Field(0.01, env="RISK_PER_TRADE_PCT")
     max_daily_loss: float = Field(2_000.0, env="MAX_DAILY_LOSS")
     max_daily_loss_pct: float = Field(0.02, env="MAX_DAILY_LOSS_PCT")
     max_drawdown_pct: float = Field(0.10, env="MAX_DRAWDOWN_PCT")
     max_positions: int = Field(3, env="MAX_POSITIONS")
     max_positions_total: int = Field(3, env="MAX_POSITIONS_TOTAL")
+    max_concurrent_positions: int = Field(3, env="MAX_CONCURRENT_POSITIONS")
     max_positions_per_asset_class: dict[str, int] = Field(
         default_factory=lambda: {
             AssetClass.EQUITY.value: 3,
@@ -156,6 +171,16 @@ class Settings(BaseSettings):
     alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
     max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
     position_notional_buffer_pct: float = Field(0.995, env="POSITION_NOTIONAL_BUFFER_PCT")
+    max_symbol_allocation_pct: float = Field(0.10, env="MAX_SYMBOL_ALLOCATION_PCT")
+    max_asset_class_allocation_pct: dict[str, float] = Field(
+        default_factory=lambda: {
+            AssetClass.EQUITY.value: 0.35,
+            AssetClass.ETF.value: 0.35,
+            AssetClass.CRYPTO.value: 0.15,
+            AssetClass.OPTION.value: 0.05,
+        },
+        env="MAX_ASSET_CLASS_ALLOCATION_PCT",
+    )
     entry_tranches: int = Field(3, env="ENTRY_TRANCHES")
     entry_tranche_weights: Annotated[list[float], NoDecode] = Field(
         default_factory=lambda: [0.4, 0.3, 0.3],
@@ -180,8 +205,22 @@ class Settings(BaseSettings):
     max_correlated_positions: int = Field(2, env="MAX_CORRELATED_POSITIONS")
     cooldown_seconds_per_symbol: int = Field(300, env="COOLDOWN_SECONDS_PER_SYMBOL")
     cooldown_seconds_per_strategy: int = Field(180, env="COOLDOWN_SECONDS_PER_STRATEGY")
+    symbol_reentry_cooldown_minutes: int = Field(0, env="SYMBOL_REENTRY_COOLDOWN_MINUTES")
     take_profit_pct: float = Field(0.05, env="TAKE_PROFIT_PCT")
     stop_loss_atr_multiplier: float = Field(2.0, env="STOP_LOSS_ATR_MULTIPLIER")
+    enable_partial_exits: bool = Field(True, env="ENABLE_PARTIAL_EXITS")
+    partial_take_profit_levels: Annotated[list[float], NoDecode] = Field(
+        default_factory=lambda: [1.0, 2.0],
+        env="PARTIAL_TAKE_PROFIT_LEVELS",
+    )
+    partial_take_profit_fractions: Annotated[list[float], NoDecode] = Field(
+        default_factory=lambda: [0.5, 1.0],
+        env="PARTIAL_TAKE_PROFIT_FRACTIONS",
+    )
+    break_even_after_r_multiple: float = Field(1.0, env="BREAK_EVEN_AFTER_R_MULTIPLE")
+    trailing_stop_mode: str = Field("atr", env="TRAILING_STOP_MODE")
+    trailing_stop_atr_multiple: float = Field(2.5, env="TRAILING_STOP_ATR_MULTIPLE")
+    time_stop_bars: int = Field(20, env="TIME_STOP_BARS")
     allow_extended_hours: bool = Field(False, env="ALLOW_EXTENDED_HOURS")
     kill_switch_enabled: bool = Field(False, env="KILL_SWITCH_ENABLED")
     short_selling_enabled: bool = Field(False, env="SHORT_SELLING_ENABLED")
@@ -233,16 +272,29 @@ class Settings(BaseSettings):
     )
     prefer_primary_crypto_quotes: bool = Field(True, env="PREFER_PRIMARY_CRYPTO_QUOTES")
     ml_enabled: bool = Field(False, env="ML_ENABLED")
+    entry_model_enabled: bool = Field(True, env="ENTRY_MODEL_ENABLED")
+    exit_model_enabled: bool = Field(False, env="EXIT_MODEL_ENABLED")
     ml_model_type: str = Field("logistic_regression", env="ML_MODEL_TYPE")
     ml_min_score_threshold: float = Field(0.55, env="ML_MIN_SCORE_THRESHOLD")
+    ml_exit_min_score: float = Field(0.55, env="ML_EXIT_MIN_SCORE")
     ml_min_train_rows: int = Field(50, env="ML_MIN_TRAIN_ROWS")
     ml_retrain_enabled: bool = Field(False, env="ML_RETRAIN_ENABLED")
+    ml_entry_min_auc: float = Field(0.55, env="ML_ENTRY_MIN_AUC")
+    ml_entry_min_precision: float = Field(0.50, env="ML_ENTRY_MIN_PRECISION")
     ml_promotion_min_auc: float = Field(0.55, env="ML_PROMOTION_MIN_AUC")
     ml_promotion_min_precision: float = Field(0.50, env="ML_PROMOTION_MIN_PRECISION")
     ml_promotion_min_winrate_lift: float = Field(0.00, env="ML_PROMOTION_MIN_WINRATE_LIFT")
+    ml_promotion_min_profit_factor: float = Field(1.05, env="ML_PROMOTION_MIN_PROFIT_FACTOR")
+    ml_promotion_max_drawdown: float = Field(0.20, env="ML_PROMOTION_MAX_DRAWDOWN")
+    ml_promotion_min_expectancy: float = Field(0.0, env="ML_PROMOTION_MIN_EXPECTANCY")
+    walk_forward_enabled: bool = Field(True, env="WALK_FORWARD_ENABLED")
     model_dir: str = Field("models", env="MODEL_DIR")
     ml_current_model_path: str = Field("models/current_model.joblib", env="ML_CURRENT_MODEL_PATH")
     ml_candidate_model_path: str = Field("models/candidate_model.joblib", env="ML_CANDIDATE_MODEL_PATH")
+    ml_entry_current_model_path: str = Field("models/current_model.joblib", env="ML_ENTRY_CURRENT_MODEL_PATH")
+    ml_entry_candidate_model_path: str = Field("models/candidate_model.joblib", env="ML_ENTRY_CANDIDATE_MODEL_PATH")
+    ml_exit_current_model_path: str = Field("models/current_exit_model.joblib", env="ML_EXIT_CURRENT_MODEL_PATH")
+    ml_exit_candidate_model_path: str = Field("models/candidate_exit_model.joblib", env="ML_EXIT_CANDIDATE_MODEL_PATH")
     ml_registry_path: str = Field("models/registry.json", env="ML_REGISTRY_PATH")
     news_features_enabled: bool = Field(False, env="NEWS_FEATURES_ENABLED")
     news_rss_enabled: bool = Field(False, env="NEWS_RSS_ENABLED")
@@ -382,6 +434,10 @@ class Settings(BaseSettings):
     def parse_entry_tranche_weights(cls, value: str | list[float] | list[str]) -> list[float]:
         return _parse_numeric_list(value, "ENTRY_TRANCHE_WEIGHTS")
 
+    @field_validator("partial_take_profit_levels", "partial_take_profit_fractions", mode="before")
+    def parse_partial_exit_lists(cls, value: str | list[float] | list[str], info: ValidationInfo) -> list[float]:
+        return _parse_numeric_list(value, info.field_name.upper())
+
     @field_validator("discord_webhook_url", mode="before")
     def parse_discord_webhook_url(cls, value: str | None) -> str | None:
         if isinstance(value, str) and not value.strip():
@@ -411,6 +467,7 @@ class Settings(BaseSettings):
         "max_positions_per_asset_class",
         "scan_interval_seconds_by_asset_class",
         "max_notional_per_asset_class",
+        "max_asset_class_allocation_pct",
         "strategy_switches",
         "active_strategy_by_asset_class",
         mode="before",
@@ -447,6 +504,10 @@ class Settings(BaseSettings):
 
         if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
             raise ValueError("POSITION_NOTIONAL_BUFFER_PCT must be greater than 0 and less than or equal to 1.")
+        if not 0 < self.discord_dedupe_ttl_seconds:
+            raise ValueError("DISCORD_DEDUPE_TTL_SECONDS must be greater than 0.")
+        if self.broker_order_status_ignore_terminal_older_than_minutes < 0:
+            raise ValueError("BROKER_ORDER_STATUS_IGNORE_TERMINAL_OLDER_THAN_MINUTES must be >= 0.")
         if self.quote_stale_after_seconds < 0:
             raise ValueError("QUOTE_STALE_AFTER_SECONDS must be >= 0.")
         if self.entry_tranches <= 0:
@@ -462,6 +523,29 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"ENTRY_TRANCHE_WEIGHTS must sum to 1.0 (got {total_weight:.6f})."
             )
+        if self.max_symbol_allocation_pct <= 0 or self.max_symbol_allocation_pct > 1:
+            raise ValueError("MAX_SYMBOL_ALLOCATION_PCT must be between 0 and 1.")
+        if any(value <= 0 or value > 1 for value in self.max_asset_class_allocation_pct.values()):
+            raise ValueError("MAX_ASSET_CLASS_ALLOCATION_PCT values must each be between 0 and 1.")
+        if self.symbol_reentry_cooldown_minutes < 0:
+            raise ValueError("SYMBOL_REENTRY_COOLDOWN_MINUTES must be >= 0.")
+        if not self.partial_take_profit_levels:
+            raise ValueError("PARTIAL_TAKE_PROFIT_LEVELS must not be empty.")
+        if len(self.partial_take_profit_levels) != len(self.partial_take_profit_fractions):
+            raise ValueError("PARTIAL_TAKE_PROFIT_LEVELS and PARTIAL_TAKE_PROFIT_FRACTIONS must have matching lengths.")
+        if any(level <= 0 for level in self.partial_take_profit_levels):
+            raise ValueError("PARTIAL_TAKE_PROFIT_LEVELS must contain only positive values.")
+        if any(fraction <= 0 or fraction > 1 for fraction in self.partial_take_profit_fractions):
+            raise ValueError("PARTIAL_TAKE_PROFIT_FRACTIONS values must be between 0 and 1.")
+        if self.break_even_after_r_multiple < 0:
+            raise ValueError("BREAK_EVEN_AFTER_R_MULTIPLE must be >= 0.")
+        self.trailing_stop_mode = self.trailing_stop_mode.strip().lower()
+        if self.trailing_stop_mode not in {"none", "atr", "static"}:
+            raise ValueError("TRAILING_STOP_MODE must be one of: none, atr, static.")
+        if self.trailing_stop_atr_multiple < 0:
+            raise ValueError("TRAILING_STOP_ATR_MULTIPLE must be >= 0.")
+        if self.time_stop_bars < 0:
+            raise ValueError("TIME_STOP_BARS must be >= 0.")
         self.scale_in_mode = self.scale_in_mode.strip().lower()
         if self.scale_in_mode not in {"confirmation", "time", "momentum"}:
             raise ValueError("SCALE_IN_MODE must be one of: confirmation, time, momentum.")
@@ -471,12 +555,22 @@ class Settings(BaseSettings):
             raise ValueError("ML_MODEL_TYPE must be one of: logistic_regression, xgboost.")
         if not 0 <= self.ml_min_score_threshold <= 1:
             raise ValueError("ML_MIN_SCORE_THRESHOLD must be between 0 and 1.")
+        if not 0 <= self.ml_exit_min_score <= 1:
+            raise ValueError("ML_EXIT_MIN_SCORE must be between 0 and 1.")
         if self.ml_min_train_rows < 1:
             raise ValueError("ML_MIN_TRAIN_ROWS must be >= 1.")
+        if not 0 <= self.ml_entry_min_auc <= 1:
+            raise ValueError("ML_ENTRY_MIN_AUC must be between 0 and 1.")
+        if not 0 <= self.ml_entry_min_precision <= 1:
+            raise ValueError("ML_ENTRY_MIN_PRECISION must be between 0 and 1.")
         if not 0 <= self.ml_promotion_min_auc <= 1:
             raise ValueError("ML_PROMOTION_MIN_AUC must be between 0 and 1.")
         if not 0 <= self.ml_promotion_min_precision <= 1:
             raise ValueError("ML_PROMOTION_MIN_PRECISION must be between 0 and 1.")
+        if self.ml_promotion_min_profit_factor < 0:
+            raise ValueError("ML_PROMOTION_MIN_PROFIT_FACTOR must be >= 0.")
+        if not 0 <= self.ml_promotion_max_drawdown <= 1:
+            raise ValueError("ML_PROMOTION_MAX_DRAWDOWN must be between 0 and 1.")
         if self.news_max_headlines_per_ticker < 1:
             raise ValueError("NEWS_MAX_HEADLINES_PER_TICKER must be >= 1.")
         if self.news_lookback_hours < 1:
@@ -518,6 +612,24 @@ class Settings(BaseSettings):
             self.max_position_notional = resolved_notional_cap
         if self.max_positions_total != self.max_positions:
             self.max_positions = self.max_positions_total
+        if self.max_concurrent_positions != self.max_positions_total:
+            resolved_positions_cap = min(self.max_concurrent_positions, self.max_positions_total)
+            self.max_concurrent_positions = resolved_positions_cap
+            self.max_positions_total = resolved_positions_cap
+            self.max_positions = resolved_positions_cap
+        if self.risk_per_trade_pct != self.max_risk_per_trade:
+            if self.risk_per_trade_pct != 0.01:
+                self.max_risk_per_trade = self.risk_per_trade_pct
+            else:
+                self.risk_per_trade_pct = self.max_risk_per_trade
+        if self.ml_entry_current_model_path != "models/current_model.joblib":
+            self.ml_current_model_path = self.ml_entry_current_model_path
+        elif self.ml_current_model_path != "models/current_model.joblib":
+            self.ml_entry_current_model_path = self.ml_current_model_path
+        if self.ml_entry_candidate_model_path != "models/candidate_model.joblib":
+            self.ml_candidate_model_path = self.ml_entry_candidate_model_path
+        elif self.ml_candidate_model_path != "models/candidate_model.joblib":
+            self.ml_entry_candidate_model_path = self.ml_candidate_model_path
         return self
 
     def strategy_for_asset_class(self, asset_class: AssetClass | str) -> str:

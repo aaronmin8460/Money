@@ -20,13 +20,47 @@ def _default_registry() -> dict[str, Any]:
         "current_model": None,
         "candidate_model": None,
         "previous_current_model": None,
+        "models": {
+            "entry": {
+                "current_model": None,
+                "candidate_model": None,
+                "previous_current_model": None,
+            },
+            "exit": {
+                "current_model": None,
+                "candidate_model": None,
+                "previous_current_model": None,
+            },
+        },
         "model_type": None,
         "feature_version": FEATURE_VERSION,
         "train_rows": 0,
         "validation_rows": 0,
         "metrics": {},
+        "trading_metrics": {},
+        "evaluation": {},
         "notes": "",
     }
+
+
+def _ensure_model_sections(payload: dict[str, Any]) -> dict[str, Any]:
+    payload.setdefault("models", {})
+    for purpose in ("entry", "exit"):
+        payload["models"].setdefault(
+            purpose,
+            {
+                "current_model": None,
+                "candidate_model": None,
+                "previous_current_model": None,
+            },
+        )
+    if payload.get("current_model") is not None:
+        payload["models"]["entry"]["current_model"] = payload.get("current_model")
+    if payload.get("candidate_model") is not None:
+        payload["models"]["entry"]["candidate_model"] = payload.get("candidate_model")
+    if payload.get("previous_current_model") is not None:
+        payload["models"]["entry"]["previous_current_model"] = payload.get("previous_current_model")
+    return payload
 
 
 def initialize_registry(path: str | Path) -> dict[str, Any]:
@@ -49,7 +83,7 @@ def load_registry(path: str | Path) -> dict[str, Any]:
         payload = _default_registry()
     for key, value in _default_registry().items():
         payload.setdefault(key, value)
-    return payload
+    return _ensure_model_sections(payload)
 
 
 def save_registry(path: str | Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -68,10 +102,12 @@ def update_candidate(
     train_rows: int,
     validation_rows: int,
     metrics: dict[str, Any],
+    trading_metrics: dict[str, Any] | None = None,
     notes: str = "",
+    model_purpose: str = "entry",
 ) -> dict[str, Any]:
     registry = load_registry(path)
-    registry["candidate_model"] = {
+    candidate_payload = {
         "path": model_path,
         "created_at": _utc_now(),
         "model_type": model_type,
@@ -79,14 +115,20 @@ def update_candidate(
         "train_rows": train_rows,
         "validation_rows": validation_rows,
         "metrics": metrics,
+        "trading_metrics": trading_metrics or {},
         "notes": notes,
     }
-    registry["model_type"] = model_type
-    registry["feature_version"] = feature_version
-    registry["train_rows"] = train_rows
-    registry["validation_rows"] = validation_rows
-    registry["metrics"] = metrics
-    registry["notes"] = notes
+    purpose = model_purpose.strip().lower()
+    registry["models"][purpose]["candidate_model"] = candidate_payload
+    if purpose == "entry":
+        registry["candidate_model"] = candidate_payload
+        registry["model_type"] = model_type
+        registry["feature_version"] = feature_version
+        registry["train_rows"] = train_rows
+        registry["validation_rows"] = validation_rows
+        registry["metrics"] = metrics
+        registry["trading_metrics"] = trading_metrics or {}
+        registry["notes"] = notes
     registry["promoted"] = False
     return save_registry(path, registry)
 
@@ -97,9 +139,11 @@ def promote_candidate(
     current_model_path: str | Path,
     candidate_model_path: str | Path,
     notes: str = "",
+    model_purpose: str = "entry",
 ) -> dict[str, Any]:
     registry = load_registry(path)
-    candidate = registry.get("candidate_model")
+    purpose = model_purpose.strip().lower()
+    candidate = registry["models"].get(purpose, {}).get("candidate_model")
     if not candidate:
         return registry
 
@@ -109,22 +153,35 @@ def promote_candidate(
     if candidate_path.exists():
         shutil.copy2(candidate_path, current_path)
 
-    registry["previous_current_model"] = registry.get("current_model")
-    registry["current_model"] = {
+    promoted_payload = {
         **candidate,
         "path": str(current_path),
         "promoted_at": _utc_now(),
         "notes": notes or candidate.get("notes") or "",
     }
-    registry["candidate_model"] = None
+    registry["models"][purpose]["previous_current_model"] = registry["models"].get(purpose, {}).get("current_model")
+    registry["models"][purpose]["current_model"] = promoted_payload
+    registry["models"][purpose]["candidate_model"] = None
+    if purpose == "entry":
+        registry["previous_current_model"] = registry.get("current_model")
+        registry["current_model"] = promoted_payload
+        registry["candidate_model"] = None
     registry["promoted"] = True
     registry["notes"] = notes or registry.get("notes") or ""
     return save_registry(path, registry)
 
 
-def rollback_candidate(path: str | Path, *, notes: str = "") -> dict[str, Any]:
+def rollback_candidate(path: str | Path, *, notes: str = "", model_purpose: str | None = None) -> dict[str, Any]:
     registry = load_registry(path)
-    registry["candidate_model"] = None
+    if model_purpose is None:
+        registry["candidate_model"] = None
+        registry["models"]["entry"]["candidate_model"] = None
+        registry["models"]["exit"]["candidate_model"] = None
+    else:
+        purpose = model_purpose.strip().lower()
+        registry["models"][purpose]["candidate_model"] = None
+        if purpose == "entry":
+            registry["candidate_model"] = None
     registry["promoted"] = False
     if notes:
         registry["notes"] = notes
@@ -136,6 +193,7 @@ def rollback_current(path: str | Path, *, notes: str = "") -> dict[str, Any]:
     previous_current = registry.get("previous_current_model")
     if previous_current:
         registry["current_model"] = previous_current
+        registry["models"]["entry"]["current_model"] = previous_current
     registry["promoted"] = False
     if notes:
         registry["notes"] = notes

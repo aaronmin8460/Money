@@ -475,6 +475,9 @@ class DiscordNotifier:
     def enabled(self) -> bool:
         return self.settings.discord_notifications_enabled and bool(self.settings.discord_webhook_url)
 
+    def __post_init__(self) -> None:
+        self.dedupe_ttl_seconds = float(self.settings.discord_dedupe_ttl_seconds)
+
     def send_trade_notification(
         self,
         *,

@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from app.ml.evaluation import evaluate_predictions
+from app.ml.evaluation import calibrate_threshold, evaluate_rows, walk_forward_split
 from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, feature_dict
 from app.ml.preprocessing import prepare_feature_frame
 from app.ml.schema import FEATURE_VERSION
@@ -34,7 +34,14 @@ def load_model_bundle(path: str | Path) -> dict[str, Any]:
         return pickle.load(handle)
 
 
-def _split_rows(rows: list[dict[str, Any]], validation_ratio: float = 0.2) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _split_rows(
+    rows: list[dict[str, Any]],
+    validation_ratio: float = 0.2,
+    *,
+    walk_forward_enabled: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if walk_forward_enabled:
+        return walk_forward_split(rows, validation_ratio=validation_ratio)
     shuffled = list(rows)
     random.Random(42).shuffle(shuffled)
     validation_size = max(1, int(len(shuffled) * validation_ratio))
@@ -51,8 +58,16 @@ def train_model(
     model_type: str = "logistic_regression",
     min_train_rows: int = 50,
     threshold: float = 0.5,
+    purpose: str = "entry",
+    walk_forward_enabled: bool = False,
+    min_precision: float = 0.0,
 ) -> dict[str, Any]:
-    labeled_rows = [feature_dict(row) for row in rows if feature_dict(row).get("label") in {0, 1}]
+    labeled_rows = [
+        feature_dict(row)
+        for row in rows
+        if feature_dict(row).get("label") in {0, 1}
+        and str(feature_dict(row).get("model_purpose") or "entry") == purpose
+    ]
     if len(labeled_rows) < min_train_rows:
         return {
             "trained": False,
@@ -111,11 +126,10 @@ def train_model(
     else:
         estimator = LogisticRegression(max_iter=500, class_weight="balanced")
 
-    train_rows, validation_rows = _split_rows(labeled_rows)
+    train_rows, validation_rows = _split_rows(labeled_rows, walk_forward_enabled=walk_forward_enabled)
     train_frame = prepare_feature_frame(train_rows).frame
     validation_frame = prepare_feature_frame(validation_rows).frame
     y_train = [int(row["label"]) for row in train_rows]
-    y_validation = [int(row["label"]) for row in validation_rows]
 
     preprocessor = ColumnTransformer(
         transformers=[
@@ -152,10 +166,21 @@ def train_model(
         float(row[1])
         for row in pipeline.predict_proba(validation_frame[CATEGORICAL_FEATURES + NUMERIC_FEATURES])
     ]
-    metrics = evaluate_predictions(y_validation, validation_scores, threshold=threshold)
+    calibration = calibrate_threshold(
+        [int(row["label"]) for row in validation_rows],
+        validation_scores,
+        outcome_returns=[
+            row.get("realized_return", row.get("forward_return", row.get("risk_adjusted_return")))
+            for row in validation_rows
+        ],
+        min_precision=min_precision,
+    )
+    threshold = float(calibration["threshold"])
+    metrics = evaluate_rows(validation_rows, validation_scores, threshold=threshold)
     bundle = {
         "model": pipeline,
         "model_type": selected_type,
+        "purpose": purpose,
         "feature_version": FEATURE_VERSION,
         "categorical_features": list(CATEGORICAL_FEATURES),
         "numeric_features": list(NUMERIC_FEATURES),

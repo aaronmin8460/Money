@@ -282,6 +282,12 @@ class ExecutionService:
         self.portfolio.mark_to_market({proposal.symbol: price})
         executed_order = self.broker.submit_order(proposal)
         if not proposal.is_dry_run:
+            existing_position = self.portfolio.get_position(proposal.symbol)
+            trade_pnl = None
+            if existing_position is not None and signal.order_intent == "long_exit":
+                trade_pnl = (price - existing_position.entry_price) * min(existing_position.quantity, proposal.quantity or 0.0)
+            elif existing_position is not None and signal.order_intent == "short_exit":
+                trade_pnl = (existing_position.entry_price - price) * min(existing_position.quantity, proposal.quantity or 0.0)
             self.portfolio.update_position(
                 proposal.symbol,
                 proposal.side if isinstance(proposal.side, str) else str(proposal.side),
@@ -294,7 +300,13 @@ class ExecutionService:
                 exit_stage=signal.exit_stage,
                 signal_metadata=self._build_position_signal_metadata(signal),
             )
-            self.risk_manager.mark_executed(proposal.symbol, signal.strategy_name)
+            self.risk_manager.mark_executed(
+                proposal.symbol,
+                signal.strategy_name,
+                order_intent=signal.order_intent,
+                exit_stage=signal.exit_stage,
+                trade_pnl=trade_pnl,
+            )
             self._record_post_execution_state(signal, proposal, price, asset_class)
         self._persist_order(signal, proposal, executed_order)
 
@@ -388,10 +400,15 @@ class ExecutionService:
             "stop_price": signal.stop_price,
             "target_price": signal.target_price,
             "trailing_stop": signal.trailing_stop,
+            "atr": signal.atr,
             "current_stop": metrics.get("current_stop"),
             "next_stop": metrics.get("next_stop"),
             "tp1_price": metrics.get("tp1_price"),
             "tp2_price": metrics.get("tp2_price"),
+            "hit_target_stages": list(metrics.get("hit_target_stages") or []),
+            "entry_scan_bar_index": metrics.get("scan_bar_index"),
+            "strategy_score": metrics.get("strategy_score"),
+            "reward_risk_ratio": metrics.get("reward_risk_ratio"),
         }
 
     def _attempt_risk_compliant_sizing(
@@ -741,14 +758,79 @@ class ExecutionService:
                 metadata={"sizing": sizing_details},
             )
 
+        account = self.risk_manager.get_account_snapshot()
+        equity = self._decimal(account["equity"])
+        current_total_exposure = self._decimal(self.portfolio.exposure())
+        current_class_exposure = self._decimal(self.portfolio.exposure_by_asset_class().get(asset_class.value, 0.0))
+        symbol_exposure = self._decimal(abs(self.portfolio.position_market_value(signal.symbol) or 0.0))
+        remaining_total_exposure = max(
+            Decimal("0"),
+            self._decimal(self.settings.max_total_exposure) - current_total_exposure,
+        )
+        symbol_allocation_cap = self._round_money(
+            equity * self._decimal(self.settings.max_symbol_allocation_pct)
+        )
+        class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
+            asset_class.value,
+            self.settings.max_symbol_allocation_pct,
+        )
+        class_allocation_cap = self._round_money(equity * self._decimal(class_allocation_pct))
+        remaining_symbol_allocation = max(Decimal("0"), symbol_allocation_cap - symbol_exposure)
+        remaining_class_allocation = max(Decimal("0"), class_allocation_cap - current_class_exposure)
+        remaining_slots = max(
+            1,
+            self.settings.max_concurrent_positions - (
+                len(self.portfolio.positions)
+                if bool(scale_in_meta.get("tranche_consumes_new_slot", True))
+                else max(0, len(self.portfolio.positions) - 1)
+            ),
+        )
+        slot_budget = self._round_money(remaining_total_exposure / self._decimal(remaining_slots))
+        risk_per_trade_budget = self._round_money(
+            equity * self._decimal(self.settings.risk_per_trade_pct)
+        )
+        risk_notional_cap = None
+        if signal.stop_price is not None:
+            stop_distance = (
+                self._decimal(signal.stop_price) - rounded_price
+                if signal.order_intent == "short_entry"
+                else rounded_price - self._decimal(signal.stop_price)
+            )
+            if stop_distance > 0:
+                risk_quantity_cap = risk_per_trade_budget / stop_distance
+                risk_notional_cap = self._round_money(risk_quantity_cap * rounded_price)
+
         if signal.position_size is not None and signal.position_size > 0:
             raw_quantity = self._decimal(signal.position_size)
-            requested_notional_cap = hard_max_notional
+            requested_notional_cap = max(
+                Decimal("0"),
+                min(
+                    hard_max_notional,
+                    effective_max_notional,
+                    remaining_total_exposure if remaining_total_exposure > 0 else effective_max_notional,
+                    remaining_symbol_allocation if remaining_symbol_allocation > 0 else symbol_allocation_cap,
+                    remaining_class_allocation if remaining_class_allocation > 0 else class_allocation_cap,
+                    slot_budget if slot_budget > 0 else effective_max_notional,
+                    risk_notional_cap if risk_notional_cap is not None and risk_notional_cap > 0 else hard_max_notional,
+                ),
+            )
         else:
             planned_tranche_notional = self._decimal(
                 scale_in_meta.get("next_tranche_notional", float(self._round_money(effective_max_notional)))
             )
-            requested_notional_cap = max(Decimal("0"), min(planned_tranche_notional, effective_max_notional, hard_max_notional))
+            requested_notional_cap = max(
+                Decimal("0"),
+                min(
+                    planned_tranche_notional,
+                    effective_max_notional,
+                    hard_max_notional,
+                    remaining_total_exposure if remaining_total_exposure > 0 else effective_max_notional,
+                    remaining_symbol_allocation if remaining_symbol_allocation > 0 else symbol_allocation_cap,
+                    remaining_class_allocation if remaining_class_allocation > 0 else class_allocation_cap,
+                    slot_budget if slot_budget > 0 else effective_max_notional,
+                    risk_notional_cap if risk_notional_cap is not None and risk_notional_cap > 0 else hard_max_notional,
+                ),
+            )
             raw_quantity = requested_notional_cap / max(rounded_price, Decimal("0.000001"))
 
         clamp_result = self.clamp_order_to_notional_cap(
@@ -768,6 +850,12 @@ class ExecutionService:
                 "max_allowed_notional": float(self._round_money(requested_notional_cap)),
                 "quantity_reduced_to_fit_cap": bool(clamp_result["quantity_reduced_to_fit_cap"]),
                 "quantity_reduction_steps": int(clamp_result["reduction_steps"]),
+                "risk_per_trade_budget": float(risk_per_trade_budget),
+                "risk_notional_cap": float(self._round_money(risk_notional_cap)) if risk_notional_cap is not None else None,
+                "remaining_symbol_allocation": float(self._round_money(remaining_symbol_allocation)),
+                "remaining_asset_class_allocation": float(self._round_money(remaining_class_allocation)),
+                "remaining_total_exposure": float(self._round_money(remaining_total_exposure)),
+                "slot_budget": float(self._round_money(slot_budget)),
             }
         )
         remaining_allocation_before = self._decimal(scale_in_meta.get("remaining_allocation", 0.0))
@@ -814,11 +902,27 @@ class ExecutionService:
         asset_class: AssetClass,
         price: float,
     ) -> dict[str, Any]:
+        account = self.risk_manager.get_account_snapshot()
+        equity = self._decimal(account["equity"])
+        symbol_allocation_cap = self._round_money(
+            equity * self._decimal(self.settings.max_symbol_allocation_pct)
+        )
+        class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
+            asset_class.value,
+            self.settings.max_symbol_allocation_pct,
+        )
+        class_allocation_cap = self._round_money(equity * self._decimal(class_allocation_pct))
+        current_class_exposure = self._decimal(
+            self.portfolio.exposure_by_asset_class().get(asset_class.value, 0.0)
+        )
+        remaining_class_allocation = max(Decimal("0"), class_allocation_cap - current_class_exposure)
         total_target_notional = float(
             self._round_money(
                 min(
                     self._decimal(self.settings.max_position_notional),
                     self._decimal(self.settings.effective_max_position_notional),
+                    symbol_allocation_cap,
+                    remaining_class_allocation if remaining_class_allocation > 0 else symbol_allocation_cap,
                 )
             )
         )

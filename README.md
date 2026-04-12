@@ -24,6 +24,25 @@ Important guardrails:
 - ML is a filter/booster only and never overrides hard risk controls
 - the preferred local/API runtime stays single-process through `scripts/run_paper_api.py`
 
+## Strategy And Exit Upgrades
+
+The trading loop still stays paper-safe, but the decision layers are now more structured:
+
+- BUY candidates go through a modular signal pipeline: trend filter, regime filter, volatility filter, liquidity/volume confirmation, breakout/retest trigger, and reward/risk viability.
+- BUY ranking is no longer just `strategy says BUY + ML above threshold`; candidates are ranked by `strategy_score + entry_ml_score + risk_quality_adjustment`.
+- position sizing is volatility-aware and capped by risk-per-trade, per-symbol allocation, per-asset-class allocation, and max concurrent positions.
+- SELL is now policy-driven, not only binary. The exit layer can tighten stops, promote break-even, take partial profit, trail, time-stop stale positions, or fully exit on hard risk.
+- hard stop-loss and emergency exits remain authoritative even when optional exit ML is enabled.
+
+## Broker Lifecycle Replay Suppression
+
+Broker lifecycle notification memory now persists to `BROKER_ORDER_STATUS_CACHE_PATH` instead of living only in process memory.
+
+- startup broker status sync seeds a baseline snapshot without replaying historical fill/cancel/reject alerts
+- orders submitted in the current process still notify on the first poll
+- old terminal orders can be ignored conservatively during baseline sync via `BROKER_ORDER_STATUS_IGNORE_TERMINAL_OLDER_THAN_MINUTES`
+- Discord TTL dedupe is configurable with `DISCORD_DEDUPE_TTL_SECONDS`, but restart replay suppression does not rely on TTL alone
+
 ## Repository Layout
 
 - `app/api/`: FastAPI routes, diagnostics, admin helpers
@@ -140,6 +159,7 @@ Dedupe protection exists for:
 - scan summaries
 - broker lifecycle updates
 - startup/shutdown duplicates across quick reloads via a short-lived local dedupe cache
+- broker order lifecycle replay suppression across process restarts via `logs/broker_order_status_memory.json`
 
 ## Signal, Trade, And Outcome Storage
 
@@ -165,8 +185,9 @@ Signal/order/outcome storage now has two layers:
 ML scoring is optional and disabled by default.
 
 - strategies still generate the primary signal
-- ML only scores `BUY` candidates
-- if the score is below `ML_MIN_SCORE_THRESHOLD`, the candidate becomes `skipped_low_ml_score`
+- the entry model scores BUY candidates and can filter/rank entries
+- the optional exit model can assist partial/full de-risking, but it does not block hard stops or emergency exits
+- if the entry score is below `ML_MIN_SCORE_THRESHOLD`, the candidate becomes `skipped_low_ml_score`
 - risk controls still run independently and remain authoritative
 
 ### Model Types
@@ -178,6 +199,8 @@ ML scoring is optional and disabled by default.
 
 - `models/current_model.joblib`
 - `models/candidate_model.joblib`
+- `models/current_exit_model.joblib`
+- `models/candidate_exit_model.joblib`
 - `models/registry.json`
 
 ### Model Registry
@@ -186,6 +209,7 @@ ML scoring is optional and disabled by default.
 
 - `current_model`
 - `candidate_model`
+- purpose-specific `models.entry.*` and `models.exit.*`
 - `created_at`
 - `promoted`
 - `model_type`
@@ -193,6 +217,7 @@ ML scoring is optional and disabled by default.
 - `train_rows`
 - `validation_rows`
 - `metrics`
+- `trading_metrics`
 - `notes`
 
 Helper functions live in `app/ml/registry.py` for initialize/load/update/promote/rollback flows.
@@ -217,14 +242,14 @@ python scripts/train_model.py --dataset models/training_data.jsonl
 
 ```bash
 source .venv/bin/activate
-python scripts/evaluate_model.py --dataset models/training_data.jsonl
+python scripts/evaluate_model.py --dataset models/training_data.jsonl --purpose all
 ```
 
 ### Promote Candidate
 
 ```bash
 source .venv/bin/activate
-python scripts/promote_model.py
+python scripts/promote_model.py --purpose entry
 ```
 
 ### Nightly Retrain Wrapper
@@ -239,12 +264,52 @@ Promotion is threshold-gated by:
 - `ML_PROMOTION_MIN_AUC`
 - `ML_PROMOTION_MIN_PRECISION`
 - `ML_PROMOTION_MIN_WINRATE_LIFT`
+- `ML_PROMOTION_MIN_PROFIT_FACTOR`
+- `ML_PROMOTION_MAX_DRAWDOWN`
+- `ML_PROMOTION_MIN_EXPECTANCY`
 
 Sparse data is handled safely. If there are not enough labeled rows, the scripts log a skip instead of crashing the system.
 
 ### Label Bootstrapping Note
 
-This v1 uses conservative bootstrap labels from structured outcome data. When realized trade outcome history is sparse, the export path falls back to execution outcome plus basic reward/risk heuristics. That keeps the retrain loop operational without pretending the labels are a full production-grade realized-PnL dataset yet.
+The export/research path now preserves richer fields when they exist:
+
+- forward return proxies
+- favorable/adverse excursion
+- holding-duration context for exits
+- realized return and risk-adjusted return when available
+
+When realized trade outcome history is still sparse, the export path falls back to conservative execution-outcome and reward/risk proxies instead of breaking the pipeline.
+
+## Replay / Backtest Research
+
+The research replay stays offline and never places paper or live orders.
+
+Run a baseline vs candidate comparison:
+
+```bash
+source .venv/bin/activate
+python scripts/run_backtest.py --symbol AAPL --csv-path data/AAPL.csv --mode compare
+```
+
+Artifacts are written under `logs/research/<symbol>/`:
+
+- `baseline_summary.json`
+- `candidate_summary.json`
+- `comparison_summary.json`
+- per-variant trades in both `jsonl` and `csv`
+- per-variant equity curve JSON
+
+The replay simulates:
+
+- entries
+- partial exits
+- stop-loss / break-even / trailing stop behavior
+- regime deterioration exits
+- time stops
+- simple slippage and fee assumptions
+
+This is intended for evidence-gathering before paper deployment, not for live execution.
 
 ## News Feature Pipeline
 
@@ -281,6 +346,36 @@ Relevant env vars:
 - `OPENAI_MODEL`
 - `NEWS_MAX_HEADLINES_PER_TICKER`
 - `NEWS_LOOKBACK_HOURS`
+
+## Key Environment Variables
+
+The most important new knobs are:
+
+- `BROKER_ORDER_STATUS_CACHE_PATH`
+- `BROKER_ORDER_STATUS_SUPPRESS_STARTUP_REPLAY`
+- `BROKER_ORDER_STATUS_IGNORE_TERMINAL_OLDER_THAN_MINUTES`
+- `DISCORD_DEDUPE_TTL_SECONDS`
+- `RISK_PER_TRADE_PCT`
+- `MAX_SYMBOL_ALLOCATION_PCT`
+- `MAX_ASSET_CLASS_ALLOCATION_PCT`
+- `MAX_CONCURRENT_POSITIONS`
+- `SYMBOL_REENTRY_COOLDOWN_MINUTES`
+- `ENABLE_PARTIAL_EXITS`
+- `PARTIAL_TAKE_PROFIT_LEVELS`
+- `PARTIAL_TAKE_PROFIT_FRACTIONS`
+- `BREAK_EVEN_AFTER_R_MULTIPLE`
+- `TRAILING_STOP_MODE`
+- `TRAILING_STOP_ATR_MULTIPLE`
+- `TIME_STOP_BARS`
+- `ENTRY_MODEL_ENABLED`
+- `EXIT_MODEL_ENABLED`
+- `ML_ENTRY_MIN_AUC`
+- `ML_ENTRY_MIN_PRECISION`
+- `ML_EXIT_MIN_SCORE`
+- `ML_PROMOTION_MIN_PROFIT_FACTOR`
+- `ML_PROMOTION_MAX_DRAWDOWN`
+- `ML_PROMOTION_MIN_EXPECTANCY`
+- `WALK_FORWARD_ENABLED`
 
 ## Diagnostics And Verification
 

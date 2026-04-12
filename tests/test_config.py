@@ -124,18 +124,47 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
             trading_enabled=False,
             log_dir="custom-logs",
             auto_trader_lock_path="custom-logs/auto.lock",
+            discord_dedupe_ttl_seconds=90,
+            broker_order_status_cache_path="custom-logs/broker_status.json",
+            broker_order_status_suppress_startup_replay=True,
+            broker_order_status_ignore_terminal_older_than_minutes=45,
             ml_enabled=True,
+            entry_model_enabled=True,
+            exit_model_enabled=True,
             ml_model_type="logistic_regression",
             ml_min_score_threshold=0.65,
+            ml_exit_min_score=0.6,
             ml_min_train_rows=25,
             ml_retrain_enabled=True,
+            ml_entry_min_auc=0.61,
+            ml_entry_min_precision=0.58,
             ml_promotion_min_auc=0.61,
             ml_promotion_min_precision=0.58,
             ml_promotion_min_winrate_lift=0.03,
+            ml_promotion_min_profit_factor=1.2,
+            ml_promotion_max_drawdown=0.18,
+            ml_promotion_min_expectancy=0.01,
+            walk_forward_enabled=True,
             model_dir="custom-models",
             ml_current_model_path="custom-models/current.joblib",
             ml_candidate_model_path="custom-models/candidate.joblib",
+            ml_entry_current_model_path="custom-models/current-entry.joblib",
+            ml_entry_candidate_model_path="custom-models/candidate-entry.joblib",
+            ml_exit_current_model_path="custom-models/current-exit.joblib",
+            ml_exit_candidate_model_path="custom-models/candidate-exit.joblib",
             ml_registry_path="custom-models/registry.json",
+            risk_per_trade_pct=0.02,
+            max_symbol_allocation_pct=0.08,
+            max_asset_class_allocation_pct={"equity": 0.25, "etf": 0.2, "crypto": 0.1, "option": 0.02},
+            max_concurrent_positions=4,
+            symbol_reentry_cooldown_minutes=15,
+            enable_partial_exits=True,
+            partial_take_profit_levels=[1.0, 2.0],
+            partial_take_profit_fractions=[0.25, 1.0],
+            break_even_after_r_multiple=1.2,
+            trailing_stop_mode="atr",
+            trailing_stop_atr_multiple=2.0,
+            time_stop_bars=12,
             news_features_enabled=True,
             news_rss_enabled=True,
             news_llm_enabled=False,
@@ -146,10 +175,21 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
 
     assert settings.log_dir == "custom-logs"
     assert settings.auto_trader_lock_path == "custom-logs/auto.lock"
+    assert settings.discord_dedupe_ttl_seconds == 90
+    assert settings.broker_order_status_cache_path == "custom-logs/broker_status.json"
     assert settings.ml_enabled is True
+    assert settings.exit_model_enabled is True
     assert settings.ml_min_score_threshold == 0.65
+    assert settings.ml_exit_min_score == 0.6
     assert settings.ml_retrain_enabled is True
     assert settings.ml_registry_path == "custom-models/registry.json"
+    assert settings.risk_per_trade_pct == 0.02
+    assert settings.max_symbol_allocation_pct == 0.08
+    assert settings.max_asset_class_allocation_pct["equity"] == 0.25
+    assert settings.symbol_reentry_cooldown_minutes == 15
+    assert settings.partial_take_profit_levels == [1.0, 2.0]
+    assert settings.partial_take_profit_fractions == [0.25, 1.0]
+    assert settings.time_stop_bars == 12
     assert settings.news_features_enabled is True
     assert settings.news_rss_enabled is True
     assert settings.news_llm_enabled is False
