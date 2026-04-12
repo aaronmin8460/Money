@@ -58,7 +58,7 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
         data: Any,
         context: StrategyContext | None = None,
     ) -> list[TradeSignal]:
-        symbol_df, benchmark_df = self._unpack_data(data)
+        symbol_df, benchmark_df, regime_df = self._unpack_data(data)
         asset_class = context.asset.asset_class if context else AssetClass.EQUITY
         profile = self._profile_for(asset_class)
         if symbol_df.empty or len(symbol_df) < max(profile.sma_long_window, self.regime_long_sma):
@@ -66,7 +66,7 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
 
         evaluated_df = add_pipeline_indicators(symbol_df, profile)
         latest = evaluated_df.iloc[-1]
-        regime_state = self._get_regime_state(evaluated_df, benchmark_df)
+        regime_state = self._get_regime_state(evaluated_df, benchmark_df, regime_df)
         has_tracked_long_position = bool((context.metadata if context else {}).get("has_sellable_long_position"))
 
         if regime_state == "bearish" and has_tracked_long_position:
@@ -151,13 +151,23 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
     def _profile_for(self, asset_class: AssetClass) -> AssetSignalProfile:
         return self.profiles.get(asset_class, self.profiles[AssetClass.EQUITY])
 
-    def _unpack_data(self, data: Any) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    def _unpack_data(self, data: Any) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
         if isinstance(data, dict):
-            return data.get("symbol", pd.DataFrame()), data.get("benchmark")
-        return data, None
+            return data.get("symbol", pd.DataFrame()), data.get("benchmark"), data.get("regime")
+        return data, None, None
 
-    def _get_regime_state(self, symbol_df: pd.DataFrame, benchmark_df: pd.DataFrame | None) -> str:
-        candidate = benchmark_df.copy() if benchmark_df is not None and not benchmark_df.empty else symbol_df.copy()
+    def _get_regime_state(
+        self,
+        symbol_df: pd.DataFrame,
+        benchmark_df: pd.DataFrame | None,
+        regime_df: pd.DataFrame | None,
+    ) -> str:
+        if benchmark_df is not None and not benchmark_df.empty:
+            candidate = benchmark_df.copy()
+        elif regime_df is not None and not regime_df.empty:
+            candidate = regime_df.copy()
+        else:
+            candidate = symbol_df.copy()
         if len(candidate) < self.regime_long_sma:
             return "unknown"
         candidate["sma_short"] = candidate["Close"].rolling(self.regime_short_sma, min_periods=1).mean()

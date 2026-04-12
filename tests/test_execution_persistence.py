@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.config.settings import Settings
 from app.db.models import FillRecord, NormalizedSignalRecord
 from app.db.session import SessionLocal
@@ -722,3 +724,187 @@ def test_execution_maps_short_exit_to_buy_and_preserves_partial_cover_size(tmp_p
     assert result["proposal"]["quantity"] == 2.0
     assert result["proposal"]["order_intent"] == "short_exit"
     assert result["proposal"]["position_direction"] == "short"
+
+
+def test_meaningful_reduce_only_long_exit_still_submits_normally() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    broker = PaperBroker(settings=settings)
+    portfolio = Portfolio()
+    portfolio.positions["AAPL"] = Position(
+        symbol="AAPL",
+        quantity=3.0,
+        entry_price=100.0,
+        side="BUY",
+        current_price=110.0,
+        asset_class=AssetClass.EQUITY,
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        settings=settings,
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="AAPL",
+            signal=Signal.SELL,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            position_size=2.0,
+            price=110.0,
+            entry_price=110.0,
+            reason="Meaningful partial exit",
+        )
+    )
+
+    assert result["action"] == "dry_run"
+    assert result["proposal"]["quantity"] == 2.0
+    assert result["risk"]["rule"] == "dry_run"
+    assert result["proposal"]["dust_resolution"] == {}
+
+
+def test_reduce_only_crypto_exit_dust_is_resolved_locally() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    broker = PaperBroker(settings=settings)
+    portfolio = Portfolio()
+    portfolio.positions["ETH/USD"] = Position(
+        symbol="ETH/USD",
+        quantity=0.00000075,
+        entry_price=1800.0,
+        side="BUY",
+        current_price=2000.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        settings=settings,
+    )
+    execution.tranche_state.upsert_plan(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        target_position_notional=500.0,
+        tranche_weights=[1.0],
+        scale_in_mode="confirmation",
+        allow_average_down=False,
+        decision_reason="Dust exit test",
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="ETH/USD",
+            signal=Signal.SELL,
+            asset_class=AssetClass.CRYPTO,
+            strategy_name="crypto_momentum_trend",
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            price=2000.0,
+            entry_price=2000.0,
+            reason="Dust cleanup",
+        )
+    )
+
+    assert result["action"] == "dust_resolved"
+    assert result["risk"]["rule"] == "dust_resolved"
+    assert result["risk"]["approved"] is True
+    assert result["risk"]["details"]["rounded_quantity"] == 0.0
+    assert result["risk"]["details"]["tracked_position_quantity"] == pytest.approx(0.00000075)
+    assert result["risk"]["details"]["dust_auto_resolved"] is True
+    assert result["risk"]["rule"] != "input_validation"
+    assert result["proposal"]["dust_resolution"]["resolution_source"] == "reduce_only_exit"
+    assert portfolio.get_position("ETH/USD") is None
+    assert execution.tranche_state.get_plan("ETH/USD") is not None
+    assert execution.tranche_state.get_plan("ETH/USD").plan_status == "closed"
+    assert broker.orders == []
+
+
+def test_non_dust_unexecutable_exit_is_rejected_without_closing_position() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+    )
+    broker = PaperBroker(settings=settings)
+    portfolio = Portfolio()
+    portfolio.positions["ETH/USD"] = Position(
+        symbol="ETH/USD",
+        quantity=0.00000075,
+        entry_price=1_900_000.0,
+        side="BUY",
+        current_price=2_000_000.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+    risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
+    execution = ExecutionService(
+        broker=broker,
+        portfolio=portfolio,
+        risk_manager=risk_manager,
+        dry_run=True,
+        settings=settings,
+    )
+    execution.tranche_state.upsert_plan(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        target_position_notional=500.0,
+        tranche_weights=[1.0],
+        scale_in_mode="confirmation",
+        allow_average_down=False,
+        decision_reason="Non-dust exit test",
+    )
+
+    result = execution.process_signal(
+        TradeSignal(
+            symbol="ETH/USD",
+            signal=Signal.SELL,
+            asset_class=AssetClass.CRYPTO,
+            strategy_name="crypto_momentum_trend",
+            signal_type="exit",
+            order_intent="long_exit",
+            reduce_only=True,
+            price=2_000_000.0,
+            entry_price=2_000_000.0,
+            reason="Unexecutable but not dust",
+        )
+    )
+
+    latest_rejection = risk_manager.get_rejection_snapshot(limit=1)["latest"]
+
+    assert result["action"] == "rejected"
+    assert result["risk"]["rule"] == "non_dust_exit_unexecutable"
+    assert result["risk"]["rule"] != "input_validation"
+    assert result["risk"]["details"]["unexecutable_exit_reason"] == "exit_qty_rounds_to_zero"
+    assert result["risk"]["details"]["tracked_position_abs_market_value"] == pytest.approx(1.5)
+    assert portfolio.get_position("ETH/USD") is not None
+    assert execution.tranche_state.get_plan("ETH/USD") is not None
+    assert execution.tranche_state.get_plan("ETH/USD").plan_status == "active"
+    assert "non_dust_exit_unexecutable" in (execution.tranche_state.get_plan("ETH/USD").blocked_reason or "")
+    assert latest_rejection is not None
+    assert latest_rejection["rule"] == "non_dust_exit_unexecutable"
+    assert broker.orders == []

@@ -18,11 +18,47 @@ def test_settings_defaults() -> None:
             max_risk_per_trade=0.01,
             default_symbols=["AAPL", "SPY"],
         )
-    
+
     assert settings.broker_mode == "mock"
     assert settings.trading_enabled is False
     assert settings.max_risk_per_trade == 0.01
     assert "AAPL" in settings.default_symbols
+    assert settings.dust_position_max_notional == 1.0
+    assert settings.dust_position_max_qty_by_asset_class["crypto"] == 0.000001
+
+
+def test_dust_position_settings_parse_json_object() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            dust_position_max_notional=0.5,
+            dust_position_max_qty_by_asset_class='{"crypto": 0.0000025, "equity": 0.0}',
+        )
+
+    assert settings.dust_position_max_notional == 0.5
+    assert settings.dust_position_max_qty_by_asset_class["crypto"] == 0.0000025
+    assert settings.dust_position_max_qty_by_asset_class["equity"] == 0.0
+    assert settings.dust_position_max_qty_by_asset_class["etf"] == 0.0
+
+
+def test_asset_class_timeframe_defaults_are_available() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+        )
+
+    assert settings.entry_timeframe_for_asset_class(AssetClass.EQUITY) == "15Min"
+    assert settings.entry_timeframe_for_asset_class(AssetClass.CRYPTO) == "15Min"
+    assert settings.regime_timeframe_for_asset_class(AssetClass.EQUITY) == "1D"
+    assert settings.regime_timeframe_for_asset_class(AssetClass.CRYPTO) == "4H"
+    assert settings.scanner_timeframe_for_asset_class(AssetClass.ETF) == "15Min"
+    assert settings.lookback_bars_for_asset_class(AssetClass.CRYPTO) == 160
+    assert settings.universe_prefilter_limit_for_asset_class(AssetClass.EQUITY) == 50
+    assert settings.final_evaluation_limit_for_asset_class(AssetClass.EQUITY) == 15
 
 
 def test_active_symbols_uses_default_symbols_by_default() -> None:
@@ -47,7 +83,7 @@ def test_active_symbols_uses_included_symbols_when_set() -> None:
             trading_enabled=False,
             default_symbols=["AAPL", "SPY"],
             included_symbols=["BTC/USD", "ETH/USD"],
-    )
+        )
     assert settings.active_symbols == ["BTC/USD", "ETH/USD"]
 
 

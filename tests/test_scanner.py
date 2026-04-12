@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pandas as pd
+
+from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot
 from app.config.settings import Settings
 from app.db.models import AssetCatalogEntry, AssetCatalogSyncRun, RankedOpportunityRecord, ScannerRun
 from app.db.session import SessionLocal
@@ -159,3 +162,128 @@ def test_scanner_explicit_symbols_fall_back_when_catalog_is_missing_entries(tmp_
 
     assert result.scanned_count == 2
     assert list(result.symbol_snapshots.keys()) == ["BTC/USD", "ETH/USD"]
+
+
+def test_scanner_uses_asset_class_specific_intraday_timeframes(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+        scanner_timeframe_by_asset_class={"equity": "15Min", "crypto": "15Min"},
+        lookback_bars_by_asset_class={"equity": 42, "crypto": 64},
+    )
+    fetch_calls: list[tuple[str, str, int]] = []
+
+    class StubCatalog:
+        def get_asset(self, symbol: str):
+            return {
+                "AAPL": AssetMetadata(symbol="AAPL", name="AAPL", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+                "BTC/USD": AssetMetadata(symbol="BTC/USD", name="BTC/USD", asset_class=AssetClass.CRYPTO, exchange="CRYPTO"),
+            }.get(symbol)
+
+        def get_scan_universe(self, asset_class=None):
+            return []
+
+    class StubMarketData:
+        def get_normalized_snapshot(self, symbol: str, asset_class: AssetClass):
+            price = 150.0 if asset_class == AssetClass.EQUITY else 60_000.0
+            return NormalizedMarketSnapshot(
+                symbol=symbol,
+                asset_class=asset_class,
+                last_trade_price=price,
+                evaluation_price=price,
+                quote_available=True,
+                quote_stale=False,
+                price_source_used="last_trade",
+                session_state="regular" if asset_class != AssetClass.CRYPTO else "always_open",
+                exchange="MOCK",
+                source="mock",
+            )
+
+        def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50, asset_class=None):
+            fetch_calls.append((symbol, str(timeframe), int(limit)))
+            return pd.DataFrame(
+                {
+                    "Open": [100, 101, 102, 103, 104, 105],
+                    "High": [101, 102, 103, 104, 105, 106],
+                    "Low": [99, 100, 101, 102, 103, 104],
+                    "Close": [100, 101, 102, 103, 104, 105],
+                    "Volume": [1000, 1100, 1200, 1300, 1400, 1500],
+                }
+            )
+
+    scanner = ScannerService(asset_catalog=StubCatalog(), market_data_service=StubMarketData(), settings=settings)
+    result = scanner.scan(symbols=["AAPL", "BTC/USD"], limit=5)
+
+    assert result.scanned_count == 2
+    assert ("AAPL", "15Min", 42) in fetch_calls
+    assert ("BTC/USD", "15Min", 64) in fetch_calls
+    assert result.timeframes_by_asset_class["equity"]["scanner_timeframe"] == "15Min"
+
+
+def test_scanner_prefilter_ranks_beyond_catalog_order(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+        universe_prefilter_limit_by_asset_class={"equity": 3},
+        final_evaluation_limit_by_asset_class={"equity": 2},
+        scanner_timeframe_by_asset_class={"equity": "15Min"},
+        lookback_bars_by_asset_class={"equity": 40},
+    )
+    assets = [
+        AssetMetadata(symbol="AAA", name="AAA", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+        AssetMetadata(symbol="BBB", name="BBB", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+        AssetMetadata(symbol="ZZZ", name="ZZZ", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+    ]
+    score_by_symbol = {"AAA": 100_000.0, "BBB": 250_000.0, "ZZZ": 2_000_000.0}
+
+    class StubCatalog:
+        def get_asset(self, symbol: str):
+            return next((asset for asset in assets if asset.symbol == symbol), None)
+
+        def get_scan_universe(self, asset_class=None):
+            return list(assets)
+
+    class StubMarketData:
+        def get_normalized_snapshot(self, symbol: str, asset_class: AssetClass):
+            price = 100.0 + len(symbol)
+            return NormalizedMarketSnapshot(
+                symbol=symbol,
+                asset_class=asset_class,
+                last_trade_price=price,
+                evaluation_price=price,
+                quote_available=True,
+                quote_stale=False,
+                price_source_used="last_trade",
+                session_state="regular",
+                exchange="MOCK",
+                source="mock",
+            )
+
+        def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50, asset_class=None):
+            volume_base = score_by_symbol[symbol] / 100.0
+            closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+            return pd.DataFrame(
+                {
+                    "Open": closes,
+                    "High": [value + 1 for value in closes],
+                    "Low": [value - 1 for value in closes],
+                    "Close": closes,
+                    "Volume": [volume_base * factor for factor in [0.8, 0.9, 1.0, 1.1, 1.2, 1.3]],
+                }
+            )
+
+    scanner = ScannerService(asset_catalog=StubCatalog(), market_data_service=StubMarketData(), settings=settings)
+    result = scanner.scan(asset_class=AssetClass.EQUITY, limit=5)
+
+    assert result.prefilter_counts["equity"] == 3
+    assert result.final_evaluation_counts["equity"] == 2
+    assert "ZZZ" in result.symbol_snapshots
+    assert "AAA" not in result.symbol_snapshots

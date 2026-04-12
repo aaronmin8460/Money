@@ -9,6 +9,38 @@ from pydantic_settings import BaseSettings, NoDecode
 from app.domain.models import AssetClass
 
 
+DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
+    AssetClass.EQUITY.value: "15Min",
+    AssetClass.ETF.value: "15Min",
+    AssetClass.CRYPTO.value: "15Min",
+}
+DEFAULT_REGIME_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
+    AssetClass.EQUITY.value: "1D",
+    AssetClass.ETF.value: "1D",
+    AssetClass.CRYPTO.value: "4H",
+}
+DEFAULT_SCANNER_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
+    AssetClass.EQUITY.value: "15Min",
+    AssetClass.ETF.value: "15Min",
+    AssetClass.CRYPTO.value: "15Min",
+}
+DEFAULT_LOOKBACK_BARS_BY_ASSET_CLASS: dict[str, int] = {
+    AssetClass.EQUITY.value: 120,
+    AssetClass.ETF.value: 120,
+    AssetClass.CRYPTO.value: 160,
+}
+DEFAULT_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS: dict[str, int] = {
+    AssetClass.EQUITY.value: 50,
+    AssetClass.ETF.value: 50,
+    AssetClass.CRYPTO.value: 50,
+}
+DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS: dict[str, int] = {
+    AssetClass.EQUITY.value: 15,
+    AssetClass.ETF.value: 15,
+    AssetClass.CRYPTO.value: 15,
+}
+
+
 def _parse_json_list(value: str | list[str] | None, field_name: str) -> list[str]:
     if value is None:
         return []
@@ -154,6 +186,22 @@ class Settings(BaseSettings):
         env="MAX_POSITIONS_PER_ASSET_CLASS",
     )
     default_timeframe: str = Field("1D", env="DEFAULT_TIMEFRAME")
+    entry_timeframe_by_asset_class: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS),
+        env="ENTRY_TIMEFRAME_BY_ASSET_CLASS",
+    )
+    regime_timeframe_by_asset_class: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_REGIME_TIMEFRAME_BY_ASSET_CLASS),
+        env="REGIME_TIMEFRAME_BY_ASSET_CLASS",
+    )
+    scanner_timeframe_by_asset_class: dict[str, str] = Field(
+        default_factory=lambda: dict(DEFAULT_SCANNER_TIMEFRAME_BY_ASSET_CLASS),
+        env="SCANNER_TIMEFRAME_BY_ASSET_CLASS",
+    )
+    lookback_bars_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_LOOKBACK_BARS_BY_ASSET_CLASS),
+        env="LOOKBACK_BARS_BY_ASSET_CLASS",
+    )
     default_symbols: List[str] = Field(default_factory=lambda: ["AAPL", "SPY"], env="DEFAULT_SYMBOLS")
     active_strategy: str = Field("equity_momentum_breakout", env="ACTIVE_STRATEGY")
     active_strategy_by_asset_class: dict[str, str] = Field(default_factory=dict, env="ACTIVE_STRATEGY_BY_ASSET_CLASS")
@@ -167,6 +215,14 @@ class Settings(BaseSettings):
             AssetClass.CRYPTO.value: 60,
         },
         env="SCAN_INTERVAL_SECONDS_BY_ASSET_CLASS",
+    )
+    universe_prefilter_limit_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS),
+        env="UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS",
+    )
+    final_evaluation_limit_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS),
+        env="FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS",
     )
     alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
     max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
@@ -201,6 +257,16 @@ class Settings(BaseSettings):
             AssetClass.OPTION.value: 2_500.0,
         },
         env="MAX_NOTIONAL_PER_ASSET_CLASS",
+    )
+    dust_position_max_notional: float = Field(1.00, env="DUST_POSITION_MAX_NOTIONAL")
+    dust_position_max_qty_by_asset_class: dict[str, float] = Field(
+        default_factory=lambda: {
+            AssetClass.CRYPTO.value: 0.000001,
+            AssetClass.EQUITY.value: 0.0,
+            AssetClass.ETF.value: 0.0,
+            AssetClass.OPTION.value: 0.0,
+        },
+        env="DUST_POSITION_MAX_QTY_BY_ASSET_CLASS",
     )
     max_correlated_positions: int = Field(2, env="MAX_CORRELATED_POSITIONS")
     cooldown_seconds_per_symbol: int = Field(300, env="COOLDOWN_SECONDS_PER_SYMBOL")
@@ -466,8 +532,15 @@ class Settings(BaseSettings):
     @field_validator(
         "max_positions_per_asset_class",
         "scan_interval_seconds_by_asset_class",
+        "entry_timeframe_by_asset_class",
+        "regime_timeframe_by_asset_class",
+        "scanner_timeframe_by_asset_class",
+        "lookback_bars_by_asset_class",
+        "universe_prefilter_limit_by_asset_class",
+        "final_evaluation_limit_by_asset_class",
         "max_notional_per_asset_class",
         "max_asset_class_allocation_pct",
+        "dust_position_max_qty_by_asset_class",
         "strategy_switches",
         "active_strategy_by_asset_class",
         mode="before",
@@ -527,6 +600,70 @@ class Settings(BaseSettings):
             raise ValueError("MAX_SYMBOL_ALLOCATION_PCT must be between 0 and 1.")
         if any(value <= 0 or value > 1 for value in self.max_asset_class_allocation_pct.values()):
             raise ValueError("MAX_ASSET_CLASS_ALLOCATION_PCT values must each be between 0 and 1.")
+        self.scan_interval_seconds_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.scan_interval_seconds_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.entry_timeframe_by_asset_class = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in self.entry_timeframe_by_asset_class.items()
+            if str(key).strip() and str(value).strip()
+        }
+        self.regime_timeframe_by_asset_class = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in self.regime_timeframe_by_asset_class.items()
+            if str(key).strip() and str(value).strip()
+        }
+        self.scanner_timeframe_by_asset_class = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in self.scanner_timeframe_by_asset_class.items()
+            if str(key).strip() and str(value).strip()
+        }
+        self.lookback_bars_by_asset_class = {
+            str(key).strip().lower(): max(5, int(value))
+            for key, value in self.lookback_bars_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.universe_prefilter_limit_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.universe_prefilter_limit_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.final_evaluation_limit_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.final_evaluation_limit_by_asset_class.items()
+            if str(key).strip()
+        }
+        for asset_class, default_value in DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS.items():
+            self.entry_timeframe_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_REGIME_TIMEFRAME_BY_ASSET_CLASS.items():
+            self.regime_timeframe_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_SCANNER_TIMEFRAME_BY_ASSET_CLASS.items():
+            self.scanner_timeframe_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_LOOKBACK_BARS_BY_ASSET_CLASS.items():
+            self.lookback_bars_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS.items():
+            self.universe_prefilter_limit_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS.items():
+            self.final_evaluation_limit_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class in DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS:
+            final_limit = self.final_evaluation_limit_by_asset_class[asset_class]
+            prefilter_limit = self.universe_prefilter_limit_by_asset_class.get(asset_class, final_limit)
+            self.universe_prefilter_limit_by_asset_class[asset_class] = max(final_limit, prefilter_limit)
+        if self.dust_position_max_notional < 0:
+            raise ValueError("DUST_POSITION_MAX_NOTIONAL must be >= 0.")
+        self.dust_position_max_qty_by_asset_class = {
+            str(key).strip().lower(): float(value)
+            for key, value in self.dust_position_max_qty_by_asset_class.items()
+            if str(key).strip()
+        }
+        if any(value < 0 for value in self.dust_position_max_qty_by_asset_class.values()):
+            raise ValueError("DUST_POSITION_MAX_QTY_BY_ASSET_CLASS values must each be >= 0.")
+        for asset_class in AssetClass:
+            if asset_class == AssetClass.UNKNOWN:
+                continue
+            self.dust_position_max_qty_by_asset_class.setdefault(asset_class.value, 0.0)
         if self.symbol_reentry_cooldown_minutes < 0:
             raise ValueError("SYMBOL_REENTRY_COOLDOWN_MINUTES must be >= 0.")
         if not self.partial_take_profit_levels:
@@ -640,6 +777,50 @@ class Settings(BaseSettings):
         if key == AssetClass.CRYPTO.value and self.active_strategy != "crypto_momentum_trend":
             return "crypto_momentum_trend"
         return self.active_strategy
+
+    def _asset_class_key(self, asset_class: AssetClass | str) -> str:
+        return asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class).strip().lower()
+
+    def entry_timeframe_for_asset_class(self, asset_class: AssetClass | str) -> str:
+        key = self._asset_class_key(asset_class)
+        return str(self.entry_timeframe_by_asset_class.get(key) or self.default_timeframe).strip()
+
+    def regime_timeframe_for_asset_class(self, asset_class: AssetClass | str) -> str:
+        key = self._asset_class_key(asset_class)
+        return str(self.regime_timeframe_by_asset_class.get(key) or self.default_timeframe).strip()
+
+    def scanner_timeframe_for_asset_class(self, asset_class: AssetClass | str) -> str:
+        key = self._asset_class_key(asset_class)
+        return str(self.scanner_timeframe_by_asset_class.get(key) or self.default_timeframe).strip()
+
+    def lookback_bars_for_asset_class(self, asset_class: AssetClass | str) -> int:
+        key = self._asset_class_key(asset_class)
+        value = self.lookback_bars_by_asset_class.get(key)
+        if value is None:
+            return max(30, self.scanner_limit_per_asset_class)
+        return max(5, int(value))
+
+    def scan_interval_for_asset_class(self, asset_class: AssetClass | str) -> int:
+        key = self._asset_class_key(asset_class)
+        value = self.scan_interval_seconds_by_asset_class.get(key)
+        if value is None:
+            return max(1, int(self.scan_interval_seconds))
+        return max(1, int(value))
+
+    def universe_prefilter_limit_for_asset_class(self, asset_class: AssetClass | str) -> int:
+        key = self._asset_class_key(asset_class)
+        final_limit = self.final_evaluation_limit_for_asset_class(asset_class)
+        value = self.universe_prefilter_limit_by_asset_class.get(key)
+        if value is None:
+            return max(final_limit, self.scanner_limit_per_asset_class)
+        return max(final_limit, int(value))
+
+    def final_evaluation_limit_for_asset_class(self, asset_class: AssetClass | str) -> int:
+        key = self._asset_class_key(asset_class)
+        value = self.final_evaluation_limit_by_asset_class.get(key)
+        if value is None:
+            return max(1, min(self.scanner_limit_per_asset_class, 15))
+        return max(1, int(value))
 
     @property
     def news_llm_available(self) -> bool:

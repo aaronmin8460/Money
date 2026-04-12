@@ -1,6 +1,6 @@
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -39,6 +39,126 @@ def _build_broker_notifier(calls: list[dict[str, object]]):
     return StubNotifier()
 
 
+def _build_dust_exit_trader(monkeypatch) -> tuple[AutoTrader, list[str]]:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        auto_trade_enabled=True,
+        crypto_only_mode=True,
+        included_symbols=["ETH/USD"],
+        crypto_symbols=["ETH/USD"],
+        default_symbols=["ETH/USD"],
+        max_positions=1,
+        scan_interval_seconds=1,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader.portfolio.positions["ETH/USD"] = Position(
+        symbol="ETH/USD",
+        quantity=0.00000075,
+        entry_price=1800.0,
+        side="BUY",
+        current_price=2000.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+    trader.tranche_state.upsert_plan(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        target_position_notional=500.0,
+        tranche_weights=[1.0],
+        scale_in_mode="confirmation",
+        allow_average_down=False,
+        decision_reason="Dust auto-trader test",
+    )
+    snapshot = NormalizedMarketSnapshot(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        last_trade_price=2000.0,
+        mid_price=2000.0,
+        evaluation_price=2000.0,
+        quote_available=False,
+        quote_stale=False,
+        fallback_pricing_used=False,
+        price_source_used="last_trade",
+        session_state="always_open",
+        exchange="CRYPTO",
+        source="mock",
+    ).to_dict()
+    generated_exit_signals: list[str] = []
+
+    monkeypatch.setattr(trader, "_sync_portfolio_from_broker", lambda: None)
+    monkeypatch.setattr(
+        trader.scanner,
+        "scan",
+        lambda *args, **kwargs: ScanResult(
+            generated_at=datetime.now(timezone.utc),
+            asset_class="crypto",
+            scanned_count=1,
+            opportunities=[],
+            top_gainers=[],
+            top_losers=[],
+            unusual_volume=[],
+            breakouts=[],
+            pullbacks=[],
+            volatility=[],
+            momentum=[],
+            regime_status={},
+            errors=[],
+            symbol_snapshots={"ETH/USD": snapshot},
+        ),
+    )
+    monkeypatch.setattr(
+        trader,
+        "_resolve_asset",
+        lambda symbol, asset_class=None: AssetMetadata(
+            symbol=symbol,
+            name=symbol,
+            asset_class=AssetClass.CRYPTO,
+            exchange="CRYPTO",
+            tradable=True,
+            fractionable=True,
+        ),
+    )
+
+    def fake_evaluate_exit(asset, *, normalized_snapshot, evaluation_mode, regime_snapshot=None, news_features=None):
+        if asset.symbol == "ETH/USD" and trader.portfolio.is_sellable_long_position(asset.symbol):
+            generated_exit_signals.append(asset.symbol)
+            return TradeSignal(
+                symbol="ETH/USD",
+                signal=Signal.SELL,
+                asset_class=AssetClass.CRYPTO,
+                strategy_name="crypto_momentum_trend",
+                signal_type="exit",
+                order_intent="long_exit",
+                reduce_only=True,
+                price=2000.0,
+                entry_price=2000.0,
+                reason="Dust exit",
+                metrics={"decision_code": "exit_signal", "normalized_snapshot": snapshot},
+            )
+        return None
+
+    monkeypatch.setattr(trader, "_evaluate_exit_signal", fake_evaluate_exit)
+    monkeypatch.setattr(
+        trader,
+        "_evaluate_asset",
+        lambda asset, **kwargs: TradeSignal(
+            symbol=asset.symbol,
+            signal=Signal.HOLD,
+            asset_class=asset.asset_class,
+            strategy_name="crypto_momentum_trend",
+            price=2000.0,
+            reason="No position",
+            metrics={"decision_code": "no_signal", "normalized_snapshot": snapshot},
+        ),
+    )
+    monkeypatch.setattr(trader, "_enrich_signal", lambda signal, **kwargs: None)
+    monkeypatch.setattr(trader, "_apply_ml_score_filter", lambda signal, **kwargs: signal)
+    monkeypatch.setattr(trader, "_observe_broker_order_statuses", lambda cycle_id: None)
+    return trader, generated_exit_signals
+
+
 def test_auto_trader_run_now_returns_result() -> None:
     settings = Settings(
         _env_file=None,
@@ -55,6 +175,37 @@ def test_auto_trader_run_now_returns_result() -> None:
     assert response["success"] is True
     assert isinstance(response["results"], list)
     assert trader.get_status()["running"] is False
+
+
+def test_auto_trader_status_surfaces_dust_resolution(monkeypatch) -> None:
+    trader, generated_exit_signals = _build_dust_exit_trader(monkeypatch)
+
+    response = trader.run_now()
+    status = trader.get_status()
+
+    assert response["success"] is True
+    assert generated_exit_signals == ["ETH/USD"]
+    assert response["results"][0]["action"] == "dust_resolved"
+    assert status["open_positions_count"] == 0
+    assert status["latest_dust_resolution"]["action"] == "dust_resolved"
+    assert status["last_run_result"]["action_counts"]["dust_resolved"] == 1
+    assert status["last_symbol_evaluations"][0]["classification"] == "dust_resolved"
+    tranche = next(item for item in status["tranche_state"] if item["symbol"] == "ETH/USD")
+    assert tranche["plan_status"] == "closed"
+
+
+def test_auto_trader_does_not_retry_exit_after_dust_resolution(monkeypatch) -> None:
+    trader, generated_exit_signals = _build_dust_exit_trader(monkeypatch)
+
+    first = trader.run_now()
+    second = trader.run_now()
+
+    assert first["success"] is True
+    assert second["success"] is True
+    assert generated_exit_signals == ["ETH/USD"]
+    assert first["results"][0]["action"] == "dust_resolved"
+    assert second["results"] == []
+    assert trader.get_status()["open_positions_count"] == 0
 
 
 def test_auto_trader_prevents_duplicate_start() -> None:
@@ -1036,3 +1187,322 @@ def test_buy_ranking_and_exposure_gating_behavior() -> None:
     assert [signal.symbol for signal in selected] == ["BTC/USD"]
     assert equity_candidate.metrics["buy_ranking"]["selection_rule"] == "portfolio_exposure_limit"
     assert crypto_candidate.metrics["buy_ranking"]["selection_rule"] == "selected_by_rank"
+
+
+def test_evaluate_asset_uses_separate_entry_and_regime_timeframes(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        entry_timeframe_by_asset_class={"crypto": "15Min"},
+        regime_timeframe_by_asset_class={"crypto": "4H"},
+        lookback_bars_by_asset_class={"crypto": 80},
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    asset = AssetMetadata(
+        symbol="ETH/USD",
+        name="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        exchange="CRYPTO",
+        tradable=True,
+        fractionable=True,
+    )
+    snapshot = NormalizedMarketSnapshot(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        last_trade_price=3000.0,
+        evaluation_price=3000.0,
+        quote_available=True,
+        quote_stale=False,
+        price_source_used="last_trade",
+        session_state="always_open",
+        exchange="CRYPTO",
+        source="mock",
+    ).to_dict()
+    fetch_calls: list[tuple[str, str, int]] = []
+
+    class RecordingStrategy:
+        name = "crypto_momentum_trend"
+
+        def __init__(self) -> None:
+            self.seen_data = None
+            self.seen_context = None
+
+        def supports(self, asset_class: AssetClass) -> bool:
+            return asset_class == AssetClass.CRYPTO
+
+        def generate_signals(self, symbol: str, data, context=None):
+            self.seen_data = data
+            self.seen_context = context
+            return [
+                TradeSignal(
+                    symbol=symbol,
+                    signal=Signal.BUY,
+                    asset_class=AssetClass.CRYPTO,
+                    strategy_name=self.name,
+                    price=3000.0,
+                    entry_price=3000.0,
+                    stop_price=2940.0,
+                    target_price=3120.0,
+                    reason="Momentum aligned",
+                    metrics={"decision_code": "signal", "strategy_score": 0.7},
+                )
+            ]
+
+    strategy = RecordingStrategy()
+
+    def fake_fetch_bars(symbol: str, timeframe: str | None = None, limit: int = 50, asset_class=None):
+        fetch_calls.append((symbol, str(timeframe), int(limit)))
+        closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+        if timeframe == "4H":
+            closes = [200.0, 201.0, 202.0, 203.0, 204.0, 205.0]
+        return pd.DataFrame(
+            {
+                "Open": closes,
+                "High": [value + 1 for value in closes],
+                "Low": [value - 1 for value in closes],
+                "Close": closes,
+                "Volume": [1000, 1100, 1200, 1300, 1400, 1500],
+            }
+        )
+
+    monkeypatch.setattr(trader, "_select_strategy_for_asset", lambda _asset: strategy)
+    monkeypatch.setattr(trader.market_data_service, "fetch_bars", fake_fetch_bars)
+    monkeypatch.setattr(
+        trader.market_data_service,
+        "get_latest_quote",
+        lambda symbol, asset_class: QuoteSnapshot(symbol=symbol, asset_class=AssetClass.CRYPTO),
+    )
+
+    result = trader._evaluate_asset(asset, precomputed_snapshot=snapshot)
+
+    assert ("ETH/USD", "15Min", 80) in fetch_calls
+    assert ("ETH/USD", "4H", 80) in fetch_calls
+    assert isinstance(strategy.seen_data, dict)
+    assert float(strategy.seen_data["entry"].iloc[-1]["Close"]) == 105.0
+    assert float(strategy.seen_data["regime"].iloc[-1]["Close"]) == 205.0
+    assert result.metrics["entry_timeframe"] == "15Min"
+    assert result.metrics["regime_timeframe"] == "4H"
+
+
+def test_scan_and_trade_honors_per_asset_class_cadence(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        enabled_asset_classes=["equity", "crypto"],
+        etf_trading_enabled=False,
+        scan_interval_seconds_by_asset_class={"equity": 300, "crypto": 60},
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    now = datetime.utcnow()
+    trader._last_asset_class_run_at = {
+        "equity": now - timedelta(seconds=30),
+        "crypto": now - timedelta(seconds=120),
+    }
+    scan_calls: list[str] = []
+
+    monkeypatch.setattr(trader, "_sync_portfolio_from_broker", lambda: None)
+    monkeypatch.setattr(trader, "_observe_broker_order_statuses", lambda cycle_id: None)
+
+    def fake_scan(*, asset_class=None, **kwargs):
+        scan_calls.append(asset_class.value)
+        return ScanResult(
+            generated_at=datetime.now(timezone.utc),
+            asset_class=asset_class.value,
+            scanned_count=0,
+            opportunities=[],
+            top_gainers=[],
+            top_losers=[],
+            unusual_volume=[],
+            breakouts=[],
+            pullbacks=[],
+            volatility=[],
+            momentum=[],
+            regime_status={},
+            errors=[],
+            symbol_snapshots={},
+        )
+
+    monkeypatch.setattr(trader.scanner, "scan", fake_scan)
+
+    response = trader._scan_and_trade(mode="background_loop", respect_cadence=True)
+
+    assert response == []
+    assert scan_calls == ["crypto"]
+    assert trader.get_status()["last_scan_overview"]["due_asset_classes"] == ["crypto"]
+    assert "equity" in trader.get_status()["last_cadence_diagnostics"]["skipped_asset_classes"]
+
+
+def test_open_positions_are_monitored_even_without_new_entries(monkeypatch) -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        enabled_asset_classes=["crypto"],
+        equity_trading_enabled=False,
+        etf_trading_enabled=False,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    trader.portfolio.positions["ETH/USD"] = Position(
+        symbol="ETH/USD",
+        quantity=0.25,
+        entry_price=2000.0,
+        side="BUY",
+        current_price=2100.0,
+        asset_class=AssetClass.CRYPTO,
+    )
+    snapshot = NormalizedMarketSnapshot(
+        symbol="ETH/USD",
+        asset_class=AssetClass.CRYPTO,
+        last_trade_price=2100.0,
+        evaluation_price=2100.0,
+        quote_available=True,
+        quote_stale=False,
+        price_source_used="last_trade",
+        session_state="always_open",
+        exchange="CRYPTO",
+        source="mock",
+    ).to_dict()
+    scan_kwargs: list[dict[str, object]] = []
+    evaluated_symbols: list[str] = []
+
+    monkeypatch.setattr(trader, "_sync_portfolio_from_broker", lambda: None)
+    monkeypatch.setattr(trader, "_observe_broker_order_statuses", lambda cycle_id: None)
+    monkeypatch.setattr(trader, "_evaluate_exit_signal", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trader, "_enrich_signal", lambda signal, **kwargs: None)
+    monkeypatch.setattr(trader, "_apply_ml_score_filter", lambda signal, **kwargs: signal)
+    monkeypatch.setattr(
+        trader.execution_service,
+        "process_signal",
+        lambda signal: {
+            "latest_price": signal.price,
+            "proposal": {"symbol": signal.symbol},
+            "risk": {"rule": "hold", "reason": signal.reason, "details": {}},
+            "action": "skipped",
+            "order": None,
+        },
+    )
+
+    def fake_scan(*args, **kwargs):
+        scan_kwargs.append(kwargs)
+        return ScanResult(
+            generated_at=datetime.now(timezone.utc),
+            asset_class="crypto",
+            scanned_count=1,
+            opportunities=[],
+            top_gainers=[],
+            top_losers=[],
+            unusual_volume=[],
+            breakouts=[],
+            pullbacks=[],
+            volatility=[],
+            momentum=[],
+            regime_status={},
+            errors=[],
+            symbol_snapshots={"ETH/USD": snapshot},
+            symbol_inclusion_reasons={"ETH/USD": ["open_position"]},
+            timeframes_by_asset_class={
+                "crypto": {
+                    "scanner_timeframe": "15Min",
+                    "entry_timeframe": "15Min",
+                    "regime_timeframe": "4H",
+                    "lookback_bars": 160,
+                }
+            },
+        )
+
+    def fake_evaluate_asset(asset, **kwargs):
+        evaluated_symbols.append(asset.symbol)
+        return TradeSignal(
+            symbol=asset.symbol,
+            signal=Signal.HOLD,
+            asset_class=asset.asset_class,
+            strategy_name="crypto_momentum_trend",
+            price=2100.0,
+            entry_price=2100.0,
+            reason="Monitor open position",
+            metrics={"decision_code": "no_signal", "normalized_snapshot": snapshot},
+        )
+
+    monkeypatch.setattr(trader.scanner, "scan", fake_scan)
+    monkeypatch.setattr(trader, "_evaluate_asset", fake_evaluate_asset)
+
+    response = trader._scan_and_trade(mode="background_loop", respect_cadence=True)
+
+    assert response
+    assert evaluated_symbols == ["ETH/USD"]
+    assert scan_kwargs[0]["required_symbols"] == ["ETH/USD"]
+
+
+def test_ranked_buy_selection_stays_diverse_without_duplicate_spam() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        max_position_notional=10_000.0,
+        max_symbol_allocation_pct=0.10,
+        max_asset_class_allocation_pct={"equity": 0.20, "etf": 0.20, "crypto": 0.20, "option": 0.02},
+        max_concurrent_positions=3,
+        auto_trader_lock_path=_test_lock_path(),
+    )
+    trader = AutoTrader(settings)
+    signals = [
+        TradeSignal(
+            symbol="MSFT",
+            signal=Signal.BUY,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            price=100.0,
+            entry_price=100.0,
+            stop_price=95.0,
+            liquidity_score=0.9,
+            confidence_score=0.8,
+            metrics={"strategy_score": 0.8, "reward_risk_ratio": 2.0, "breakout_distance_atr": 0.2, "ml": {"score": 0.9}},
+        ),
+        TradeSignal(
+            symbol="SPY",
+            signal=Signal.BUY,
+            asset_class=AssetClass.ETF,
+            strategy_name="equity_momentum_breakout",
+            price=500.0,
+            entry_price=500.0,
+            stop_price=490.0,
+            liquidity_score=0.8,
+            confidence_score=0.75,
+            metrics={"strategy_score": 0.75, "reward_risk_ratio": 1.8, "breakout_distance_atr": 0.25, "ml": {"score": 0.8}},
+        ),
+        TradeSignal(
+            symbol="BTC/USD",
+            signal=Signal.BUY,
+            asset_class=AssetClass.CRYPTO,
+            strategy_name="crypto_momentum_trend",
+            price=50_000.0,
+            entry_price=50_000.0,
+            stop_price=48_500.0,
+            liquidity_score=0.7,
+            confidence_score=0.7,
+            metrics={"strategy_score": 0.7, "reward_risk_ratio": 1.7, "breakout_distance_atr": 0.3, "ml": {"score": 0.7}},
+        ),
+        TradeSignal(
+            symbol="MSFT",
+            signal=Signal.BUY,
+            asset_class=AssetClass.EQUITY,
+            strategy_name="equity_momentum_breakout",
+            price=100.0,
+            entry_price=100.0,
+            stop_price=96.0,
+            liquidity_score=0.6,
+            confidence_score=0.55,
+            metrics={"strategy_score": 0.5, "reward_risk_ratio": 1.2, "breakout_distance_atr": 0.35, "ml": {"score": 0.4}},
+        ),
+    ]
+
+    selected = trader._select_ranked_buy_signals(signals)
+
+    assert [signal.symbol for signal in selected] == ["MSFT", "SPY", "BTC/USD"]
+    assert len({signal.symbol for signal in selected}) == 3
+    assert signals[-1].metrics["buy_ranking"]["selection_rule"] == "duplicate_same_cycle"

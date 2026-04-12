@@ -859,6 +859,7 @@ class RiskManager:
             candidate_position_direction = "long"
         elif resolved_order_profile in {"short_entry", "short_exit"}:
             candidate_position_direction = "short"
+        tracked_position_market_value = self.portfolio.position_market_value(symbol) if position is not None else 0.0
         details = {
             "symbol": symbol,
             "side": side,
@@ -894,6 +895,8 @@ class RiskManager:
             "tracked_position_entry_price": position.entry_price if position is not None else None,
             "tracked_position_asset_class": position.asset_class.value if position is not None else None,
             "tracked_position_exchange": position.exchange if position is not None else None,
+            "tracked_position_market_value": tracked_position_market_value,
+            "tracked_position_abs_market_value": abs(tracked_position_market_value),
             "tracked_position_sellable": has_tracked_long_position,
             "tracked_position_coverable": has_coverable_short_position,
             "cash": account["cash"],

@@ -26,6 +26,8 @@ def normalize_outcome_classification(action: str, risk_rule: str | None = None) 
         return "dry_run"
     if normalized_action == "skipped_low_ml_score":
         return "skipped_low_ml_score"
+    if normalized_action in {"dust_resolved", "dust_closed"} or normalized_rule in {"dust_resolved", "dust_closed"}:
+        return "dust_resolved"
     if normalized_rule == "ml_inference_error":
         return "ml_inference_error"
     if normalized_rule == "market_closed_extended_hours_disabled":
@@ -36,6 +38,8 @@ def normalize_outcome_classification(action: str, risk_rule: str | None = None) 
         return "extended_hours_not_supported_for_asset"
     if normalized_rule == "no_position_to_sell":
         return "no_position_to_sell"
+    if normalized_rule in {"exit_qty_rounds_to_zero", "non_dust_exit_unexecutable"}:
+        return normalized_rule
     if normalized_action == "rejected":
         return "risk_rejected"
     if normalized_action == "skipped":

@@ -156,6 +156,8 @@ def _derive_exit_bootstrap_label(
 ) -> tuple[int | None, str | None]:
     if classification == "ml_inference_error":
         return None, None
+    if classification == "dust_resolved":
+        return None, None
     if classification in {"risk_rejected", "no_position_to_sell"}:
         return 0, "exit_execution_outcome"
 

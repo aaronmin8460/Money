@@ -205,11 +205,20 @@ class ExecutionService:
             }
 
         proposal = self._build_order_request(signal, asset_class, price)
-        
+
         # Attempt quantity reduction if stop-based risk exceeds max_risk_per_trade.
         if self._is_exposure_increasing_signal(signal) and signal.stop_price is not None:
             proposal = self._attempt_risk_compliant_sizing(signal, proposal, price, asset_class)
-        
+
+        special_exit_result = self._maybe_handle_reduce_only_exit_resolution(
+            signal=signal,
+            proposal=proposal,
+            price=price,
+            asset_class=asset_class,
+        )
+        if special_exit_result is not None:
+            return special_exit_result
+
         risk_decision = self._evaluate_signal_risk(signal, proposal, price)
         self._persist_signal_event(signal, price, proposal.quantity or 0.0, risk_decision)
 
@@ -352,7 +361,310 @@ class ExecutionService:
             "position_direction": (proposal.metadata or {}).get("position_direction"),
             "reduce_only": bool((proposal.metadata or {}).get("reduce_only")),
             "exit_stage": (proposal.metadata or {}).get("exit_stage"),
+            "sizing": dict((proposal.metadata or {}).get("sizing") or {}),
+            "dust_resolution": dict((proposal.metadata or {}).get("dust_resolution") or {}),
         }
+
+    def resolve_tracked_dust_positions(self, *, source: str = "runtime_sync") -> list[dict[str, Any]]:
+        resolved: list[dict[str, Any]] = []
+        for symbol in list(self.portfolio.positions.keys()):
+            position = self.portfolio.get_position(symbol)
+            if position is None:
+                continue
+            reference_price = float(position.current_price or position.entry_price or 0.0)
+            dust_details = self._classify_tracked_position_as_dust(
+                symbol=symbol,
+                asset_class=position.asset_class,
+                price=reference_price,
+            )
+            if dust_details is None:
+                continue
+            resolution_reason = "Tracked position was auto-resolved locally as dust during runtime sync."
+            dust_details.update(
+                {
+                    "dust_auto_resolved": True,
+                    "resolution_source": source,
+                    "resolution_reason": resolution_reason,
+                }
+            )
+            if self._resolve_dust_position_locally(
+                symbol=symbol,
+                price=reference_price,
+                reason=resolution_reason,
+                details=dust_details,
+            ):
+                resolved.append(dust_details)
+        return resolved
+
+    def _maybe_handle_reduce_only_exit_resolution(
+        self,
+        *,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        price: float,
+        asset_class: AssetClass,
+    ) -> dict[str, Any] | None:
+        if signal.order_intent not in EXIT_ORDER_INTENTS or not signal.reduce_only:
+            return None
+
+        position = self.portfolio.get_position(signal.symbol)
+        if position is None or position.quantity <= 0:
+            return None
+
+        sizing_details = dict((proposal.metadata or {}).get("sizing") or {})
+        raw_quantity = self._decimal(sizing_details.get("raw_calculated_qty", position.quantity))
+        rounded_quantity = self._decimal(proposal.quantity or 0.0)
+        final_notional = self._decimal(
+            sizing_details.get(
+                "final_submitted_notional",
+                proposal.notional if proposal.notional is not None else 0.0,
+            )
+        )
+        if raw_quantity <= 0:
+            return None
+        if rounded_quantity > 0 and final_notional > 0:
+            return None
+
+        diagnostics = self._build_unexecutable_exit_diagnostics(
+            signal=signal,
+            proposal=proposal,
+            price=price,
+            asset_class=asset_class,
+        )
+        updated_metadata = dict(proposal.metadata or {})
+        updated_metadata["dust_resolution"] = dict(diagnostics)
+        proposal = OrderRequest(
+            symbol=proposal.symbol,
+            side=proposal.side,
+            quantity=proposal.quantity,
+            notional=proposal.notional,
+            asset_class=proposal.asset_class,
+            price=proposal.price,
+            time_in_force=proposal.time_in_force,
+            order_type=proposal.order_type,
+            is_dry_run=proposal.is_dry_run,
+            metadata=updated_metadata,
+        )
+
+        dust_details = self._classify_tracked_position_as_dust(
+            symbol=signal.symbol,
+            asset_class=asset_class,
+            price=float(proposal.price or price),
+            base_details=diagnostics,
+        )
+        if dust_details is not None:
+            dust_reason = (
+                "Tracked position resolved locally as dust after reduce-only exit rounded below executable size."
+            )
+            dust_details.update(
+                {
+                    "dust_auto_resolved": True,
+                    "resolution_source": "reduce_only_exit",
+                    "resolution_reason": dust_reason,
+                }
+            )
+            self._resolve_dust_position_locally(
+                symbol=signal.symbol,
+                price=float(proposal.price or price),
+                reason=dust_reason,
+                details=dust_details,
+            )
+            proposal.metadata["dust_resolution"] = dict(dust_details)
+            risk_decision = RiskDecision(
+                approved=True,
+                reason=dust_reason,
+                rule="dust_resolved",
+                details=dust_details,
+            )
+            self._persist_signal_event(signal, price, 0.0, risk_decision)
+            self._log_execution_artifacts(
+                action="dust_resolved",
+                signal=signal,
+                proposal=proposal,
+                risk_decision=risk_decision,
+                order=None,
+            )
+            return {
+                "symbol": proposal.symbol,
+                "signal": signal.signal.value,
+                "latest_price": price,
+                "proposal": self._proposal_to_payload(proposal, asset_class),
+                "risk": risk_decision.to_dict(),
+                "action": "dust_resolved",
+                "order": None,
+            }
+
+        rejection_reason = (
+            "Reduce-only exit quantity rounds to zero after asset rounding; tracked position exceeds dust "
+            "thresholds and was left open."
+        )
+        diagnostics.update(
+            {
+                "dust_auto_resolved": False,
+                "resolution_source": "reduce_only_exit",
+                "resolution_reason": rejection_reason,
+            }
+        )
+        proposal.metadata["dust_resolution"] = dict(diagnostics)
+        risk_decision = RiskDecision(
+            approved=False,
+            reason=rejection_reason,
+            rule="non_dust_exit_unexecutable",
+            details=diagnostics,
+        )
+        self.risk_manager.record_manual_rejection(signal.symbol, signal.signal.value, risk_decision)
+        self.tranche_state.mark_decision(
+            signal.symbol,
+            reason="Exit remained open because quantity rounded below executable size.",
+            blocked_reason=f"{risk_decision.rule}: {risk_decision.reason}",
+        )
+        self._persist_signal_event(signal, price, 0.0, risk_decision)
+        self._notify_trade_event(
+            action="rejected",
+            signal=signal,
+            proposal=proposal,
+            risk_decision=risk_decision,
+        )
+        self._log_execution_artifacts(
+            action="rejected",
+            signal=signal,
+            proposal=proposal,
+            risk_decision=risk_decision,
+            order=None,
+        )
+        return {
+            "symbol": proposal.symbol,
+            "signal": signal.signal.value,
+            "latest_price": price,
+            "proposal": self._proposal_to_payload(proposal, asset_class),
+            "risk": risk_decision.to_dict(),
+            "action": "rejected",
+            "order": None,
+        }
+
+    def _build_unexecutable_exit_diagnostics(
+        self,
+        *,
+        signal: TradeSignal,
+        proposal: OrderRequest,
+        price: float,
+        asset_class: AssetClass,
+    ) -> dict[str, Any]:
+        position = self.portfolio.get_position(signal.symbol)
+        sizing_details = dict((proposal.metadata or {}).get("sizing") or {})
+        value_price = self._decimal(proposal.price or price)
+        tracked_quantity = self._decimal(position.quantity if position is not None else 0.0)
+        tracked_market_value = tracked_quantity * value_price
+        if position is not None and str(getattr(position.direction, "value", position.side)).lower() == "short":
+            tracked_market_value *= Decimal("-1")
+        rounded_quantity = self._decimal(sizing_details.get("rounded_quantity", proposal.quantity or 0.0))
+        final_notional = self._decimal(
+            sizing_details.get(
+                "final_submitted_notional",
+                proposal.notional if proposal.notional is not None else 0.0,
+            )
+        )
+        diagnostics = {
+            **sizing_details,
+            "symbol": signal.symbol,
+            "asset_class": asset_class.value,
+            "order_intent": signal.order_intent,
+            "reduce_only": signal.reduce_only,
+            "raw_tracked_position_qty": float(tracked_quantity),
+            "tracked_position_quantity": float(tracked_quantity),
+            "tracked_position_side": str(position.side) if position is not None else None,
+            "tracked_position_direction": (
+                str(getattr(position.direction, "value", position.side)).lower() if position is not None else None
+            ),
+            "tracked_position_entry_price": position.entry_price if position is not None else None,
+            "tracked_position_current_price": position.current_price if position is not None else None,
+            "tracked_position_asset_class": position.asset_class.value if position is not None else None,
+            "tracked_position_exchange": position.exchange if position is not None else None,
+            "tracked_position_initial_quantity": position.initial_quantity if position is not None else None,
+            "tracked_position_price_used_for_value": float(value_price),
+            "tracked_position_market_value": float(tracked_market_value),
+            "tracked_position_abs_market_value": float(abs(tracked_market_value)),
+            "rounded_qty": float(rounded_quantity),
+            "rounded_quantity": float(rounded_quantity),
+            "rounded_notional": float(final_notional),
+            "final_submitted_notional": float(final_notional),
+            "dust_position_max_notional": float(self._decimal(self.settings.dust_position_max_notional)),
+            "dust_position_max_qty": float(
+                self._decimal(
+                    self.settings.dust_position_max_qty_by_asset_class.get(asset_class.value, 0.0)
+                )
+            ),
+            "unexecutable_exit_reason": (
+                "exit_qty_rounds_to_zero" if rounded_quantity <= 0 else "exit_notional_rounds_to_zero"
+            ),
+        }
+        return diagnostics
+
+    def _classify_tracked_position_as_dust(
+        self,
+        *,
+        symbol: str,
+        asset_class: AssetClass,
+        price: float,
+        base_details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        position = self.portfolio.get_position(symbol)
+        if position is None or position.quantity <= 0 or price <= 0:
+            return None
+
+        qty_threshold = self._decimal(
+            self.settings.dust_position_max_qty_by_asset_class.get(asset_class.value, 0.0)
+        )
+        if qty_threshold <= 0:
+            return None
+
+        tracked_quantity = self._decimal(position.quantity)
+        tracked_market_value = tracked_quantity * self._decimal(price)
+        if str(getattr(position.direction, "value", position.side)).lower() == "short":
+            tracked_market_value *= Decimal("-1")
+        max_notional = self._decimal(self.settings.dust_position_max_notional)
+        if abs(tracked_market_value) > max_notional or tracked_quantity > qty_threshold:
+            return None
+
+        dust_details = dict(base_details or {})
+        dust_details.update(
+            {
+                "asset_class": asset_class.value,
+                "raw_tracked_position_qty": float(tracked_quantity),
+                "tracked_position_quantity": float(tracked_quantity),
+                "tracked_position_market_value": float(tracked_market_value),
+                "tracked_position_abs_market_value": float(abs(tracked_market_value)),
+                "tracked_position_price_used_for_value": float(price),
+                "dust_position_max_notional": float(max_notional),
+                "dust_position_max_qty": float(qty_threshold),
+                "dust_thresholds_met": True,
+            }
+        )
+        return dust_details
+
+    def _resolve_dust_position_locally(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        reason: str,
+        details: dict[str, Any],
+    ) -> bool:
+        closed_position = self.portfolio.close_position_locally(symbol, price=price)
+        if closed_position is None:
+            return False
+        self.tranche_state.mark_position_closed(symbol, reason=reason)
+        logger.info(
+            "Tracked position resolved locally as dust",
+            extra={
+                "symbol": symbol,
+                "asset_class": details.get("asset_class"),
+                "tracked_position_quantity": details.get("tracked_position_quantity"),
+                "tracked_position_market_value": details.get("tracked_position_market_value"),
+                "resolution_source": details.get("resolution_source"),
+            },
+        )
+        return True
 
     def _resolve_order_side(self, signal: TradeSignal) -> str:
         mapped_side = ORDER_INTENT_TO_BROKER_SIDE.get(signal.order_intent)

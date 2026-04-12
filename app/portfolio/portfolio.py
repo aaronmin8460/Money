@@ -456,6 +456,22 @@ class Portfolio:
     def get_position(self, symbol: str) -> Position | None:
         return self.positions.get(symbol)
 
+    def close_position_locally(self, symbol: str, *, price: float) -> Position | None:
+        position = self.positions.pop(symbol, None)
+        if position is None:
+            return None
+
+        close_price = float(price)
+        if position.direction == PositionDirection.SHORT:
+            self.realized_pnl += (position.entry_price - close_price) * position.quantity
+            self.cash -= position.quantity * close_price
+        else:
+            self.realized_pnl += (close_price - position.entry_price) * position.quantity
+            self.cash += position.quantity * close_price
+
+        self._recalculate_equity()
+        return position
+
     def is_long_position(self, symbol: str) -> bool:
         position = self.get_position(symbol)
         if position is None or position.quantity <= 0:

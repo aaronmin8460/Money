@@ -231,8 +231,6 @@ class AssetCatalogService:
                 continue
             if symbol in exclude_symbols:
                 continue
-            if include_symbols and symbol not in include_symbols:
-                continue
             if watchlist_symbols and symbol not in watchlist_symbols:
                 continue
             if major_symbols and symbol not in major_symbols:
@@ -243,5 +241,5 @@ class AssetCatalogService:
 
         if include_symbols:
             symbol_rank = {symbol: index for index, symbol in enumerate(explicit_symbol_order)}
-            filtered.sort(key=lambda asset: symbol_rank.get(asset.symbol.upper(), len(symbol_rank)))
+            filtered.sort(key=lambda asset: (symbol_rank.get(asset.symbol.upper(), len(symbol_rank)), asset.symbol))
         return filtered

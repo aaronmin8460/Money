@@ -20,6 +20,7 @@ from app.monitoring.logger import get_logger
 from app.news.feature_store import NewsFeatureStore
 from app.services.exit_manager import ExitManager
 from app.services.market_data import infer_asset_class, normalize_asset_class
+from app.services.scanner import ScanResult
 from app.strategies.base import Signal, StrategyContext, TradeSignal
 from app.utils.datetime_parser import parse_iso_datetime
 
@@ -86,6 +87,7 @@ class AutoTrader:
         self._last_notification_ids: List[str] = []
         self._latest_skipped_reason: str | None = None
         self._latest_rejected_reason: str | None = None
+        self._latest_dust_resolution: Dict[str, Any] | None = None
         self._last_submitted_order: Dict[str, Any] | None = None
         self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
         self._session_order_ids: set[str] = set()
@@ -94,6 +96,8 @@ class AutoTrader:
         self._latest_broker_order_status_updates: List[Dict[str, Any]] = []
         self._broker_status_dedupe_suppressed: int = 0
         self._process_lock_handle: Any | None = None
+        self._last_asset_class_run_at: Dict[str, datetime.datetime] = {}
+        self._last_cadence_diagnostics: Dict[str, Any] = {}
 
     def start(self) -> bool:
         with self._state_lock:
@@ -330,6 +334,12 @@ class AutoTrader:
                 "scan_selection_mode": scan_selection_mode,
                 "scan_requested_symbols": scan_requested_symbols or [],
                 "scan_ranking_limit": scan_ranking_limit,
+                "scan_selection_mode_by_asset_class": self._last_scan_overview.get("scan_selection_mode_by_asset_class", {}),
+                "scan_requested_symbols_by_asset_class": self._last_scan_overview.get("scan_requested_symbols_by_asset_class", {}),
+                "scan_timeframes_by_asset_class": self._last_scan_overview.get("timeframes_by_asset_class", {}),
+                "scan_prefilter_counts": self._last_scan_overview.get("prefilter_counts", {}),
+                "scan_final_evaluation_counts": self._last_scan_overview.get("final_evaluation_counts", {}),
+                "signal_funnel": self._last_scan_overview.get("signal_funnel", {}),
                 "last_scan_scanned_count": self._last_scan_overview.get("scanned_count"),
                 "last_ranked_candidate_count": len(self._last_ranked_candidates),
                 "last_symbol_evaluation_count": len(self._last_symbol_evaluations),
@@ -346,10 +356,16 @@ class AutoTrader:
                 "last_cycle_id": self._last_cycle_id,
                 "latest_rejected_reason": self._latest_rejected_reason,
                 "latest_skipped_reason": self._latest_skipped_reason,
+                "latest_dust_resolution": self._latest_dust_resolution,
                 "last_submitted_order": self._last_submitted_order,
                 "latest_broker_order_status_updates": self._latest_broker_order_status_updates,
                 "broker_status_dedupe_suppressed": self._broker_status_dedupe_suppressed,
                 "summary_dedupe_suppressed": self._summary_dedupe_suppressed,
+                "last_cadence_diagnostics": self._last_cadence_diagnostics,
+                "asset_class_last_run_at": {
+                    asset_class: value.isoformat() + "Z"
+                    for asset_class, value in self._last_asset_class_run_at.items()
+                },
                 "recent_notification_ids": self._last_notification_ids,
                 "notifier_diagnostics": notifier_diagnostics,
                 "thread_ident": self._loop_thread_ident,
@@ -362,6 +378,111 @@ class AutoTrader:
                 "process_lock_acquired": self._process_lock_handle is not None,
             }
 
+    def _loop_wake_interval_seconds(self) -> float:
+        intervals = [
+            self.settings.scan_interval_for_asset_class(asset_class)
+            for asset_class in self._enabled_asset_classes()
+        ]
+        if not intervals:
+            return max(1.0, float(self.settings.scan_interval_seconds))
+        return max(1.0, float(min([self.settings.scan_interval_seconds, *intervals])))
+
+    def _enabled_asset_classes(self) -> list[AssetClass]:
+        ordered = [AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO, AssetClass.OPTION]
+        return [asset_class for asset_class in ordered if asset_class in self.settings.enabled_asset_class_set]
+
+    def _configured_symbols_for_asset_class(self, asset_class: AssetClass) -> list[str]:
+        candidate_groups: list[list[str]] = []
+        if asset_class == AssetClass.CRYPTO:
+            candidate_groups.append(list(self.settings.active_crypto_symbols))
+            candidate_groups.append(list(self.settings.crypto_symbols))
+        candidate_groups.append(list(self.settings.active_symbols))
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for group in candidate_groups:
+            for symbol in group:
+                try:
+                    resolved_asset = self._resolve_asset(symbol, asset_class)
+                except Exception:
+                    continue
+                if resolved_asset.asset_class != asset_class or resolved_asset.symbol in seen:
+                    continue
+                seen.add(resolved_asset.symbol)
+                symbols.append(resolved_asset.symbol)
+        return symbols
+
+    def _open_symbols_by_asset_class(self) -> dict[AssetClass, list[str]]:
+        grouped: dict[AssetClass, list[str]] = {}
+        for position in self.portfolio.positions.values():
+            if position.asset_class not in self.settings.enabled_asset_class_set:
+                continue
+            grouped.setdefault(position.asset_class, []).append(position.symbol)
+        return grouped
+
+    def _build_cadence_diagnostics(
+        self,
+        *,
+        now: datetime.datetime,
+        due_asset_classes: list[AssetClass],
+        open_symbols_by_asset_class: dict[AssetClass, list[str]],
+    ) -> dict[str, Any]:
+        due_set = set(due_asset_classes)
+        diagnostics: dict[str, Any] = {
+            "checked_at": now.isoformat() + "Z",
+            "due_asset_classes": [asset_class.value for asset_class in due_asset_classes],
+            "skipped_asset_classes": {},
+            "skipped_symbol_count": 0,
+        }
+        for asset_class in self._enabled_asset_classes():
+            if asset_class in due_set:
+                continue
+            interval = self.settings.scan_interval_for_asset_class(asset_class)
+            last_run_at = self._last_asset_class_run_at.get(asset_class.value)
+            elapsed_seconds = None
+            next_due_in_seconds = 0
+            if last_run_at is not None:
+                elapsed_seconds = max(0.0, (now - last_run_at).total_seconds())
+                next_due_in_seconds = max(0.0, float(interval) - elapsed_seconds)
+            configured_symbols = self._configured_symbols_for_asset_class(asset_class)
+            open_symbols = list(dict.fromkeys(open_symbols_by_asset_class.get(asset_class, [])))
+            skipped_symbols = list(dict.fromkeys(configured_symbols + open_symbols))
+            diagnostics["skipped_asset_classes"][asset_class.value] = {
+                "interval_seconds": interval,
+                "elapsed_seconds": elapsed_seconds,
+                "next_due_in_seconds": next_due_in_seconds,
+                "configured_symbol_count": len(configured_symbols),
+                "open_position_symbol_count": len(open_symbols),
+                "skipped_symbol_count": len(skipped_symbols),
+            }
+            diagnostics["skipped_symbol_count"] += len(skipped_symbols)
+        return diagnostics
+
+    def _due_asset_classes(
+        self,
+        *,
+        now: datetime.datetime,
+        respect_cadence: bool,
+    ) -> list[AssetClass]:
+        if not respect_cadence:
+            return self._enabled_asset_classes()
+        due: list[AssetClass] = []
+        for asset_class in self._enabled_asset_classes():
+            interval = self.settings.scan_interval_for_asset_class(asset_class)
+            last_run_at = self._last_asset_class_run_at.get(asset_class.value)
+            if last_run_at is None or (now - last_run_at).total_seconds() >= interval:
+                due.append(asset_class)
+        return due
+
+    def _mark_asset_classes_ran(
+        self,
+        asset_classes: list[AssetClass],
+        *,
+        ran_at: datetime.datetime,
+    ) -> None:
+        with self._state_lock:
+            for asset_class in asset_classes:
+                self._last_asset_class_run_at[asset_class.value] = ran_at
+
     def _run_loop(self) -> None:
         with self._state_lock:
             self._loop_thread_ident = threading.get_ident()
@@ -371,7 +492,7 @@ class AutoTrader:
                     break
 
             try:
-                self._scan_and_trade(mode="background_loop")
+                self._scan_and_trade(mode="background_loop", respect_cadence=True)
                 with self._state_lock:
                     self._last_run_time = datetime.datetime.utcnow()
                     self._last_error = None
@@ -387,7 +508,7 @@ class AutoTrader:
                     }
                 self._notify_cycle_failure(exc, context={"mode": "background_loop"})
 
-            if self._wake_event.wait(self.settings.scan_interval_seconds):
+            if self._wake_event.wait(self._loop_wake_interval_seconds()):
                 self._wake_event.clear()
 
     def _resolve_asset(
@@ -424,6 +545,21 @@ class AutoTrader:
             self.portfolio.sync_account_state(account.cash, account.equity)
         except Exception as exc:
             logger.warning("Failed to refresh portfolio cash/equity: %s", exc)
+
+        resolved_dust_positions: list[dict[str, Any]] = []
+        try:
+            resolved_dust_positions = self.execution_service.resolve_tracked_dust_positions(source="broker_sync")
+        except Exception as exc:
+            logger.warning("Failed to resolve tracked dust positions after broker sync: %s", exc)
+        else:
+            if resolved_dust_positions:
+                with self._state_lock:
+                    self._latest_dust_resolution = {
+                        "source": "broker_sync",
+                        "count": len(resolved_dust_positions),
+                        "positions": resolved_dust_positions[-5:],
+                        "resolved_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    }
 
         try:
             self.asset_catalog.ensure_fresh()
@@ -467,39 +603,28 @@ class AutoTrader:
     def _build_context(
         self,
         asset: AssetMetadata,
-        bars: Any,
+        entry_bars: Any,
         *,
         strategy: Any,
         snapshot: NormalizedMarketSnapshot,
+        entry_timeframe: str,
+        regime_timeframe: str,
+        regime_bars: Any = None,
+        benchmark_bars: Any = None,
     ) -> StrategyContext:
-        benchmark_bars = None
-        regime_symbol = getattr(strategy, "regime_symbol", "SPY")
-        if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF} and asset.symbol != regime_symbol:
-            try:
-                # Fetch enough benchmark data for regime strategies
-                regime_long_sma = getattr(strategy, "regime_long_sma", 25)
-                benchmark_limit = (
-                    250
-                    if getattr(strategy, "name", "") == "equity_momentum_breakout"
-                    else max(30, regime_long_sma + 5)
-                )
-                benchmark_bars = self.market_data_service.fetch_bars(
-                    regime_symbol,
-                    asset_class=AssetClass.ETF,
-                    timeframe=self.settings.default_timeframe,
-                    limit=benchmark_limit,
-                )
-            except Exception as exc:
-                logger.warning("Failed to fetch benchmark bars: %s", exc)
         tracked_position = self.portfolio.get_position(asset.symbol)
         position_state = self.portfolio.get_position_state(asset.symbol)
         return StrategyContext(
             asset=asset,
             session=self.market_data_service.get_session_status(asset.asset_class),
             quote=self.market_data_service.get_latest_quote(asset.symbol, asset.asset_class),
-            timeframe=self.settings.default_timeframe,
+            timeframe=entry_timeframe,
             metadata={
+                "entry_bars": entry_bars,
+                "regime_bars": regime_bars,
                 "benchmark_bars": benchmark_bars,
+                "entry_timeframe": entry_timeframe,
+                "regime_timeframe": regime_timeframe,
                 "short_selling_enabled": self.settings.short_selling_enabled,
                 **position_state,
                 "normalized_snapshot": snapshot.to_dict(),
@@ -525,6 +650,56 @@ class AutoTrader:
                 ),
             },
         )
+
+    def _fetch_strategy_bars(
+        self,
+        asset: AssetMetadata,
+        *,
+        strategy: Any,
+    ) -> tuple[Any, Any, Any, str, str]:
+        entry_timeframe = self.settings.entry_timeframe_for_asset_class(asset.asset_class)
+        regime_timeframe = self.settings.regime_timeframe_for_asset_class(asset.asset_class)
+        lookback_bars = self.settings.lookback_bars_for_asset_class(asset.asset_class)
+        strategy_name = getattr(strategy, "name", "")
+        regime_long_sma = max(
+            0,
+            int(
+                getattr(strategy, "regime_long_sma", 0)
+                or getattr(strategy, "slow_window", 0)
+                or 0
+            ),
+        )
+        entry_limit = max(lookback_bars, 30)
+        regime_limit = max(lookback_bars, regime_long_sma + 5 if regime_long_sma else 30)
+        entry_bars = self.market_data_service.fetch_bars(
+            asset.symbol,
+            asset_class=asset.asset_class,
+            timeframe=entry_timeframe,
+            limit=entry_limit,
+        )
+        if regime_timeframe == entry_timeframe:
+            regime_bars = entry_bars
+        else:
+            regime_bars = self.market_data_service.fetch_bars(
+                asset.symbol,
+                asset_class=asset.asset_class,
+                timeframe=regime_timeframe,
+                limit=regime_limit,
+            )
+
+        benchmark_bars = None
+        regime_symbol = getattr(strategy, "regime_symbol", "SPY")
+        if strategy_name == "equity_momentum_breakout":
+            benchmark_limit = max(regime_limit, regime_long_sma + 5 if regime_long_sma else 30)
+            benchmark_symbol = regime_symbol if asset.symbol != regime_symbol else asset.symbol
+            benchmark_asset_class = AssetClass.ETF if benchmark_symbol == regime_symbol else asset.asset_class
+            benchmark_bars = self.market_data_service.fetch_bars(
+                benchmark_symbol,
+                asset_class=benchmark_asset_class,
+                timeframe=regime_timeframe,
+                limit=benchmark_limit,
+            )
+        return entry_bars, regime_bars, benchmark_bars, entry_timeframe, regime_timeframe
 
     def _get_normalized_snapshot(
         self,
@@ -743,19 +918,34 @@ class AutoTrader:
                     },
                 )
 
-        # Fetch enough data for regime strategies (at least 250 bars for 200-day regime)
-        min_bars = 250 if getattr(strategy, "name", "") == "equity_momentum_breakout" else 60
-        bars = self.market_data_service.fetch_bars(
-            asset.symbol,
-            asset_class=asset.asset_class,
-            timeframe=self.settings.default_timeframe,
-            limit=min_bars,
+        entry_bars, regime_bars, benchmark_bars, entry_timeframe, regime_timeframe = self._fetch_strategy_bars(
+            asset,
+            strategy=strategy,
         )
-        context = self._build_context(asset, bars, strategy=strategy, snapshot=normalized_snapshot)
+        context = self._build_context(
+            asset,
+            entry_bars,
+            strategy=strategy,
+            snapshot=normalized_snapshot,
+            entry_timeframe=entry_timeframe,
+            regime_timeframe=regime_timeframe,
+            regime_bars=regime_bars,
+            benchmark_bars=benchmark_bars,
+        )
         candidate_signals: list[TradeSignal] = []
-        strategy_input: Any = bars
-        if getattr(strategy, "name", "") == "equity_momentum_breakout":
-            strategy_input = {"symbol": bars, "benchmark": context.metadata.get("benchmark_bars")}
+        strategy_input: Any = entry_bars
+        strategy_name = getattr(strategy, "name", "")
+        if strategy_name == "equity_momentum_breakout":
+            strategy_input = {
+                "symbol": entry_bars,
+                "benchmark": benchmark_bars,
+                "regime": regime_bars,
+            }
+        elif strategy_name == "crypto_momentum_trend" and regime_timeframe != entry_timeframe:
+            strategy_input = {
+                "entry": entry_bars,
+                "regime": regime_bars,
+            }
         try:
             candidate_signals.extend(strategy.generate_signals(asset.symbol, strategy_input, context=context))
         except TypeError as exc:
@@ -800,13 +990,17 @@ class AutoTrader:
         signal.liquidity_score = signal.liquidity_score or 0.0
         if signal.metrics is None:
             signal.metrics = {}
-        latest_volume = float(bars.iloc[-1]["Volume"]) if not bars.empty else None
-        signal.metrics.setdefault("avg_volume", float(bars["Volume"].tail(10).mean()) if not bars.empty else None)
+        latest_volume = float(entry_bars.iloc[-1]["Volume"]) if not entry_bars.empty else None
+        signal.metrics.setdefault("avg_volume", float(entry_bars["Volume"].tail(10).mean()) if not entry_bars.empty else None)
         signal.metrics.setdefault("dollar_volume", (signal.metrics.get("avg_volume") or 0.0) * (signal.entry_price or signal.price or 0.0))
         signal.metrics.setdefault("latest_volume", latest_volume)
         signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
         signal.metrics["decision_code"] = signal.metrics.get("decision_code") or ("no_signal" if signal.signal == Signal.HOLD else "signal")
         signal.metrics["strategy_selected"] = strategy.name
+        signal.metrics["entry_timeframe"] = entry_timeframe
+        signal.metrics["regime_timeframe"] = regime_timeframe
+        signal.metrics["entry_bar_count"] = len(entry_bars)
+        signal.metrics["regime_bar_count"] = len(regime_bars) if regime_bars is not None else len(entry_bars)
         return signal
 
     @staticmethod
@@ -950,7 +1144,80 @@ class AutoTrader:
         hold_signal.apply_intent_defaults()
         return hold_signal
 
-    def _scan_and_trade(self, *, mode: str = "auto") -> List[Dict[str, Any]]:
+    def _merge_scan_results(
+        self,
+        scan_results_by_asset_class: dict[str, ScanResult],
+    ) -> ScanResult:
+        ordered_results = [
+            scan_results_by_asset_class[key]
+            for key in sorted(scan_results_by_asset_class.keys())
+        ]
+        opportunities = [
+            opportunity
+            for result in ordered_results
+            for opportunity in result.opportunities
+        ]
+        sorted_by_quality = sorted(
+            opportunities,
+            key=lambda item: item.signal_quality_score,
+            reverse=True,
+        )
+        regime_status: dict[str, int] = {}
+        symbol_snapshots: dict[str, Any] = {}
+        prefilter_counts: dict[str, int] = {}
+        final_evaluation_counts: dict[str, int] = {}
+        timeframes_by_asset_class: dict[str, dict[str, Any]] = {}
+        symbol_inclusion_reasons: dict[str, list[str]] = {}
+        selection_diagnostics: dict[str, Any] = {}
+        errors: list[dict[str, str]] = []
+        scanned_count = 0
+        for result in ordered_results:
+            scanned_count += result.scanned_count
+            errors.extend(result.errors)
+            symbol_snapshots.update(result.symbol_snapshots)
+            prefilter_counts.update(result.prefilter_counts)
+            final_evaluation_counts.update(result.final_evaluation_counts)
+            timeframes_by_asset_class.update(result.timeframes_by_asset_class)
+            symbol_inclusion_reasons.update(result.symbol_inclusion_reasons)
+            selection_diagnostics.update(result.selection_diagnostics)
+            for label, count in result.regime_status.items():
+                regime_status[label] = regime_status.get(label, 0) + count
+
+        limit = max(len(sorted_by_quality), 1)
+        return ScanResult(
+            generated_at=max((result.generated_at for result in ordered_results), default=datetime.datetime.utcnow()),
+            asset_class=ordered_results[0].asset_class if len(ordered_results) == 1 else None,
+            scanned_count=scanned_count,
+            opportunities=sorted_by_quality[:limit],
+            top_gainers=sorted(
+                opportunities,
+                key=lambda item: item.price_change_pct if item.price_change_pct is not None else -999.0,
+                reverse=True,
+            )[:limit],
+            top_losers=sorted(
+                opportunities,
+                key=lambda item: item.price_change_pct if item.price_change_pct is not None else 999.0,
+            )[:limit],
+            unusual_volume=sorted(
+                opportunities,
+                key=lambda item: item.metrics.get("relative_volume", 0.0),
+                reverse=True,
+            )[:limit],
+            breakouts=[item for item in sorted_by_quality if "breakout" in item.tags][:limit],
+            pullbacks=[item for item in sorted_by_quality if "pullback" in item.tags][:limit],
+            volatility=sorted(opportunities, key=lambda item: item.volatility_score, reverse=True)[:limit],
+            momentum=sorted(opportunities, key=lambda item: item.momentum_score, reverse=True)[:limit],
+            regime_status=regime_status,
+            errors=errors,
+            symbol_snapshots=symbol_snapshots,
+            prefilter_counts=prefilter_counts,
+            final_evaluation_counts=final_evaluation_counts,
+            timeframes_by_asset_class=timeframes_by_asset_class,
+            symbol_inclusion_reasons=symbol_inclusion_reasons,
+            selection_diagnostics=selection_diagnostics,
+        )
+
+    def _scan_and_trade(self, *, mode: str = "auto", respect_cadence: bool = False) -> List[Dict[str, Any]]:
         if not self._cycle_guard.acquire(blocking=False):
             logger.info("Scan cycle skipped because another cycle is already running", extra={"mode": mode})
             with self._state_lock:
@@ -981,47 +1248,77 @@ class AutoTrader:
             )
 
             with self._execution_lock:
-                scan_bar_index = self.tranche_state.increment_scan_bar_index()
                 self._sync_portfolio_from_broker()
-                scan_selection_mode = "catalog_universe"
-                requested_scan_symbols: list[str] = []
-                scan_ranking_limit = max(10, self.settings.max_positions_total * 3)
-                if self.settings.crypto_only_mode:
-                    requested_scan_symbols = list(self.settings.active_symbols)
-                    scan_selection_mode = "configured_active_symbols"
-                    scan_ranking_limit = max(1, len(requested_scan_symbols))
-                    scan_result = self.scanner.scan(
-                        asset_class=self.settings.primary_runtime_asset_class,
-                        symbols=requested_scan_symbols,
-                        limit=scan_ranking_limit,
-                    )
-                elif self.settings.universe_scan_enabled:
-                    scan_result = self.scanner.scan(limit=scan_ranking_limit)
-                else:
-                    requested_scan_symbols = list(self.settings.active_symbols)
-                    scan_selection_mode = "configured_active_symbols"
-                    scan_ranking_limit = max(1, len(requested_scan_symbols))
-                    scan_result = self.scanner.scan(
-                        symbols=self.settings.active_symbols,
-                        limit=scan_ranking_limit,
-                    )
+                open_symbols_by_asset_class = self._open_symbols_by_asset_class()
+                due_asset_classes = self._due_asset_classes(now=now, respect_cadence=respect_cadence)
+                cadence_diagnostics = self._build_cadence_diagnostics(
+                    now=now,
+                    due_asset_classes=due_asset_classes,
+                    open_symbols_by_asset_class=open_symbols_by_asset_class,
+                )
+                if respect_cadence and not due_asset_classes:
+                    with self._state_lock:
+                        self._last_cadence_diagnostics = cadence_diagnostics
+                        self._last_run_result = {
+                            "mode": mode,
+                            "status": "skipped",
+                            "reason": "cadence_not_due",
+                            "cadence": cadence_diagnostics,
+                            "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+                        }
+                    return []
 
-                candidate_symbols = [item.symbol for item in scan_result.opportunities]
-                selected_scan_symbols = list((scan_result.symbol_snapshots or {}).keys())
-                if self.settings.crypto_only_mode or not self.settings.universe_scan_enabled:
-                    monitored_symbols = selected_scan_symbols or candidate_symbols
-                else:
-                    monitored_symbols = candidate_symbols
-                allowed_asset_classes = self.settings.enabled_asset_class_set
-                open_symbols = [
-                    position.symbol
-                    for position in self.portfolio.positions.values()
-                    if position.asset_class in allowed_asset_classes
-                ]
-                all_symbols = list(dict.fromkeys(monitored_symbols + open_symbols))
+                scan_bar_index = self.tranche_state.increment_scan_bar_index()
+                scan_results_by_asset_class: dict[str, ScanResult] = {}
+                scan_selection_mode_by_asset_class: dict[str, str] = {}
+                requested_scan_symbols_by_asset_class: dict[str, list[str]] = {}
+                scan_ranking_limit_by_asset_class: dict[str, int] = {}
+
+                for asset_class in due_asset_classes:
+                    asset_key = asset_class.value
+                    requested_scan_symbols = self._configured_symbols_for_asset_class(asset_class)
+                    open_symbols = list(dict.fromkeys(open_symbols_by_asset_class.get(asset_class, [])))
+                    inclusion_reasons = {
+                        symbol: ["open_position"]
+                        for symbol in open_symbols
+                    }
+                    if self.settings.crypto_only_mode or not self.settings.universe_scan_enabled:
+                        scan_selection_mode = "configured_active_symbols"
+                        requested_scan_symbols = list(dict.fromkeys(requested_scan_symbols + open_symbols))
+                        scan_ranking_limit = max(1, len(requested_scan_symbols))
+                        for symbol in requested_scan_symbols:
+                            reasons = inclusion_reasons.setdefault(symbol, [])
+                            if symbol in open_symbols:
+                                reasons.append("open_position")
+                            if symbol in self._configured_symbols_for_asset_class(asset_class):
+                                reasons.append("configured_active_symbol")
+                        scan_result = self.scanner.scan(
+                            asset_class=asset_class,
+                            symbols=requested_scan_symbols,
+                            limit=scan_ranking_limit,
+                            inclusion_reasons=inclusion_reasons,
+                        )
+                    else:
+                        scan_selection_mode = "ranked_prefilter_universe"
+                        scan_ranking_limit = max(5, self.settings.final_evaluation_limit_for_asset_class(asset_class))
+                        scan_result = self.scanner.scan(
+                            asset_class=asset_class,
+                            limit=scan_ranking_limit,
+                            required_symbols=open_symbols,
+                            inclusion_reasons=inclusion_reasons,
+                        )
+                    scan_results_by_asset_class[asset_key] = scan_result
+                    scan_selection_mode_by_asset_class[asset_key] = scan_selection_mode
+                    requested_scan_symbols_by_asset_class[asset_key] = requested_scan_symbols
+                    scan_ranking_limit_by_asset_class[asset_key] = scan_ranking_limit
+
+                scan_result = self._merge_scan_results(scan_results_by_asset_class)
+                all_symbols = list((scan_result.symbol_snapshots or {}).keys())
                 assets = [self._resolve_asset(symbol) for symbol in all_symbols]
                 snapshot_by_symbol = scan_result.symbol_snapshots or {}
                 opportunity_by_symbol = {item.symbol: item for item in scan_result.opportunities}
+                inclusion_reasons_by_symbol = scan_result.symbol_inclusion_reasons or {}
+                timeframes_by_asset_class = scan_result.timeframes_by_asset_class or {}
                 news_features_by_symbol = self._load_news_features(all_symbols)
 
                 signals: list[TradeSignal] = []
@@ -1063,11 +1360,14 @@ class AutoTrader:
                     evaluation_action = self._classify_evaluation_action(signal)
                     signal_snapshot = (signal.metrics or {}).get("normalized_snapshot", {})
                     price_source_used = (signal.metrics or {}).get("price_source_used") or signal_snapshot.get("price_source_used")
+                    class_timeframes = timeframes_by_asset_class.get(asset.asset_class.value, {})
+                    ranked_opportunity = opportunity_by_symbol.get(asset.symbol)
                     symbol_evaluations.append(
                         {
                             "symbol": asset.symbol,
                             "asset_class": asset.asset_class.value,
                             "strategy_selected": (signal.metrics or {}).get("strategy_selected", signal.strategy_name),
+                            "initial_action": evaluation_action,
                             "market_session_state": signal_snapshot.get("session_state"),
                             "latest_normalized_snapshot": signal_snapshot,
                             "quote_available": (signal.metrics or {}).get("quote_available"),
@@ -1086,6 +1386,15 @@ class AutoTrader:
                             "classification": normalize_outcome_classification(evaluation_action, decision_code),
                             "decision_rule": decision_code or None,
                             "decision_reason": signal.reason,
+                            "scanner_timeframe": class_timeframes.get("scanner_timeframe"),
+                            "entry_timeframe": (signal.metrics or {}).get("entry_timeframe") or class_timeframes.get("entry_timeframe"),
+                            "regime_timeframe": (signal.metrics or {}).get("regime_timeframe") or class_timeframes.get("regime_timeframe"),
+                            "scan_inclusion_reasons": inclusion_reasons_by_symbol.get(asset.symbol, []),
+                            "prefilter_score": (
+                                (ranked_opportunity.metrics or {}).get("prefilter_score")
+                                if ranked_opportunity is not None
+                                else None
+                            ),
                             "ml_score": ((signal.metrics or {}).get("ml") or {}).get("score"),
                             "ml_passed": ((signal.metrics or {}).get("ml") or {}).get("passed"),
                         }
@@ -1152,7 +1461,9 @@ class AutoTrader:
                         row["decision_reason"] = ranking.get("selection_reason") or "Candidate not selected this cycle."
 
                 outcome_counts = self._count_outcomes(symbol_evaluations)
+                signal_funnel = self._count_signal_funnel(symbol_evaluations, outcome_counts)
                 self._observe_broker_order_statuses(cycle_id=cycle_id)
+                self._mark_asset_classes_ran(due_asset_classes, ran_at=now)
 
                 with self._state_lock:
                     self._last_run_time = now
@@ -1175,13 +1486,26 @@ class AutoTrader:
                     ] or [item.to_dict() for item in scan_result.opportunities]
                     self._last_regime_snapshot = scan_result.regime_status
                     self._last_scan_overview = scan_result.to_dict()
+                    self._last_cadence_diagnostics = cadence_diagnostics
                     self._last_scan_overview["scan_bar_index"] = scan_bar_index
                     self._last_scan_overview["cycle_id"] = cycle_id
                     self._last_scan_overview["mode"] = mode
                     self._last_scan_overview["outcome_counts"] = outcome_counts
-                    self._last_scan_overview["scan_selection_mode"] = scan_selection_mode
-                    self._last_scan_overview["scan_requested_symbols"] = requested_scan_symbols
-                    self._last_scan_overview["scan_ranking_limit"] = scan_ranking_limit
+                    self._last_scan_overview["signal_funnel"] = signal_funnel
+                    self._last_scan_overview["scan_selection_mode"] = "per_asset_class_cadence"
+                    self._last_scan_overview["scan_selection_mode_by_asset_class"] = scan_selection_mode_by_asset_class
+                    self._last_scan_overview["scan_requested_symbols"] = list(
+                        dict.fromkeys(
+                            symbol
+                            for symbols in requested_scan_symbols_by_asset_class.values()
+                            for symbol in symbols
+                        )
+                    )
+                    self._last_scan_overview["scan_requested_symbols_by_asset_class"] = requested_scan_symbols_by_asset_class
+                    self._last_scan_overview["scan_ranking_limit"] = max(scan_ranking_limit_by_asset_class.values(), default=0)
+                    self._last_scan_overview["scan_ranking_limit_by_asset_class"] = scan_ranking_limit_by_asset_class
+                    self._last_scan_overview["due_asset_classes"] = [asset_class.value for asset_class in due_asset_classes]
+                    self._last_scan_overview["cadence"] = cadence_diagnostics
                     self._last_scan_overview["evaluated_symbol_count"] = len(symbol_evaluations)
                     self._last_symbol_evaluations = symbol_evaluations
                     self._last_run_result = self._summarize_results(mode, results)
@@ -1232,6 +1556,7 @@ class AutoTrader:
             "symbol": asset.symbol,
             "asset_class": asset.asset_class.value,
             "strategy_selected": (signal.metrics or {}).get("strategy_selected", signal.strategy_name),
+            "initial_action": self._classify_evaluation_action(signal),
             "market_session_state": snapshot.get("session_state"),
             "latest_normalized_snapshot": snapshot,
             "quote_available": snapshot.get("quote_available"),
@@ -1241,6 +1566,9 @@ class AutoTrader:
             "price_source_for_signal": snapshot.get("price_source_used"),
             "price_source_for_order_proposal": (execution.get("risk") or {}).get("details", {}).get("price_source_used") or snapshot.get("price_source_used"),
             "price_source_for_spread_check": (execution.get("risk") or {}).get("details", {}).get("price_source_used") or snapshot.get("price_source_used"),
+            "scanner_timeframe": (signal.metrics or {}).get("scanner_timeframe"),
+            "entry_timeframe": (signal.metrics or {}).get("entry_timeframe"),
+            "regime_timeframe": (signal.metrics or {}).get("regime_timeframe"),
             "latest_price": execution.get("latest_price"),
             "signal": signal.signal.value,
             "action": execution.get("action"),
@@ -1269,6 +1597,8 @@ class AutoTrader:
             if action == "rejected":
                 self._last_rejected_candidate = result
                 self._latest_rejected_reason = risk.get("reason")
+            elif action == "dust_resolved":
+                self._latest_dust_resolution = result
             elif action in {"submitted", "dry_run"}:
                 self._last_accepted_candidate = result
                 self._last_submitted_order = result.get("order")
@@ -1302,7 +1632,7 @@ class AutoTrader:
         self,
         evaluations: list[dict[str, Any]],
     ) -> dict[str, int]:
-        counts: dict[str, int] = {"submitted": 0, "rejected": 0, "skipped": 0, "hold": 0}
+        counts: dict[str, int] = {"submitted": 0, "rejected": 0, "skipped": 0, "hold": 0, "dust_resolved": 0}
 
         for row in evaluations:
             action = str(row.get("action") or "").lower()
@@ -1316,6 +1646,20 @@ class AutoTrader:
             else:
                 counts["hold"] += 1
         return counts
+
+    def _count_signal_funnel(
+        self,
+        evaluations: list[dict[str, Any]],
+        outcome_counts: dict[str, int],
+    ) -> dict[str, int]:
+        return {
+            "hold": sum(1 for row in evaluations if str(row.get("signal") or "").upper() == Signal.HOLD.value),
+            "candidate": sum(1 for row in evaluations if str(row.get("initial_action") or "").lower() == "candidate"),
+            "submitted": int(outcome_counts.get("submitted", 0)),
+            "rejected": int(outcome_counts.get("rejected", 0)),
+            "skipped": int(outcome_counts.get("skipped", 0)),
+            "dust_resolved": int(outcome_counts.get("dust_resolved", 0)),
+        }
 
     def _summary_fingerprint(self, evaluations: list[dict[str, Any]]) -> str:
         compact = [
@@ -1731,6 +2075,9 @@ class AutoTrader:
         if ranked_opportunity is not None:
             signal.metrics["scan_signal_quality_score"] = getattr(ranked_opportunity, "signal_quality_score", None)
             signal.metrics["scan_tags"] = list(getattr(ranked_opportunity, "tags", []))
+            ranked_metrics = getattr(ranked_opportunity, "metrics", {}) or {}
+            signal.metrics.setdefault("scanner_timeframe", ranked_metrics.get("scanner_timeframe"))
+            signal.metrics.setdefault("scan_inclusion_reasons", ranked_metrics.get("inclusion_reasons"))
         if news_features:
             signal.metrics["news_features"] = dict(news_features)
 
@@ -2008,6 +2355,7 @@ class AutoTrader:
             self._last_cycle_id = None
             self._latest_skipped_reason = None
             self._latest_rejected_reason = None
+            self._latest_dust_resolution = None
             self._last_submitted_order = None
             self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
             self._session_order_ids = set()
@@ -2018,6 +2366,8 @@ class AutoTrader:
             self._broker_status_dedupe_suppressed = 0
             self._recent_summary_fingerprints = {}
             self._last_notification_ids = []
+            self._last_asset_class_run_at = {}
+            self._last_cadence_diagnostics = {}
         self._release_process_lock()
 
 
