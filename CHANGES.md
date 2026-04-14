@@ -375,7 +375,7 @@ Key tests added/should be added:
 
 ```bash
 # Check configuration loaded
-python verify_changes.py
+python scripts/verify_changes.py
 
 # Run specific coin
 curl -X POST http://localhost:8000/run-once \

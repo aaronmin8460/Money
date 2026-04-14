@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -231,3 +232,44 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
     assert settings.news_llm_enabled is False
     assert settings.openai_model == "gpt-4.1-nano"
     assert settings.news_lookback_hours == 12
+
+
+def test_api_admin_token_blank_is_normalized() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            api_admin_token="",
+        )
+
+    assert settings.api_admin_token is None
+
+
+def test_env_example_uses_safe_defaults_and_placeholders() -> None:
+    env_values: dict[str, str] = {}
+    env_example_path = Path(__file__).resolve().parents[1] / ".env.example"
+    contents = env_example_path.read_text(encoding="utf-8")
+
+    for raw_line in contents.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        env_values[key] = value
+
+    assert env_values["BROKER_MODE"] == "paper"
+    assert env_values["TRADING_ENABLED"] == "false"
+    assert env_values["AUTO_TRADE_ENABLED"] == "false"
+    assert env_values["LIVE_TRADING_ENABLED"] == "false"
+    assert env_values["DISCORD_NOTIFICATIONS_ENABLED"] == "false"
+    assert env_values["ML_ENABLED"] == "false"
+    assert env_values["ML_RETRAIN_ENABLED"] == "false"
+    assert env_values["NEWS_FEATURES_ENABLED"] == "false"
+    assert env_values["ALLOW_EXTENDED_HOURS"] == "false"
+    assert env_values["ALPACA_API_KEY"] == ""
+    assert env_values["ALPACA_SECRET_KEY"] == ""
+    assert env_values["DISCORD_WEBHOOK_URL"] == ""
+    assert env_values["API_ADMIN_TOKEN"] == ""
+    assert "1492154001083469857" not in contents
+    assert "PK2JJVNJM44OQ7VJGHI5K5K2S5" not in contents

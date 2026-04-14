@@ -90,7 +90,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
 ### 8. **Created new files:**
 
 - **CHANGES.md:** Comprehensive changelog with all details
-- **verify_changes.py:** Verification script that tests all major changes
+- **scripts/verify_changes.py:** Verification script that tests all major changes
 - **VERIFY.sh:** Bash script with exact commands for verification
 
 ---
@@ -230,7 +230,7 @@ All 16 major requirements have been addressed. The auto-trading flow now correct
 
 ### ✅ 10. TESTS (Plan, not fully implemented)
 
-- Verification script (verify_changes.py) covers:
+- Verification script (`scripts/verify_changes.py`) covers:
   1. ✓ Strategies routed correctly by asset_class
   2. ✓ Crypto evaluated when equity market closed (session state check)
   3. ✓ Market status accessible
@@ -310,7 +310,7 @@ All modules imported successfully. No syntax errors.
 ```bash
 cd /Users/byeongilmin/Desktop/Project/Money
 source .venv/bin/activate
-python verify_changes.py
+python scripts/verify_changes.py
 ```
 
 ### 2. MODULE IMPORT CHECKS
@@ -430,7 +430,7 @@ Files Changed:
 - app/api/routes.py (run-once endpoint usability)
 - .env (updated with new config)
 - CHANGES.md (created - comprehensive changelog)
-- verify_changes.py (created - verification script)
+- scripts/verify_changes.py (created - verification script)
 - VERIFY.sh (created - bash verification commands)
 ```
 

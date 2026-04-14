@@ -10,6 +10,8 @@ venv/
 !.env.example
 .DS_Store
 logs/
+server.log
+trading.db.bak.*
 models/*.joblib
 models/training_data.jsonl
 !models/registry.json

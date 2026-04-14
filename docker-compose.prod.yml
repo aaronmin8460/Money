@@ -1,0 +1,25 @@
+version: "3.8"
+
+# Production-oriented paper-trading compose profile.
+# Keep a single API/trader process and provide secrets through the env file.
+services:
+  api:
+    build: .
+    command: ["python", "scripts/run_paper_api.py", "--host", "0.0.0.0", "--port", "8000"]
+    env_file:
+      - .env
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    volumes:
+      - money_logs:/app/logs
+      - money_models:/app/models
+      - money_data:/app/data
+
+volumes:
+  money_logs:
+  money_models:
+  money_data:

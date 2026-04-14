@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
+from app.api.admin_auth import require_admin_auth
 from app.api.schemas import ResetLocalStateRequest
 from app.domain.models import AssetClass
 from app.monitoring.discord_notifier import get_discord_notifier
@@ -14,6 +15,7 @@ from app.services.runtime import get_runtime
 from app.strategies.base import Signal, TradeSignal
 
 router = APIRouter(tags=["admin"])
+protected_router = APIRouter(tags=["admin"], dependencies=[Depends(require_admin_auth)])
 
 
 @router.get("/health")
@@ -22,7 +24,7 @@ def health() -> dict[str, str]:
     return {"status": "ok", "mode": runtime.settings.broker_mode}
 
 
-@router.get("/config")
+@protected_router.get("/config")
 def config() -> dict[str, Any]:
     settings = get_runtime().settings
     return {
@@ -101,7 +103,7 @@ def config() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/universe")
+@protected_router.get("/diagnostics/universe")
 def diagnostics_universe() -> dict[str, Any]:
     runtime = get_runtime()
     assets = runtime.asset_catalog.get_scan_universe()
@@ -114,7 +116,7 @@ def diagnostics_universe() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/data-feed")
+@protected_router.get("/diagnostics/data-feed")
 def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = None) -> dict[str, Any]:
     runtime = get_runtime()
     resolved_symbol = symbol.strip().upper() if symbol else None
@@ -143,7 +145,7 @@ def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = N
     }
 
 
-@router.get("/diagnostics/strategies")
+@protected_router.get("/diagnostics/strategies")
 def diagnostics_strategies() -> dict[str, Any]:
     runtime = get_runtime()
     registry = runtime.strategy_registry
@@ -160,7 +162,7 @@ def diagnostics_strategies() -> dict[str, Any]:
     return {"strategies": strategies}
 
 
-@router.get("/diagnostics/strategy")
+@protected_router.get("/diagnostics/strategy")
 def diagnostics_strategy() -> dict[str, Any]:
     runtime = get_runtime()
     strategy_name = runtime.settings.primary_runtime_strategy
@@ -182,7 +184,7 @@ def diagnostics_strategy() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/auto")
+@protected_router.get("/diagnostics/auto")
 def diagnostics_auto() -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker()
@@ -256,14 +258,14 @@ def diagnostics_auto() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/risk")
+@protected_router.get("/diagnostics/risk")
 def diagnostics_risk(limit: int = 10) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker()
     return runtime.risk_manager.get_diagnostics(limit=limit)
 
 
-@router.get("/diagnostics/portfolio")
+@protected_router.get("/diagnostics/portfolio")
 def diagnostics_portfolio() -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker()
@@ -301,7 +303,7 @@ def diagnostics_portfolio() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/tranches")
+@protected_router.get("/diagnostics/tranches")
 def diagnostics_tranches() -> dict[str, Any]:
     runtime = get_runtime()
     return {
@@ -310,13 +312,13 @@ def diagnostics_tranches() -> dict[str, Any]:
     }
 
 
-@router.get("/diagnostics/rejections/latest")
+@protected_router.get("/diagnostics/rejections/latest")
 def diagnostics_rejections_latest(limit: int = 10) -> dict[str, Any]:
     runtime = get_runtime()
     return runtime.risk_manager.get_rejection_snapshot(limit=limit)
 
 
-@router.post("/admin/reset-local-state")
+@protected_router.post("/admin/reset-local-state")
 def admin_reset_local_state(
     request: ResetLocalStateRequest | None = Body(default=None),
 ) -> dict[str, Any]:
@@ -336,7 +338,7 @@ def admin_reset_local_state(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.post("/admin/notifications/test")
+@protected_router.post("/admin/notifications/test")
 def admin_notifications_test() -> dict[str, Any]:
     runtime = get_runtime()
     settings = runtime.settings
@@ -400,3 +402,6 @@ def admin_notifications_test() -> dict[str, Any]:
         "trade_action": trade_action,
         "results": results,
     }
+
+
+router.include_router(protected_router)

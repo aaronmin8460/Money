@@ -141,6 +141,7 @@ class Settings(BaseSettings):
     log_level: str = Field("INFO", env="LOG_LEVEL")
     database_url: str = Field("sqlite:///./trading.db", env="DATABASE_URL")
     log_dir: str = Field("logs", env="LOG_DIR")
+    api_admin_token: str | None = Field(None, env="API_ADMIN_TOKEN")
     broker_mode: str = Field("paper", env="BROKER_MODE")
     alpaca_api_key: str | None = Field(None, env="ALPACA_API_KEY")
     alpaca_secret_key: str | None = Field(None, env="ALPACA_SECRET_KEY")
@@ -510,8 +511,8 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("openai_api_key", mode="before")
-    def parse_openai_api_key(cls, value: str | None) -> str | None:
+    @field_validator("alpaca_api_key", "alpaca_secret_key", "api_admin_token", "openai_api_key", mode="before")
+    def parse_optional_secret_value(cls, value: str | None) -> str | None:
         if isinstance(value, str) and not value.strip():
             return None
         return value

@@ -31,9 +31,16 @@ def build_settings(**overrides: object) -> Settings:
         "quote_stale_after_seconds": 10**9,
         "data_stale_after_seconds": 10**9,
         "auto_trader_lock_path": f"{tempfile.gettempdir()}/money-api-test-{uuid.uuid4().hex}.lock",
+        "api_admin_token": "test-admin-token",
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def admin_auth_headers(token: str = "test-admin-token", *, use_bearer: bool = True) -> dict[str, str]:
+    if use_bearer:
+        return {"Authorization": f"Bearer {token}"}
+    return {"X-Admin-Token": token}
 
 
 def test_broker_status_route() -> None:
@@ -184,7 +191,7 @@ def test_admin_notifications_test_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(routes_admin_module, "get_discord_notifier", lambda settings: StubNotifier())
 
     with TestClient(app) as client:
-        response = client.post("/admin/notifications/test")
+        response = client.post("/admin/notifications/test", headers=admin_auth_headers())
 
     assert response.status_code == 200
     payload = response.json()
@@ -202,13 +209,34 @@ def test_admin_notifications_test_endpoint_is_debug_only() -> None:
     settings_module._settings = build_settings(app_env="production")
 
     with TestClient(app) as client:
-        response = client.post("/admin/notifications/test")
+        response = client.post("/admin/notifications/test", headers=admin_auth_headers())
 
     assert response.status_code == 403
 
 
+def test_protected_admin_routes_require_auth() -> None:
+    settings_module._settings = build_settings()
+
+    with TestClient(app) as client:
+        config_response = client.get("/config")
+        diagnostics_response = client.get("/diagnostics/auto", headers=admin_auth_headers(token="wrong-token"))
+
+    assert config_response.status_code == 401
+    assert diagnostics_response.status_code == 403
+
+
+def test_x_admin_token_header_is_accepted() -> None:
+    settings_module._settings = build_settings()
+
+    with TestClient(app) as client:
+        response = client.get("/config", headers=admin_auth_headers(use_bearer=False))
+
+    assert response.status_code == 200
+
+
 def test_diagnostics_endpoints_return_expected_fields() -> None:
     settings_module._settings = build_settings(trading_enabled=True)
+    headers = admin_auth_headers()
     with TestClient(app) as client:
         runtime = get_runtime()
         runtime.execution_service.process_signal(
@@ -224,12 +252,12 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
         )
         runtime.risk_manager.guard_against("TSLA", "SELL", 1.0, 250.0, asset_class=AssetClass.EQUITY)
 
-        risk_response = client.get("/diagnostics/risk")
-        auto_response = client.get("/diagnostics/auto")
-        strategy_response = client.get("/diagnostics/strategy")
-        portfolio_response = client.get("/diagnostics/portfolio")
-        rejections_response = client.get("/diagnostics/rejections/latest")
-        tranches_response = client.get("/diagnostics/tranches")
+        risk_response = client.get("/diagnostics/risk", headers=headers)
+        auto_response = client.get("/diagnostics/auto", headers=headers)
+        strategy_response = client.get("/diagnostics/strategy", headers=headers)
+        portfolio_response = client.get("/diagnostics/portfolio", headers=headers)
+        rejections_response = client.get("/diagnostics/rejections/latest", headers=headers)
+        tranches_response = client.get("/diagnostics/tranches", headers=headers)
 
     assert risk_response.status_code == 200
     risk_data = risk_response.json()
@@ -278,11 +306,12 @@ def test_crypto_only_diagnostics_report_crypto_runtime_focus() -> None:
         crypto_symbols=["BTC/USD", "ETH/USD", "SOL/USD"],
         active_strategy="equity_momentum_breakout",
     )
+    headers = admin_auth_headers()
 
     with TestClient(app) as client:
-        config_response = client.get("/config")
-        auto_response = client.get("/diagnostics/auto")
-        strategy_response = client.get("/diagnostics/strategy")
+        config_response = client.get("/config", headers=headers)
+        auto_response = client.get("/diagnostics/auto", headers=headers)
+        strategy_response = client.get("/diagnostics/strategy", headers=headers)
 
     assert config_response.status_code == 200
     config_payload = config_response.json()
@@ -324,7 +353,7 @@ def test_admin_reset_local_state_endpoint_works_with_default_payload() -> None:
             )
         )
 
-        response = client.post("/admin/reset-local-state")
+        response = client.post("/admin/reset-local-state", headers=admin_auth_headers())
 
     assert response.status_code == 200
     payload = response.json()

@@ -4,6 +4,8 @@ import argparse
 
 import uvicorn
 
+import _bootstrap  # noqa: F401
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
