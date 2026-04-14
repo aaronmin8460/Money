@@ -43,6 +43,7 @@ def test_alembic_upgrade_head_smoke(tmp_path) -> None:
         assert "orders" in tables
         assert "positions" in tables
         assert "fills" in tables
+        assert "runtime_safety_state" in tables
         assert "alembic_version" in tables
     finally:
         engine.dispose()
@@ -66,4 +67,4 @@ def test_init_db_stamps_existing_matching_schema(tmp_path) -> None:
     with engine.connect() as connection:
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
 
-    assert version == "20260414_0001"
+    assert version == "20260414_0002"

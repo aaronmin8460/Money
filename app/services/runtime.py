@@ -13,6 +13,7 @@ from app.services.asset_catalog import AssetCatalogService
 from app.services.broker import BrokerInterface, create_broker
 from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, MarketDataService
 from app.services.market_overview import MarketOverviewService
+from app.services.runtime_safety import RuntimeSafetyManager
 from app.services.scanner import ScannerService
 from app.services.tranche_state import TrancheStateStore
 from app.strategies.base import BaseStrategy
@@ -38,27 +39,38 @@ class RuntimeContainer:
     execution_service: ExecutionService
     strategy: BaseStrategy
     tranche_state: TrancheStateStore
+    runtime_safety: RuntimeSafetyManager
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _auto_trader: AutoTrader | None = field(default=None, init=False, repr=False)
 
-    def sync_with_broker(self) -> None:
+    def sync_with_broker(self, *, source: str = "runtime_sync") -> dict[str, bool | dict[str, object]]:
+        reconcile_snapshot: dict[str, object] = {}
+        account_synced = False
+        asset_catalog_synced = False
         with self.lock:
             try:
-                positions = self.broker.get_positions()
-                self.portfolio.reconcile_positions(positions)
+                reconcile_snapshot = self.runtime_safety.reconcile(source=source)
             except Exception as exc:
                 logger.warning("Failed to reconcile runtime positions: %s", exc)
 
             try:
                 account = self.broker.get_account()
                 self.portfolio.sync_account_state(account.cash, account.equity)
+                account_synced = True
             except Exception as exc:
                 logger.warning("Failed to refresh runtime account state: %s", exc)
+                self.runtime_safety.record_sync_failure(source=source, stage="account_refresh", error=exc)
 
             try:
                 self.asset_catalog.ensure_fresh()
+                asset_catalog_synced = True
             except Exception as exc:
                 logger.warning("Failed to refresh asset catalog: %s", exc)
+        return {
+            "account_synced": account_synced,
+            "asset_catalog_synced": asset_catalog_synced,
+            "reconciliation": reconcile_snapshot,
+        }
 
     def get_auto_trader(self) -> AutoTrader:
         if self._auto_trader is None:
@@ -108,6 +120,14 @@ def _compose_runtime(settings: Settings) -> RuntimeContainer:
         settings=settings,
         tranche_state=TrancheStateStore(),
     )
+    runtime_safety = RuntimeSafetyManager(
+        settings=settings,
+        broker=broker,
+        portfolio=portfolio,
+        tranche_state=execution_service.tranche_state,
+        risk_manager=risk_manager,
+    )
+    risk_manager.runtime_safety = runtime_safety
     runtime = RuntimeContainer(
         settings=settings,
         broker=broker,
@@ -121,13 +141,14 @@ def _compose_runtime(settings: Settings) -> RuntimeContainer:
         execution_service=execution_service,
         strategy=strategy,
         tranche_state=execution_service.tranche_state,
+        runtime_safety=runtime_safety,
     )
     return runtime
 
 
 def _build_runtime(settings: Settings) -> RuntimeContainer:
     runtime = _compose_runtime(settings)
-    runtime.sync_with_broker()
+    runtime.sync_with_broker(source="startup")
     logger.info(
         "Runtime initialized",
         extra={

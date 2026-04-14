@@ -17,6 +17,9 @@ FastAPI-based trading bot for paper-safe operation, structured logging, Discord 
 - ML can assist ranking and filtering, but it must not bypass hard stops, drawdown limits, or emergency exits.
 - News features can enrich signals, but they never place orders directly.
 - RL code remains offline and must not connect to paper or live execution.
+- Runtime safety can place the bot into an explicit halted state when configured circuit breakers trip or an operator halts it manually.
+- Halted mode blocks new exposure-increasing entries but still allows risk-reducing exits and cleanup.
+- Startup and runtime reconciliation compare broker positions, tracked local positions, and tranche state. Material mismatches are surfaced explicitly, alert through Discord when enabled, and can halt new entries.
 
 ## 3. Discord-only notification policy
 
@@ -118,6 +121,23 @@ curl http://127.0.0.1:8000/config \
   -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 ```
 
+Runtime safety examples:
+
+```bash
+curl http://127.0.0.1:8000/diagnostics/runtime-safety \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+curl http://127.0.0.1:8000/diagnostics/reconciliation \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+curl -X POST http://127.0.0.1:8000/admin/runtime-safety/halt \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"operator halt"}'
+curl -X POST http://127.0.0.1:8000/admin/runtime-safety/resume \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"resume after review","reset_consecutive_losing_exits":true}'
+```
+
 ## 7. Recommended EC2/systemd or compose-based paper deployment
 
 Recommended shape:
@@ -156,11 +176,22 @@ For production compose, set one of these in your real env file before starting:
 - `/health` remains public for health checks and container probes.
 - `/health/ready` is the public readiness probe and verifies runtime configuration plus database connectivity without placing trades.
 - `/config`, `/diagnostics/*`, `/admin/reset-local-state`, and `/admin/notifications/test` require admin authentication.
+- `/admin/runtime-safety/halt` and `/admin/runtime-safety/resume` are protected admin controls for intentional halt and recovery actions.
 - Authentication accepts either:
   - `Authorization: Bearer <token>`
   - `X-Admin-Token: <token>`
 - `API_ADMIN_TOKEN` should be treated as required in any shared, remote, staging, or production environment.
 - `/admin/notifications/test` remains development-only even when the request is authenticated.
+
+### Runtime safety operations
+
+- `HALT_ON_CONSECUTIVE_LOSSES=true` with `MAX_CONSECUTIVE_LOSING_EXITS=3` halts new entries after the configured number of realized losing exits in a row.
+- `HALT_ON_RECONCILE_MISMATCH=true` can halt new entries when reconciliation finds material broker/local state drift.
+- `HALT_ON_STARTUP_SYNC_FAILURE=true` can halt new entries if startup synchronization fails.
+- `/diagnostics/runtime-safety` shows the halted flag, halt reason and rule, consecutive loss count, entry allowance, loop metadata, and lock metadata.
+- `/diagnostics/reconciliation` shows the last reconcile status, mismatch summary, tracked local positions, broker positions, and tranche-state context.
+- Manual resume intentionally clears the halt. By default it also resets the consecutive losing exit counter unless you send `{"reset_consecutive_losing_exits": false}`.
+- Discord remains the only supported alert channel for halt, resume, reconcile mismatch, startup sync failure, and auto-heal events.
 
 ## 9. Data/log storage expectations
 
@@ -205,6 +236,10 @@ Runtime verification:
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/health/ready
 curl http://127.0.0.1:8000/auto/status
+curl http://127.0.0.1:8000/diagnostics/runtime-safety \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+curl http://127.0.0.1:8000/diagnostics/reconciliation \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 curl http://127.0.0.1:8000/config \
   -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 curl -X POST http://127.0.0.1:8000/auto/run-now

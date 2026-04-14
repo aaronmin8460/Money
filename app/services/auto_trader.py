@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import os
+import socket
 import threading
 import time
 from pathlib import Path
@@ -96,6 +97,7 @@ class AutoTrader:
         self._latest_broker_order_status_updates: List[Dict[str, Any]] = []
         self._broker_status_dedupe_suppressed: int = 0
         self._process_lock_handle: Any | None = None
+        self._process_lock_acquired_at: datetime.datetime | None = None
         self._last_asset_class_run_at: Dict[str, datetime.datetime] = {}
         self._last_cadence_diagnostics: Dict[str, Any] = {}
 
@@ -104,6 +106,7 @@ class AutoTrader:
             if self._running or (self._thread and self._thread.is_alive()):
                 logger.info("Paper auto-trader start skipped because it is already running")
                 return False
+            self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
             if not self._acquire_process_lock():
                 logger.warning(
                     "Paper auto-trader start blocked because another process holds the loop lock",
@@ -111,7 +114,6 @@ class AutoTrader:
                 )
                 return False
 
-            self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
             self._session_order_ids.clear()
             self._broker_status_baseline_synced = False
             self._order_status_memory = self._load_broker_order_status_memory()
@@ -282,6 +284,11 @@ class AutoTrader:
     def get_status(self) -> Dict[str, Any]:
         latest_rejection = self.risk_manager.get_rejection_snapshot(limit=1)["latest"]
         notifier_diagnostics = get_discord_notifier(self.settings).diagnostics()
+        lock_metadata = self._get_process_lock_diagnostics()
+        runtime_safety = self.runtime.runtime_safety.get_runtime_diagnostics(
+            lock_metadata=lock_metadata,
+            loop_metadata=self._get_loop_safety_snapshot(),
+        )
         with self._state_lock:
             scan_selection_mode = self._last_scan_overview.get("scan_selection_mode")
             if scan_selection_mode is None:
@@ -352,6 +359,7 @@ class AutoTrader:
                     for asset_class in sorted(self.settings.enabled_asset_class_set, key=lambda item: item.value)
                 },
                 "allow_extended_hours": self.settings.allow_extended_hours,
+                "cycle_in_progress": self._cycle_guard.locked(),
                 "scan_summary_notifications_enabled": self.settings.discord_notify_scan_summary,
                 "last_cycle_id": self._last_cycle_id,
                 "latest_rejected_reason": self._latest_rejected_reason,
@@ -376,6 +384,11 @@ class AutoTrader:
                 "news_features_enabled": self.settings.news_features_enabled,
                 "auto_trader_lock_path": self.settings.auto_trader_lock_path,
                 "process_lock_acquired": self._process_lock_handle is not None,
+                "process_lock_metadata": lock_metadata,
+                "runtime_safety": runtime_safety,
+                "runtime_halted": runtime_safety["halted"],
+                "new_entries_allowed": runtime_safety["new_entries_allowed"],
+                "last_reconcile_status": runtime_safety["last_reconcile_status"],
             }
 
     def _loop_wake_interval_seconds(self) -> float:
@@ -533,18 +546,8 @@ class AutoTrader:
             tradable=True,
         )
 
-    def _sync_portfolio_from_broker(self) -> None:
-        try:
-            positions = self.broker.get_positions()
-            self.portfolio.reconcile_positions(positions)
-        except Exception as exc:
-            logger.warning("Failed to reconcile portfolio positions: %s", exc)
-
-        try:
-            account = self.broker.get_account()
-            self.portfolio.sync_account_state(account.cash, account.equity)
-        except Exception as exc:
-            logger.warning("Failed to refresh portfolio cash/equity: %s", exc)
+    def _sync_portfolio_from_broker(self, *, source: str = "runtime_loop") -> None:
+        self.runtime.sync_with_broker(source=source)
 
         resolved_dust_positions: list[dict[str, Any]] = []
         try:
@@ -560,11 +563,6 @@ class AutoTrader:
                         "positions": resolved_dust_positions[-5:],
                         "resolved_at": datetime.datetime.utcnow().isoformat() + "Z",
                     }
-
-        try:
-            self.asset_catalog.ensure_fresh()
-        except Exception as exc:
-            logger.warning("Failed to refresh asset catalog: %s", exc)
 
         runtime_asset_class = self.settings.primary_runtime_asset_class
         try:
@@ -2301,6 +2299,82 @@ class AutoTrader:
             },
         )
 
+    @staticmethod
+    def _format_timestamp(value: datetime.datetime | None) -> str | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _current_lock_metadata(self, *, state: str) -> dict[str, Any]:
+        return {
+            "state": state,
+            "lock_path": self.settings.auto_trader_lock_path,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": self._format_timestamp(self._process_lock_acquired_at),
+            "process_started_at": self._format_timestamp(self._process_started_at),
+        }
+
+    def _write_lock_metadata(self, handle: Any, metadata: dict[str, Any]) -> None:
+        handle.seek(0)
+        handle.truncate(0)
+        handle.write(json.dumps(metadata, sort_keys=True))
+        handle.flush()
+
+    def _read_lock_file_metadata(self) -> dict[str, Any]:
+        lock_path = Path(self.settings.auto_trader_lock_path)
+        if not lock_path.exists():
+            return {}
+        raw = lock_path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return {"raw": raw}
+        return payload if isinstance(payload, dict) else {"raw": raw}
+
+    def _probe_lock_available(self) -> bool:
+        if self._process_lock_handle is not None:
+            return False
+        lock_path = Path(self.settings.auto_trader_lock_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return True
+        except Exception:
+            return False
+        finally:
+            handle.close()
+
+    def _get_process_lock_diagnostics(self) -> dict[str, Any]:
+        current_process_holds_lock = self._process_lock_handle is not None
+        lock_file_metadata = self._read_lock_file_metadata()
+        lock_available = False if current_process_holds_lock else self._probe_lock_available()
+        diagnostics = {
+            **self._current_lock_metadata(state="locked" if current_process_holds_lock else "unlocked"),
+            "current_process_holds_lock": current_process_holds_lock,
+            "lock_available": lock_available,
+            "lock_file_metadata": lock_file_metadata,
+        }
+        diagnostics["lock_file_stale_metadata"] = bool(lock_file_metadata) and lock_available
+        return diagnostics
+
+    def _get_loop_safety_snapshot(self) -> dict[str, Any]:
+        return {
+            "running": self._running,
+            "thread_ident": self._loop_thread_ident,
+            "cycle_in_progress": self._cycle_guard.locked(),
+            "last_cycle_id": self._last_cycle_id,
+            "last_run_time": self._last_run_time.isoformat() if self._last_run_time else None,
+        }
+
     def _acquire_process_lock(self) -> bool:
         if self._process_lock_handle is not None:
             return True
@@ -2314,18 +2388,35 @@ class AutoTrader:
         except Exception:
             handle.close()
             return False
-        handle.seek(0)
-        handle.truncate(0)
-        handle.write(str(os.getpid()))
-        handle.flush()
+        self._process_lock_acquired_at = datetime.datetime.now(datetime.timezone.utc)
+        lock_metadata = self._current_lock_metadata(state="locked")
+        self._write_lock_metadata(handle, lock_metadata)
         self._process_lock_handle = handle
+        self.runtime.runtime_safety.update_lock_metadata(
+            {
+                **lock_metadata,
+                "current_process_holds_lock": True,
+                "lock_available": False,
+                "lock_file_metadata": lock_metadata,
+                "lock_file_stale_metadata": False,
+            }
+        )
         return True
 
     def _release_process_lock(self) -> None:
         handle = self._process_lock_handle
         if handle is None:
             return
+        release_metadata = {
+            **self._current_lock_metadata(state="released"),
+            "released_at": self._format_timestamp(datetime.datetime.now(datetime.timezone.utc)),
+            "current_process_holds_lock": False,
+            "lock_available": True,
+            "lock_file_metadata": {},
+            "lock_file_stale_metadata": False,
+        }
         try:
+            self._write_lock_metadata(handle, {})
             import fcntl
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
@@ -2335,6 +2426,8 @@ class AutoTrader:
             handle.close()
         finally:
             self._process_lock_handle = None
+            self._process_lock_acquired_at = None
+        self.runtime.runtime_safety.update_lock_metadata(release_metadata)
 
     def reset_runtime_state(self) -> None:
         with self._state_lock:
@@ -2368,6 +2461,7 @@ class AutoTrader:
             self._last_notification_ids = []
             self._last_asset_class_run_at = {}
             self._last_cadence_diagnostics = {}
+            self._process_lock_acquired_at = None
         self._release_process_lock()
 
 

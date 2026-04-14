@@ -234,6 +234,35 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
     assert settings.news_lookback_hours == 12
 
 
+def test_runtime_safety_settings_parse_correctly() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            halt_on_consecutive_losses=True,
+            max_consecutive_losing_exits=4,
+            halt_on_reconcile_mismatch=False,
+            halt_on_startup_sync_failure=True,
+        )
+
+    assert settings.halt_on_consecutive_losses is True
+    assert settings.max_consecutive_losing_exits == 4
+    assert settings.halt_on_reconcile_mismatch is False
+    assert settings.halt_on_startup_sync_failure is True
+
+
+def test_runtime_safety_settings_reject_invalid_loss_threshold() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError, match="MAX_CONSECUTIVE_LOSING_EXITS"):
+            Settings(
+                _env_file=None,
+                broker_mode="mock",
+                trading_enabled=False,
+                max_consecutive_losing_exits=0,
+            )
+
+
 def test_api_admin_token_blank_is_normalized() -> None:
     with patch.dict(os.environ, {}, clear=True):
         settings = Settings(
@@ -267,6 +296,10 @@ def test_env_example_uses_safe_defaults_and_placeholders() -> None:
     assert env_values["ML_RETRAIN_ENABLED"] == "false"
     assert env_values["NEWS_FEATURES_ENABLED"] == "false"
     assert env_values["ALLOW_EXTENDED_HOURS"] == "false"
+    assert env_values["HALT_ON_CONSECUTIVE_LOSSES"] == "true"
+    assert env_values["MAX_CONSECUTIVE_LOSING_EXITS"] == "3"
+    assert env_values["HALT_ON_RECONCILE_MISMATCH"] == "true"
+    assert env_values["HALT_ON_STARTUP_SYNC_FAILURE"] == "true"
     assert env_values["ALPACA_API_KEY"] == ""
     assert env_values["ALPACA_SECRET_KEY"] == ""
     assert env_values["DISCORD_WEBHOOK_URL"] == ""

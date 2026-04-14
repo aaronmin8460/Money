@@ -974,6 +974,11 @@ def _system_color(event: str) -> int:
         "Paper auto-trader started": 0x3498DB,
         "Paper auto-trader stopped": 0x2C3E50,
         "Scan summary": 0x3498DB,
+        "Bot halted by circuit breaker": 0xE67E22,
+        "Bot resumed manually": 0x27AE60,
+        "Reconcile mismatch detected": 0xE74C3C,
+        "Reconcile auto-heal applied": 0x3498DB,
+        "Startup sync failure": 0xE74C3C,
     }.get(event, 0x3498DB)
 
 

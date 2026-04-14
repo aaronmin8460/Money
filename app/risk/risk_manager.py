@@ -40,10 +40,12 @@ class RiskManager:
         portfolio: Portfolio,
         settings: Settings | None = None,
         broker: Any | None = None,
+        runtime_safety: Any | None = None,
     ):
         self.settings = settings or get_settings()
         self.portfolio = portfolio
         self.broker = broker
+        self.runtime_safety = runtime_safety
         self._symbol_cooldowns: dict[str, datetime] = {}
         self._strategy_cooldowns: dict[str, datetime] = {}
         self._stop_out_cooldowns: dict[str, datetime] = {}
@@ -103,6 +105,11 @@ class RiskManager:
             "daily_loss_pct": current_daily_loss_pct,
             "active_cooldowns": self.get_active_cooldowns(),
             "latest_rejection": self._latest_rejection,
+            "runtime_safety": (
+                self.runtime_safety.get_state_snapshot()
+                if self.runtime_safety is not None
+                else None
+            ),
         }
 
     def get_active_cooldowns(self) -> dict[str, list[dict[str, Any]]]:
@@ -254,6 +261,25 @@ class RiskManager:
 
         if self.settings.kill_switch_enabled:
             return RiskDecision(False, "Hard kill switch is enabled.", rule="kill_switch", details=decision_details)
+
+        runtime_safety_state = (
+            self.runtime_safety.get_state_snapshot()
+            if self.runtime_safety is not None
+            else None
+        )
+        if runtime_safety_state is not None:
+            decision_details["runtime_halted"] = runtime_safety_state["halted"]
+            decision_details["runtime_halt_reason"] = runtime_safety_state["halt_reason"]
+            decision_details["runtime_halt_rule"] = runtime_safety_state["halt_rule"]
+            decision_details["consecutive_losing_exits"] = runtime_safety_state["consecutive_losing_exits"]
+            decision_details["new_entries_allowed"] = runtime_safety_state["new_entries_allowed"]
+            if increases_exposure and runtime_safety_state["halted"]:
+                return RiskDecision(
+                    False,
+                    "Runtime safety halt is active. New entries are blocked until resumed.",
+                    rule=runtime_safety_state["halt_rule"] or "runtime_halted",
+                    details=decision_details,
+                )
 
         if not self.settings.trading_enabled:
             return RiskDecision(
@@ -638,6 +664,13 @@ class RiskManager:
         ):
             self._stop_out_cooldowns[symbol.upper()] = now + timedelta(
                 minutes=self.settings.symbol_reentry_cooldown_minutes
+            )
+        if self.runtime_safety is not None:
+            self.runtime_safety.record_exit_outcome(
+                symbol=symbol,
+                order_intent=order_intent,
+                trade_pnl=trade_pnl,
+                exit_stage=exit_stage,
             )
 
     def _asset_class_enabled(self, asset_class: AssetClass) -> bool:

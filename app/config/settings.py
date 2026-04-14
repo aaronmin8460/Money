@@ -324,6 +324,10 @@ class Settings(BaseSettings):
     discord_notify_crypto: bool = Field(True, env="DISCORD_NOTIFY_CRYPTO")
     discord_timezone: str = Field("America/Indiana/Indianapolis", env="DISCORD_TIMEZONE")
     auto_trader_lock_path: str = Field("logs/auto_trader.lock", env="AUTO_TRADER_LOCK_PATH")
+    halt_on_consecutive_losses: bool = Field(True, env="HALT_ON_CONSECUTIVE_LOSSES")
+    max_consecutive_losing_exits: int = Field(3, env="MAX_CONSECUTIVE_LOSING_EXITS")
+    halt_on_reconcile_mismatch: bool = Field(True, env="HALT_ON_RECONCILE_MISMATCH")
+    halt_on_startup_sync_failure: bool = Field(True, env="HALT_ON_STARTUP_SYNC_FAILURE")
     scan_universe_mode: str = Field("full", env="SCAN_UNIVERSE_MODE")
     major_equity_symbols: list[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "SPY", "QQQ", "IWM"],
@@ -667,6 +671,8 @@ class Settings(BaseSettings):
             self.dust_position_max_qty_by_asset_class.setdefault(asset_class.value, 0.0)
         if self.symbol_reentry_cooldown_minutes < 0:
             raise ValueError("SYMBOL_REENTRY_COOLDOWN_MINUTES must be >= 0.")
+        if self.max_consecutive_losing_exits < 1:
+            raise ValueError("MAX_CONSECUTIVE_LOSING_EXITS must be >= 1.")
         if not self.partial_take_profit_levels:
             raise ValueError("PARTIAL_TAKE_PROFIT_LEVELS must not be empty.")
         if len(self.partial_take_profit_levels) != len(self.partial_take_profit_fractions):

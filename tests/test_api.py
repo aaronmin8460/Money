@@ -9,6 +9,7 @@ from app.api.app import app
 from app.config import settings as settings_module
 from app.config.settings import Settings
 from app.domain.models import AssetClass
+from app.portfolio.portfolio import Position
 from app.services.runtime import get_runtime
 from app.strategies.base import Signal, TradeSignal
 
@@ -273,9 +274,13 @@ def test_protected_admin_routes_require_auth() -> None:
     with TestClient(app) as client:
         config_response = client.get("/config")
         diagnostics_response = client.get("/diagnostics/auto", headers=admin_auth_headers(token="wrong-token"))
+        runtime_safety_response = client.get("/diagnostics/runtime-safety")
+        halt_response = client.post("/admin/runtime-safety/halt")
 
     assert config_response.status_code == 401
     assert diagnostics_response.status_code == 403
+    assert runtime_safety_response.status_code == 401
+    assert halt_response.status_code == 401
 
 
 def test_x_admin_token_header_is_accepted() -> None:
@@ -307,6 +312,8 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
 
         risk_response = client.get("/diagnostics/risk", headers=headers)
         auto_response = client.get("/diagnostics/auto", headers=headers)
+        runtime_safety_response = client.get("/diagnostics/runtime-safety", headers=headers)
+        reconciliation_response = client.get("/diagnostics/reconciliation", headers=headers)
         strategy_response = client.get("/diagnostics/strategy", headers=headers)
         portfolio_response = client.get("/diagnostics/portfolio", headers=headers)
         rejections_response = client.get("/diagnostics/rejections/latest", headers=headers)
@@ -328,6 +335,26 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert "latest_signals" in auto_data
     assert "latest_rejected_order_candidate" in auto_data
     assert "tranche_state" in auto_data
+    assert "runtime_safety" in auto_data
+    assert "process_lock_metadata" in auto_data
+    assert "new_entries_allowed" in auto_data
+
+    assert runtime_safety_response.status_code == 200
+    runtime_safety_data = runtime_safety_response.json()
+    assert "halted" in runtime_safety_data
+    assert "halt_rule" in runtime_safety_data
+    assert "consecutive_losing_exits" in runtime_safety_data
+    assert "last_reconcile_status" in runtime_safety_data
+    assert "process_lock_metadata" in runtime_safety_data
+    assert "new_entries_allowed" in runtime_safety_data
+
+    assert reconciliation_response.status_code == 200
+    reconciliation_data = reconciliation_response.json()
+    assert "last_reconcile_status" in reconciliation_data
+    assert "last_reconcile_summary" in reconciliation_data
+    assert "tracked_local_positions" in reconciliation_data
+    assert "broker_positions" in reconciliation_data
+    assert "tranche_state" in reconciliation_data
 
     assert strategy_response.status_code == 200
     strategy_data = strategy_response.json()
@@ -413,3 +440,77 @@ def test_admin_reset_local_state_endpoint_works_with_default_payload() -> None:
     assert payload["options"]["close_positions"] is True
     assert payload["local_portfolio_positions"] == []
     assert payload["broker_positions"] == []
+
+
+def test_runtime_halt_blocks_new_entries_but_allows_exits_end_to_end(monkeypatch) -> None:
+    settings_module._settings = build_settings(trading_enabled=True, short_selling_enabled=False)
+    headers = admin_auth_headers()
+
+    with TestClient(app) as client:
+        runtime = get_runtime()
+
+        halt_response = client.post(
+            "/admin/runtime-safety/halt",
+            headers=headers,
+            json={"note": "operator pause"},
+        )
+        assert halt_response.status_code == 200
+        assert halt_response.json()["halted"] is True
+
+        def buy_signal(_symbol: str, _data: object) -> list[TradeSignal]:
+            return [
+                TradeSignal(
+                    symbol="AAPL",
+                    signal=Signal.BUY,
+                    asset_class=AssetClass.EQUITY,
+                    strategy_name="test_strategy",
+                    price=100.0,
+                    stop_price=95.0,
+                    reason="entry while halted",
+                )
+            ]
+
+        monkeypatch.setattr(runtime.strategy, "generate_signals", buy_signal)
+        blocked_response = client.post("/run-once", json={"symbol": "AAPL"})
+        blocked_payload = blocked_response.json()
+        assert blocked_response.status_code == 200
+        assert blocked_payload["action"] == "rejected"
+        assert blocked_payload["risk"]["rule"] == "manual_halt"
+
+        runtime.broker.positions["AAPL"] = {
+            "symbol": "AAPL",
+            "asset_class": AssetClass.EQUITY.value,
+            "exchange": "MOCK",
+            "quantity": 2.0,
+            "entry_price": 100.0,
+            "side": "BUY",
+            "current_price": 95.0,
+        }
+        runtime.portfolio.positions["AAPL"] = Position(
+            symbol="AAPL",
+            quantity=2.0,
+            entry_price=100.0,
+            side="BUY",
+            current_price=95.0,
+            asset_class=AssetClass.EQUITY,
+        )
+
+        def sell_signal(_symbol: str, _data: object) -> list[TradeSignal]:
+            return [
+                TradeSignal(
+                    symbol="AAPL",
+                    signal=Signal.SELL,
+                    asset_class=AssetClass.EQUITY,
+                    strategy_name="test_strategy",
+                    price=95.0,
+                    reason="exit while halted",
+                )
+            ]
+
+        monkeypatch.setattr(runtime.strategy, "generate_signals", sell_signal)
+        exit_response = client.post("/run-once", json={"symbol": "AAPL"})
+        exit_payload = exit_response.json()
+
+    assert exit_response.status_code == 200
+    assert exit_payload["action"] == "submitted"
+    assert exit_payload["risk"]["rule"] == "approved"

@@ -240,3 +240,19 @@ class BotRunHistory(Base):
     status = Column(String(32), nullable=False, default="success")
     summary_json = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
+
+
+class RuntimeSafetyState(Base):
+    __tablename__ = "runtime_safety_state"
+
+    id = Column(Integer, primary_key=True, index=True)
+    halted = Column(Boolean, nullable=False, default=False)
+    halt_reason = Column(String(128), nullable=True)
+    halt_rule = Column(String(128), nullable=True)
+    halted_at = Column(DateTime, nullable=True)
+    resumed_at = Column(DateTime, nullable=True)
+    consecutive_losing_exits = Column(Integer, nullable=False, default=0)
+    last_reconcile_status = Column(String(32), nullable=True)
+    last_reconcile_summary_json = Column(Text, nullable=True)
+    lock_metadata_json = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, nullable=False)

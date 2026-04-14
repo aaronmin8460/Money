@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
 from app.api.admin_auth import require_admin_auth
-from app.api.schemas import ResetLocalStateRequest
+from app.api.schemas import ResetLocalStateRequest, RuntimeSafetyActionRequest, RuntimeSafetyResumeRequest
 from app.config.settings import get_settings
 from app.db.session import check_database_connection
 from app.domain.models import AssetClass
@@ -103,6 +103,10 @@ def config() -> dict[str, Any]:
         "discord_notify_scan_summary": settings.discord_notify_scan_summary,
         "discord_notify_crypto": settings.discord_notify_crypto,
         "discord_timezone": settings.discord_timezone,
+        "halt_on_consecutive_losses": settings.halt_on_consecutive_losses,
+        "max_consecutive_losing_exits": settings.max_consecutive_losing_exits,
+        "halt_on_reconcile_mismatch": settings.halt_on_reconcile_mismatch,
+        "halt_on_startup_sync_failure": settings.halt_on_startup_sync_failure,
         "ml_enabled": settings.ml_enabled,
         "ml_model_type": settings.ml_model_type,
         "ml_min_score_threshold": settings.ml_min_score_threshold,
@@ -209,7 +213,7 @@ def diagnostics_strategy() -> dict[str, Any]:
 @protected_router.get("/diagnostics/auto")
 def diagnostics_auto() -> dict[str, Any]:
     runtime = get_runtime()
-    runtime.sync_with_broker()
+    runtime.sync_with_broker(source="diagnostics_auto")
     trader = runtime.get_auto_trader()
     status = trader.get_status()
     account = runtime.broker.get_account()
@@ -277,20 +281,55 @@ def diagnostics_auto() -> dict[str, Any]:
         "news_features_enabled": status["news_features_enabled"],
         "auto_trader_lock_path": status["auto_trader_lock_path"],
         "process_lock_acquired": status["process_lock_acquired"],
+        "process_lock_metadata": status["process_lock_metadata"],
+        "cycle_in_progress": status["cycle_in_progress"],
+        "runtime_safety": status["runtime_safety"],
+        "runtime_halted": status["runtime_halted"],
+        "new_entries_allowed": status["new_entries_allowed"],
+        "last_reconcile_status": status["last_reconcile_status"],
     }
+
+
+@protected_router.get("/diagnostics/runtime-safety")
+def diagnostics_runtime_safety() -> dict[str, Any]:
+    runtime = get_runtime()
+    trader = runtime.get_auto_trader()
+    status = trader.get_status()
+    return runtime.runtime_safety.get_runtime_diagnostics(
+        lock_metadata=status["process_lock_metadata"],
+        loop_metadata={
+            "running": status["running"],
+            "thread_ident": status["thread_ident"],
+            "cycle_in_progress": status["cycle_in_progress"],
+            "last_cycle_id": status["last_cycle_id"],
+            "last_run_time": status["last_run_time"],
+        },
+    )
+
+
+@protected_router.get("/diagnostics/reconciliation")
+def diagnostics_reconciliation(refresh: bool = True) -> dict[str, Any]:
+    runtime = get_runtime()
+    if refresh:
+        runtime.sync_with_broker(source="diagnostics_reconciliation")
+    snapshot = runtime.runtime_safety.get_reconciliation_snapshot()
+    snapshot["tracked_local_positions"] = runtime.portfolio.positions_diagnostics()
+    snapshot["broker_positions"] = runtime.broker.get_positions()
+    snapshot["tranche_state"] = runtime.tranche_state.snapshot()
+    return snapshot
 
 
 @protected_router.get("/diagnostics/risk")
 def diagnostics_risk(limit: int = 10) -> dict[str, Any]:
     runtime = get_runtime()
-    runtime.sync_with_broker()
+    runtime.sync_with_broker(source="diagnostics_risk")
     return runtime.risk_manager.get_diagnostics(limit=limit)
 
 
 @protected_router.get("/diagnostics/portfolio")
 def diagnostics_portfolio() -> dict[str, Any]:
     runtime = get_runtime()
-    runtime.sync_with_broker()
+    runtime.sync_with_broker(source="diagnostics_portfolio")
     broker_positions = []
     for position in runtime.broker.get_positions():
         position_side = str(position.get("side", "")).upper()
@@ -358,6 +397,27 @@ def admin_reset_local_state(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@protected_router.post("/admin/runtime-safety/halt")
+def admin_runtime_safety_halt(
+    request: RuntimeSafetyActionRequest | None = Body(default=None),
+) -> dict[str, Any]:
+    runtime = get_runtime()
+    payload = request or RuntimeSafetyActionRequest()
+    return runtime.runtime_safety.manual_halt(operator_note=payload.note)
+
+
+@protected_router.post("/admin/runtime-safety/resume")
+def admin_runtime_safety_resume(
+    request: RuntimeSafetyResumeRequest | None = Body(default=None),
+) -> dict[str, Any]:
+    runtime = get_runtime()
+    payload = request or RuntimeSafetyResumeRequest()
+    return runtime.runtime_safety.resume(
+        operator_note=payload.note,
+        reset_consecutive_losing_exits=payload.reset_consecutive_losing_exits,
+    )
 
 
 @protected_router.post("/admin/notifications/test")

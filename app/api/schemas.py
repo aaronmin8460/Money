@@ -28,6 +28,14 @@ class ResetLocalStateRequest(BaseModel):
     reset_daily_baseline_to_current_equity: bool = True
 
 
+class RuntimeSafetyActionRequest(BaseModel):
+    note: str | None = None
+
+
+class RuntimeSafetyResumeRequest(RuntimeSafetyActionRequest):
+    reset_consecutive_losing_exits: bool = True
+
+
 class BrokerStatus(BaseModel):
     broker_mode: str
     broker_backend: str

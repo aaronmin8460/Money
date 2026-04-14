@@ -122,7 +122,57 @@ curl http://127.0.0.1:8000/config -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 - Confirm the `alembic_version` table is present in the database.
 - Confirm the auto-trader state matches expectation before enabling automated paper trading.
 
-## 11. Checks before guarded live mode
+## 11. Runtime safety halt workflow
+
+- Halt mode blocks new entry orders from the background loop, `/auto/run-now`, and manual `/run-once` evaluation. Risk-reducing exits and cleanup actions remain allowed.
+- Halt triggers can include:
+  - configured consecutive realized losing exits
+  - material reconciliation mismatches
+  - startup sync failure
+  - manual operator halt
+- Inspect runtime safety state:
+
+```bash
+curl http://127.0.0.1:8000/diagnostics/runtime-safety \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+curl http://127.0.0.1:8000/diagnostics/reconciliation \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+```
+
+- Manually halt:
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/runtime-safety/halt \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"operator halt"}'
+```
+
+- Manually resume after review:
+
+```bash
+curl -X POST http://127.0.0.1:8000/admin/runtime-safety/resume \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"resume after review","reset_consecutive_losing_exits":true}'
+```
+
+- Resume clears the halt intentionally. By default it also resets the consecutive losing exit counter. Set `reset_consecutive_losing_exits=false` only if you want to preserve the counter for follow-up monitoring.
+- Discord alerts should fire for circuit-breaker halts, manual resumes, reconcile mismatches, startup sync failures, and reconcile auto-heal events when Discord is enabled.
+
+## 12. Responding to reconcile mismatch alerts
+
+- Start with `/diagnostics/reconciliation` and confirm whether the mismatch is:
+  - broker has position but local state does not
+  - local state has position but broker does not
+  - quantity, direction, or asset-class mismatch
+  - tranche-state inconsistency
+- If the mismatch was auto-healed, verify the local portfolio and tranche state now match broker truth before resuming automated trading.
+- If the mismatch is still material, keep the bot halted, review recent order/fill history, and compare broker positions against `tracked_local_positions` and `tranche_state`.
+- Use `/admin/reset-local-state` only when you intentionally want to reconcile local tracking back to broker truth and you understand its side effects.
+- Resume only after diagnostics show the reconcile state you expect and new entries are intentionally allowed again.
+
+## 13. Checks before guarded live mode
 
 - Re-confirm this repo defaults to paper-safe operation and guarded live mode is not the default.
 - Review database backups or rollback posture.
