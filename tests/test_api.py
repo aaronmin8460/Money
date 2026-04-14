@@ -173,6 +173,59 @@ def test_app_startup_and_shutdown_send_notifications(monkeypatch) -> None:
     assert calls[-1]["reason"] == "application shutdown completed"
 
 
+def test_health_route_is_lightweight_and_public(monkeypatch) -> None:
+    settings_module._settings = build_settings()
+
+    def fail_get_runtime(*args, **kwargs):
+        raise AssertionError("/health should not require runtime construction")
+
+    monkeypatch.setattr(routes_admin_module, "get_runtime", fail_get_runtime)
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "mode": "mock"}
+
+
+def test_readiness_route_returns_ok_for_valid_runtime_and_database(tmp_path) -> None:
+    settings_module._settings = build_settings(
+        database_url=f"sqlite:///{tmp_path / 'ready.db'}",
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readiness_route_returns_503_when_database_check_fails(monkeypatch) -> None:
+    settings_module._settings = build_settings()
+    monkeypatch.setattr(routes_admin_module, "check_database_connection", lambda settings=None: False)
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
+def test_readiness_route_returns_503_when_runtime_probe_fails(monkeypatch) -> None:
+    settings_module._settings = build_settings()
+
+    def fail_probe_runtime(*args, **kwargs):
+        raise RuntimeError("runtime load failed")
+
+    monkeypatch.setattr(routes_admin_module, "probe_runtime", fail_probe_runtime)
+
+    with TestClient(app) as client:
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready"}
+
+
 def test_admin_notifications_test_endpoint(monkeypatch) -> None:
     settings_module._settings = build_settings(app_env="development")
     calls: list[tuple[str, dict[str, object]]] = []

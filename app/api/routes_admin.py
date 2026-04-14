@@ -3,25 +3,47 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from app.api.admin_auth import require_admin_auth
 from app.api.schemas import ResetLocalStateRequest
+from app.config.settings import get_settings
+from app.db.session import check_database_connection
 from app.domain.models import AssetClass
 from app.monitoring.discord_notifier import get_discord_notifier
+from app.monitoring.logger import get_logger
 from app.risk.risk_manager import RiskDecision
 from app.services.broker import OrderRequest
 from app.services.local_state_reset import LocalStateResetOptions, reset_local_state
-from app.services.runtime import get_runtime
+from app.services.runtime import get_runtime, probe_runtime
 from app.strategies.base import Signal, TradeSignal
 
 router = APIRouter(tags=["admin"])
 protected_router = APIRouter(tags=["admin"], dependencies=[Depends(require_admin_auth)])
+logger = get_logger("api.admin")
 
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    runtime = get_runtime()
-    return {"status": "ok", "mode": runtime.settings.broker_mode}
+    settings = get_settings()
+    return {"status": "ok", "mode": settings.broker_mode}
+
+
+@router.get("/health/ready")
+def health_ready() -> JSONResponse:
+    try:
+        settings = get_settings()
+        settings.validate_settings()
+        probe_runtime(settings)
+        if not check_database_connection(settings):
+            raise RuntimeError("database connectivity check failed")
+    except Exception as exc:
+        logger.warning(
+            "Readiness check failed",
+            extra={"error_type": type(exc).__name__},
+        )
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+    return JSONResponse(status_code=200, content={"status": "ok"})
 
 
 @protected_router.get("/config")

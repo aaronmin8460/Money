@@ -7,7 +7,7 @@ from sqlalchemy import inspect
 
 from app.db.init_db import init_db
 from app.db.models import Base
-from app.db.session import engine
+from app.db.session import get_engine
 from app.monitoring.logger import get_logger
 from app.services.runtime import RuntimeContainer, get_runtime
 
@@ -117,6 +117,7 @@ def wipe_local_sqlite_history(database_url: str) -> list[str]:
     if not database_url.startswith("sqlite:///"):
         raise ValueError("Local DB wipe is only supported for SQLite databases.")
 
+    engine = get_engine()
     inspector = inspect(engine)
     existing_tables = inspector.get_table_names()
     Base.metadata.drop_all(bind=engine)

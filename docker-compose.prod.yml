@@ -1,16 +1,28 @@
 version: "3.8"
 
 # Production-oriented paper-trading compose profile.
-# Keep a single API/trader process and provide secrets through the env file.
+# Keep a single API/trader process and provide secrets through a host-side env file.
 services:
   api:
     build: .
     command: ["python", "scripts/run_paper_api.py", "--host", "0.0.0.0", "--port", "8000"]
     env_file:
-      - .env
+      - ${MONEY_ENV_FILE:-.env}
     environment:
       APP_ENV: production
       LOG_LEVEL: INFO
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     ports:
       - "8000:8000"
     restart: unless-stopped

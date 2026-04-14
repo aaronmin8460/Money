@@ -83,7 +83,7 @@ _runtime: RuntimeContainer | None = None
 _runtime_lock = threading.Lock()
 
 
-def _build_runtime(settings: Settings) -> RuntimeContainer:
+def _compose_runtime(settings: Settings) -> RuntimeContainer:
     market_data_service: MarketDataService
     if settings.is_alpaca_mode:
         market_data_service = AlpacaMarketDataService(settings)
@@ -122,6 +122,11 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         strategy=strategy,
         tranche_state=execution_service.tranche_state,
     )
+    return runtime
+
+
+def _build_runtime(settings: Settings) -> RuntimeContainer:
+    runtime = _compose_runtime(settings)
     runtime.sync_with_broker()
     logger.info(
         "Runtime initialized",
@@ -134,6 +139,11 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
         },
     )
     return runtime
+
+
+def probe_runtime(settings: Settings | None = None) -> None:
+    runtime = _compose_runtime(settings or get_settings())
+    runtime.shutdown()
 
 
 def get_runtime(settings: Settings | None = None) -> RuntimeContainer:

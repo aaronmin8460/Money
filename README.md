@@ -66,8 +66,9 @@ Required only when the related feature is enabled:
 Database guidance:
 
 - SQLite is fine for local development and short-lived paper runs.
-- For persistent paper operations, use a real Postgres URL in `DATABASE_URL`.
+- For persistent paper operations, use a real Postgres URL such as `postgresql+psycopg://USER:PASSWORD@HOST:5432/money`.
 - If you keep SQLite in a containerized deployment, point it at persistent storage such as `sqlite:///./data/trading.db`.
+- Schema changes are managed through Alembic. Use `alembic upgrade head` before startup and `alembic revision --autogenerate -m "..."` for follow-up revisions.
 
 ## 6. Local quickstart
 
@@ -85,6 +86,13 @@ Update `.env` with your local values:
 - set `API_ADMIN_TOKEN` if you want access to `/config`, `/diagnostics/*`, or `/admin/*`
 - leave Discord disabled until you intentionally want alerts
 
+Initialize or update the schema after `DATABASE_URL` is set:
+
+```bash
+source .venv/bin/activate
+alembic upgrade head
+```
+
 Run the preferred single-process runtime:
 
 ```bash
@@ -96,6 +104,7 @@ First verification commands:
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/ready
 curl http://127.0.0.1:8000/auto/status
 curl -X POST http://127.0.0.1:8000/run-once \
   -H "Content-Type: application/json" \
@@ -121,28 +130,31 @@ Systemd path:
 
 - Example service: `deploy/systemd/money-api.service`
 - Example env file: `deploy/env/money.env.example`
-- Recommended setup: copy the service to `/etc/systemd/system/`, place a real env file outside the repo, and set `API_ADMIN_TOKEN`, paper Alpaca credentials, and a production `DATABASE_URL`.
+- Recommended setup: copy the service to `/etc/systemd/system/`, place a real env file outside the repo such as `/etc/money/money.env`, and set `API_ADMIN_TOKEN`, paper Alpaca credentials, and a production `DATABASE_URL`.
 
 Compose path:
 
 - `docker-compose.yml` is development-only. It bind-mounts the repo and forces safe local defaults.
 - `docker-compose.prod.yml` is the production-oriented paper deployment shape.
-- The production compose file does not bind-mount the repository, uses `env_file`-driven configuration, and preserves the single-process runtime.
+- The production compose file does not bind-mount the repository, uses `env_file`-driven configuration, preserves the single-process runtime, and exposes a readiness-aware healthcheck.
 
 Compose example:
 
 ```bash
-docker compose -f docker-compose.prod.yml up -d --build
+MONEY_ENV_FILE=/etc/money/money.env docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-For production compose, set one of these in `.env` before starting:
+For production compose, set one of these in your real env file before starting:
 
 - `DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/money`
 - `DATABASE_URL=sqlite:///./data/trading.db`
+- Run `alembic upgrade head` before the first start or let application startup apply the same migration head automatically.
+- See [docs/operations.md](docs/operations.md) for the full persistent paper-trading runbook.
 
 ## 8. Admin API security expectations
 
 - `/health` remains public for health checks and container probes.
+- `/health/ready` is the public readiness probe and verifies runtime configuration plus database connectivity without placing trades.
 - `/config`, `/diagnostics/*`, `/admin/reset-local-state`, and `/admin/notifications/test` require admin authentication.
 - Authentication accepts either:
   - `Authorization: Bearer <token>`
@@ -154,6 +166,7 @@ For production compose, set one of these in `.env` before starting:
 
 - SQLite local/dev default: `sqlite:///./trading.db`
 - Production recommendation: Postgres via `DATABASE_URL`
+- Alembic migration state is stored in the database via the `alembic_version` table.
 - Structured logs and artifacts live under `LOG_DIR`, including:
   - `app.jsonl`
   - `signals.jsonl`
@@ -165,7 +178,6 @@ For production compose, set one of these in `.env` before starting:
 
 ## 10. Known limitations
 
-- The repository is Postgres-ready in configuration and documentation, but this PR does not migrate the SQLAlchemy layer or schemas away from SQLite-specific expectations.
 - Admin auth is token-based and intentionally simple; there is no user management layer.
 - Discord is the only supported alert channel.
 - ML, news, and RL are optional subsystems and are not required for safe paper operation.
@@ -177,7 +189,7 @@ Targeted tests first:
 
 ```bash
 source .venv/bin/activate
-uv run pytest tests/test_config.py tests/test_api.py
+uv run pytest tests/test_config.py tests/test_db_session.py tests/test_api.py tests/test_alembic.py
 ```
 
 API startup sanity check:
@@ -191,6 +203,7 @@ Runtime verification:
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/ready
 curl http://127.0.0.1:8000/auto/status
 curl http://127.0.0.1:8000/config \
   -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
