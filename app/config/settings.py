@@ -444,11 +444,13 @@ class Settings(BaseSettings):
     news_max_headlines_per_ticker: int = Field(8, env="NEWS_MAX_HEADLINES_PER_TICKER")
     news_lookback_hours: int = Field(24, env="NEWS_LOOKBACK_HOURS")
     news_source_ids: list[str] = Field(default_factory=list, env="NEWS_SOURCE_IDS")
-    benzinga_rss_enabled: bool = Field(False, env="BENZINGA_RSS_ENABLED")
-    benzinga_rss_urls: list[str] = Field(
-        default_factory=lambda: ["https://www.benzinga.com/feeds/news"],
-        env="BENZINGA_RSS_URLS",
+    reuters_rss_urls: list[str] = Field(default_factory=list, env="REUTERS_RSS_URLS")
+    marketwatch_rss_urls: list[str] = Field(
+        default_factory=lambda: ["https://feeds.marketwatch.com/marketwatch/topstories/"],
+        env="MARKETWATCH_RSS_URLS",
     )
+    benzinga_rss_enabled: bool = Field(False, env="BENZINGA_RSS_ENABLED")
+    benzinga_rss_urls: list[str] = Field(default_factory=list, env="BENZINGA_RSS_URLS")
     sec_rss_enabled: bool = Field(False, env="SEC_RSS_ENABLED")
     sec_rss_urls: list[str] = Field(
         default_factory=lambda: [
@@ -460,6 +462,12 @@ class Settings(BaseSettings):
         env="SEC_RSS_URLS",
     )
     sec_user_agent: str = Field("MoneyBot/1.0 (paper-safe research; contact unset)", env="SEC_USER_AGENT")
+    sec_company_tickers_url: str = Field(
+        "https://www.sec.gov/files/company_tickers.json",
+        env="SEC_COMPANY_TICKERS_URL",
+    )
+    sec_company_tickers_cache_path: str = Field("cache/sec_company_tickers.json", env="SEC_COMPANY_TICKERS_CACHE_PATH")
+    sec_company_tickers_cache_ttl_hours: int = Field(24, env="SEC_COMPANY_TICKERS_CACHE_TTL_HOURS")
     news_fetch_timeout_seconds: float = Field(10.0, env="NEWS_FETCH_TIMEOUT_SECONDS")
     news_fetch_retry_count: int = Field(2, env="NEWS_FETCH_RETRY_COUNT")
     news_fetch_backoff_seconds: float = Field(1.5, env="NEWS_FETCH_BACKOFF_SECONDS")
@@ -697,8 +705,12 @@ class Settings(BaseSettings):
 
     @property
     def enabled_news_sources(self) -> list[str]:
-        active_sources = ["reuters", "marketwatch"]
-        if self.benzinga_rss_enabled:
+        active_sources: list[str] = []
+        if self.reuters_rss_urls:
+            active_sources.append("reuters")
+        if self.marketwatch_rss_urls:
+            active_sources.append("marketwatch")
+        if self.benzinga_rss_enabled and self.benzinga_rss_urls:
             active_sources.append("benzinga")
         if self.sec_rss_enabled:
             active_sources.append("sec")
@@ -721,7 +733,7 @@ class Settings(BaseSettings):
     def parse_news_source_ids(cls, value: str | list[str]) -> list[str]:
         return [item.lower() for item in _parse_string_list(value, "NEWS_SOURCE_IDS")]
 
-    @field_validator("benzinga_rss_urls", "sec_rss_urls", mode="before")
+    @field_validator("reuters_rss_urls", "marketwatch_rss_urls", "benzinga_rss_urls", "sec_rss_urls", mode="before")
     def parse_url_lists(cls, value: str | list[str], info: ValidationInfo) -> list[str]:
         return _parse_string_list(value, info.field_name.upper())
 
@@ -828,6 +840,8 @@ class Settings(BaseSettings):
             if str(key).strip() and str(value).strip()
         }
         self.news_source_ids = list(dict.fromkeys(item.lower() for item in self.news_source_ids if str(item).strip()))
+        self.reuters_rss_urls = [item for item in self.reuters_rss_urls if str(item).strip()]
+        self.marketwatch_rss_urls = [item for item in self.marketwatch_rss_urls if str(item).strip()]
         self.benzinga_rss_urls = [item for item in self.benzinga_rss_urls if str(item).strip()]
         self.sec_rss_urls = [item for item in self.sec_rss_urls if str(item).strip()]
         self.news_source_weights = {
@@ -1059,6 +1073,8 @@ class Settings(BaseSettings):
             raise ValueError("NEWS_FETCH_BACKOFF_SECONDS must be >= 0.")
         if self.news_dedupe_window_minutes < 0:
             raise ValueError("NEWS_DEDUPE_WINDOW_MINUTES must be >= 0.")
+        if self.sec_company_tickers_cache_ttl_hours < 0:
+            raise ValueError("SEC_COMPANY_TICKERS_CACHE_TTL_HOURS must be >= 0.")
         if self.min_bars_between_tranches < 0:
             raise ValueError("MIN_BARS_BETWEEN_TRANCHES must be >= 0.")
         if self.minutes_between_tranches < 0:

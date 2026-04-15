@@ -282,6 +282,11 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
             openai_model="gpt-4.1-nano",
             news_max_headlines_per_ticker=4,
             news_lookback_hours=12,
+            reuters_rss_urls='["https://example.com/reuters.xml"]',
+            marketwatch_rss_urls='["https://example.com/marketwatch.xml"]',
+            benzinga_rss_enabled=True,
+            benzinga_rss_urls='["https://example.com/benzinga.xml"]',
+            sec_company_tickers_cache_ttl_hours=12,
         )
 
     assert settings.log_dir == "custom-logs"
@@ -306,6 +311,11 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
     assert settings.news_llm_enabled is False
     assert settings.openai_model == "gpt-4.1-nano"
     assert settings.news_lookback_hours == 12
+    assert settings.reuters_rss_urls == ["https://example.com/reuters.xml"]
+    assert settings.marketwatch_rss_urls == ["https://example.com/marketwatch.xml"]
+    assert settings.benzinga_rss_urls == ["https://example.com/benzinga.xml"]
+    assert settings.sec_company_tickers_cache_ttl_hours == 12
+    assert settings.enabled_news_sources == ["reuters", "marketwatch", "benzinga"]
 
 
 def test_runtime_safety_settings_parse_correctly() -> None:
@@ -369,6 +379,11 @@ def test_env_example_uses_safe_defaults_and_placeholders() -> None:
     assert env_values["ML_ENABLED"] == "false"
     assert env_values["ML_RETRAIN_ENABLED"] == "false"
     assert env_values["NEWS_FEATURES_ENABLED"] == "false"
+    assert env_values["NEWS_RSS_ENABLED"] == "false"
+    assert env_values["BENZINGA_RSS_ENABLED"] == "false"
+    assert env_values["REUTERS_RSS_URLS"] == "[]"
+    assert env_values["BENZINGA_RSS_URLS"] == "[]"
+    assert env_values["SEC_COMPANY_TICKERS_CACHE_TTL_HOURS"] == "24"
     assert env_values["ALLOW_EXTENDED_HOURS"] == "false"
     assert env_values["HALT_ON_CONSECUTIVE_LOSSES"] == "true"
     assert env_values["MAX_CONSECUTIVE_LOSING_EXITS"] == "3"
@@ -383,5 +398,6 @@ def test_env_example_uses_safe_defaults_and_placeholders() -> None:
     assert env_values["ETF_DATA_PROVIDER"] == "yfinance"
     assert env_values["CRYPTO_DATA_PROVIDER"] == "coingecko"
     assert env_values["OPTION_DATA_PROVIDER"] == "yfinance"
+    assert "www.benzinga.com/feeds/news" not in contents
     assert "1492154001083469857" not in contents
     assert "PK2JJVNJM44OQ7VJGHI5K5K2S5" not in contents

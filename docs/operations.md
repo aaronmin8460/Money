@@ -101,6 +101,23 @@ curl http://127.0.0.1:8000/config -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
   - after a controlled restart, confirm the expected startup notification arrives in Discord
 - The development-only `/admin/notifications/test` endpoint must not be used as a production probe.
 
+## 8A. Confirm news feature refresh health
+
+- News is feature-only. It must not place orders directly.
+- Keep `NEWS_RSS_ENABLED=false` unless you intentionally run the feature refresh job.
+- Configure RSS source URLs with env overrides so stale public feeds can be changed without a code deploy:
+  - `REUTERS_RSS_URLS`
+  - `MARKETWATCH_RSS_URLS`
+  - `BENZINGA_RSS_URLS`
+- MarketWatch feeds may redirect; the fetcher follows redirects.
+- Benzinga is disabled by default. Set `BENZINGA_RSS_ENABLED=true` only after supplying a verified endpoint.
+- SEC filing feeds are supported with CIK and company-name mapping through the official SEC company ticker reference cache:
+  - `SEC_COMPANY_TICKERS_URL`
+  - `SEC_COMPANY_TICKERS_CACHE_PATH`
+  - `SEC_COMPANY_TICKERS_CACHE_TTL_HOURS`
+- Check the fetch script output or systemd journal for `news_pipeline_status=healthy|degraded|failed`, `source_health`, `symbols_grouped`, and `symbols_analyzed`.
+- Treat `total_deduped > 0` with `symbols_grouped=0` as degraded, not healthy. It means headlines arrived but did not map to tracked symbols.
+
 ## 9. Persisted paths and storage
 
 - Persist the database itself:

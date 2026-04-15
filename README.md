@@ -146,7 +146,7 @@ curl -X POST http://127.0.0.1:8000/admin/runtime-safety/resume \
 Phase 5 adds three explicit operator-facing features:
 
 - `TRADING_PROFILE=conservative|balanced|aggressive` so aggressive behavior is opt-in instead of replacing the safe default.
-- Multi-source news ingestion with source attribution, Benzinga RSS support, and SEC filing/disclosure feeds that stay feature-only.
+- Multi-source news ingestion with source attribution, operator-configurable RSS sources, optional Benzinga RSS support, and SEC filing/disclosure feeds that stay feature-only.
 - FastAPI rate limiting with `slowapi`, including stricter limits for scanner/admin paths and a structured 429 response.
 
 Aggressive paper mode stays paper-first:
@@ -177,17 +177,24 @@ Example diversified news configuration:
 cat <<'EOF' >> .env
 NEWS_FEATURES_ENABLED=true
 NEWS_RSS_ENABLED=true
-NEWS_SOURCE_IDS=default_rss,benzinga,sec
-BENZINGA_RSS_ENABLED=true
-BENZINGA_RSS_URLS=["https://www.benzinga.com/feeds/news"]
+NEWS_SOURCE_IDS=
+REUTERS_RSS_URLS=[]
+MARKETWATCH_RSS_URLS=["https://feeds.marketwatch.com/marketwatch/topstories/"]
+BENZINGA_RSS_ENABLED=false
+BENZINGA_RSS_URLS=[]
 SEC_RSS_ENABLED=true
 SEC_RSS_URLS=["https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom&owner=include&count=40"]
 SEC_USER_AGENT=MoneyBot/1.0 (paper-safe research; contact=ops@example.com)
+SEC_COMPANY_TICKERS_URL=https://www.sec.gov/files/company_tickers.json
+SEC_COMPANY_TICKERS_CACHE_PATH=cache/sec_company_tickers.json
+SEC_COMPANY_TICKERS_CACHE_TTL_HOURS=24
 NEWS_LLM_ENABLED=false
 EOF
 ```
 
-To enable the OpenAI-assisted path, set `NEWS_LLM_ENABLED=true` and `OPENAI_API_KEY=<real key>`. To stay fully heuristic and offline-safe, keep `NEWS_LLM_ENABLED=false`. In both cases, the news pipeline remains feature-only and the fetch script continues safely on per-source or LLM failures.
+RSS source URLs are environment overrides so feed moves do not require code changes. MarketWatch can redirect to Dow Jones-hosted RSS and the fetcher follows redirects. Benzinga is disabled by default because the old public URL is stale; enable it only with a verified endpoint. SEC filings are mapped to symbols through the official SEC company ticker reference cache using CIK, normalized company name, then ticker-token extraction.
+
+To enable the OpenAI-assisted path, set `NEWS_LLM_ENABLED=true` and `OPENAI_API_KEY=<real key>`. To stay fully heuristic and offline-safe, keep `NEWS_LLM_ENABLED=false`. In both cases, the news pipeline remains feature-only and the fetch script continues safely on per-source or LLM failures. The fetch summary includes `news_pipeline_status=healthy|degraded|failed`, per-source health, grouped-symbol counts, and analyzed-symbol counts so systemd logs do not claim a healthy run when headlines produced zero analyzed symbols.
 
 Example rate-limit configuration:
 
@@ -227,6 +234,7 @@ Useful fields to look for:
 - `/health`: `trading_profile`, `enabled_news_sources`, `news_llm_status`, `rate_limit_enabled`
 - `/auto/status`: `trading_profile`, `trading_profile_summary`, `candidate_strategy_routing`
 - `/config`: effective aggressive overrides, source URLs, and route-specific rate-limit values
+- `scripts/fetch_news_features.py`: `news_pipeline_status`, `source_health`, `symbols_grouped`, and `symbols_analyzed`
 
 Test rate limiting locally:
 
@@ -379,6 +387,7 @@ What to look for:
 
 - `analysis_mode=llm` with `analysis_reason=llm_success` means the OpenAI path ran.
 - `analysis_mode=heuristic` with reasons such as `news_llm_disabled`, `openai_api_key_missing`, or `llm_fallback_after_error` means the pipeline degraded safely without crashing.
+- `news_pipeline_status=degraded` means at least one source or mapping stage needs operator attention, especially when `total_deduped > 0` but `symbols_grouped=0` or `symbols_analyzed=0`.
 - The timer should remain active even if LLM is disabled; RSS-only refresh is still valid feature generation.
 
 ### Verify nightly retrain behavior

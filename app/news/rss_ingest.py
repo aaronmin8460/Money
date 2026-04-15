@@ -37,6 +37,26 @@ class NewsSourceDefinition:
 
 
 @dataclass
+class NewsSourceHealth:
+    source_id: str
+    configured_urls: list[str]
+    success_count: int = 0
+    failure_count: int = 0
+    last_error: str | None = None
+    degraded: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_id": self.source_id,
+            "configured_urls": list(self.configured_urls),
+            "success_count": self.success_count,
+            "failure_count": self.failure_count,
+            "last_error": self.last_error,
+            "degraded": self.degraded,
+        }
+
+
+@dataclass
 class NewsHeadline:
     title: str
     summary: str
@@ -84,6 +104,9 @@ class NewsFetchResult:
     deduped_count_by_source: dict[str, int]
     errors: list[dict[str, str]]
     source_ids: list[str]
+    source_health: dict[str, dict[str, Any]] = field(default_factory=dict)
+    degraded: bool = False
+    degraded_reasons: list[str] = field(default_factory=list)
 
     @property
     def total_fetched(self) -> int:
@@ -106,16 +129,13 @@ class NewsFetchResult:
             "deduped_count_by_source": dict(self.deduped_count_by_source),
             "errors": list(self.errors),
             "source_ids": list(self.source_ids),
+            "source_health": dict(self.source_health),
+            "degraded": self.degraded,
+            "degraded_reasons": list(self.degraded_reasons),
         }
 
 
 DEFAULT_RSS_SOURCES = [
-    NewsSourceDefinition(
-        source_id="reuters",
-        source_name="Reuters Business",
-        source_type="default_rss",
-        urls=["https://feeds.reuters.com/reuters/businessNews"],
-    ),
     NewsSourceDefinition(
         source_id="marketwatch",
         source_name="MarketWatch Top Stories",
@@ -259,9 +279,9 @@ def _fetch_feed_body(
     while attempt <= retry_count:
         try:
             if client is None:
-                response = httpx.get(url, timeout=timeout_seconds, headers=headers)
+                response = httpx.get(url, timeout=timeout_seconds, headers=headers, follow_redirects=True)
             else:
-                response = client.get(url, timeout=timeout_seconds, headers=headers)
+                response = client.get(url, timeout=timeout_seconds, headers=headers, follow_redirects=True)
             response.raise_for_status()
             return response.text
         except Exception as exc:  # pragma: no cover - network failures are mocked in tests
@@ -349,12 +369,26 @@ def build_configured_news_sources(settings: Settings | None = None) -> list[News
             return True
         return source_id in enabled_ids or (default_group and "default_rss" in enabled_ids)
 
+    source_candidates = [
+        NewsSourceDefinition(
+            source_id="reuters",
+            source_name="Reuters Business",
+            source_type="default_rss",
+            urls=list(resolved.reuters_rss_urls),
+        ),
+        NewsSourceDefinition(
+            source_id="marketwatch",
+            source_name="MarketWatch Top Stories",
+            source_type="default_rss",
+            urls=list(resolved.marketwatch_rss_urls),
+        ),
+    ]
     sources = [
         source
-        for source in DEFAULT_RSS_SOURCES
-        if _source_enabled(source.source_id, default_group=True)
+        for source in source_candidates
+        if source.urls and _source_enabled(source.source_id, default_group=True)
     ]
-    if resolved.benzinga_rss_enabled and _source_enabled("benzinga"):
+    if resolved.benzinga_rss_enabled and resolved.benzinga_rss_urls and _source_enabled("benzinga"):
         sources.append(
             NewsSourceDefinition(
                 source_id="benzinga",
@@ -375,6 +409,29 @@ def build_configured_news_sources(settings: Settings | None = None) -> list[News
             )
         )
     return sources
+
+
+def _build_degraded_summary(
+    *,
+    source_ids: list[str],
+    source_health: dict[str, NewsSourceHealth],
+    deduped_count_by_source: Counter[str],
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    productive_sources = sorted(source_id for source_id, count in deduped_count_by_source.items() if count > 0)
+    if not source_ids:
+        reasons.append("no_configured_news_sources")
+    if len(productive_sources) < 2:
+        reasons.append("fewer_than_two_sources_produced_headlines")
+
+    non_sec_health = [health for source_id, health in source_health.items() if source_id != "sec"]
+    if non_sec_health and all(health.success_count == 0 and health.failure_count > 0 for health in non_sec_health):
+        reasons.append("all_non_sec_sources_failed")
+
+    if source_ids and not productive_sources:
+        reasons.append("no_sources_produced_headlines")
+
+    return bool(reasons), reasons
 
 
 def fetch_configured_headlines(
@@ -398,9 +455,11 @@ def fetch_configured_headlines(
     errors: list[dict[str, str]] = []
     items: list[NewsHeadline] = []
     source_ids: list[str] = []
+    source_health: dict[str, NewsSourceHealth] = {}
 
     for source in build_configured_news_sources(resolved):
         source_ids.append(source.source_id)
+        health = NewsSourceHealth(source_id=source.source_id, configured_urls=list(source.urls))
         source_items: list[NewsHeadline] = []
         for index, url in enumerate(source.urls):
             try:
@@ -417,14 +476,19 @@ def fetch_configured_headlines(
                     )
                     parsed = feedparser.parse(body)
                 source_items.extend(_parse_feed_entries(parsed, source))
+                health.success_count += 1
                 if source.pace_seconds > 0 and index < len(source.urls) - 1:
                     time.sleep(source.pace_seconds)
             except Exception as exc:
+                health.failure_count += 1
+                health.last_error = str(exc)
                 logger.warning("News fetch failed for %s (%s): %s", source.source_id, url, exc)
                 errors.append({"source_id": source.source_id, "url": url, "error": str(exc)})
                 continue
 
         recent_items = _filter_recent(source_items, lookback_hours=resolved.news_lookback_hours)
+        health.degraded = health.failure_count > 0 or health.success_count == 0
+        source_health[source.source_id] = health
         fetched_count_by_source[source.source_id] += len(recent_items)
         logger.info(
             "Fetched source headlines",
@@ -433,23 +497,37 @@ def fetch_configured_headlines(
                 "source_type": source.source_type,
                 "headline_count": len(recent_items),
                 "url_count": len(source.urls),
+                "source_health": health.to_dict(),
             },
         )
         items.extend(recent_items)
 
     deduped_items = dedupe_headlines(items, window_minutes=resolved.news_dedupe_window_minutes)
     deduped_count_by_source: Counter[str] = Counter(item.source_id for item in deduped_items)
+    degraded, degraded_reasons = _build_degraded_summary(
+        source_ids=source_ids,
+        source_health=source_health,
+        deduped_count_by_source=deduped_count_by_source,
+    )
+    log_extra = {
+        "source_ids": source_ids,
+        "total_fetched": len(items),
+        "total_deduped": len(deduped_items),
+        "duplicate_count": max(0, len(items) - len(deduped_items)),
+        "fetched_count_by_source": dict(fetched_count_by_source),
+        "deduped_count_by_source": dict(deduped_count_by_source),
+        "error_count": len(errors),
+        "source_health": {source_id: health.to_dict() for source_id, health in source_health.items()},
+        "degraded": degraded,
+        "degraded_reasons": degraded_reasons,
+    }
+    if degraded:
+        logger.warning("Completed multi-source news fetch in degraded state", extra=log_extra)
+    else:
+        logger.info("Completed multi-source news fetch", extra=log_extra)
     logger.info(
-        "Completed multi-source news fetch",
-        extra={
-            "source_ids": source_ids,
-            "total_fetched": len(items),
-            "total_deduped": len(deduped_items),
-            "duplicate_count": max(0, len(items) - len(deduped_items)),
-            "fetched_count_by_source": dict(fetched_count_by_source),
-            "deduped_count_by_source": dict(deduped_count_by_source),
-            "error_count": len(errors),
-        },
+        "News source health summary",
+        extra=log_extra,
     )
     return NewsFetchResult(
         items=items,
@@ -458,4 +536,7 @@ def fetch_configured_headlines(
         deduped_count_by_source=dict(deduped_count_by_source),
         errors=errors,
         source_ids=source_ids,
+        source_health={source_id: health.to_dict() for source_id, health in source_health.items()},
+        degraded=degraded,
+        degraded_reasons=degraded_reasons,
     )

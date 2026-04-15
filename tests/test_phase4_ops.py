@@ -94,7 +94,10 @@ def test_deploy_env_example_keeps_safe_phase4_defaults() -> None:
     assert env_values["NEWS_RSS_ENABLED"] == "false"
     assert env_values["NEWS_LLM_ENABLED"] == "false"
     assert env_values["BENZINGA_RSS_ENABLED"] == "false"
+    assert env_values["REUTERS_RSS_URLS"] == "[]"
+    assert env_values["BENZINGA_RSS_URLS"] == "[]"
     assert env_values["SEC_RSS_ENABLED"] == "false"
+    assert env_values["SEC_COMPANY_TICKERS_CACHE_TTL_HOURS"] == "24"
     assert env_values["RATE_LIMIT_ENABLED"] == "false"
     assert env_values["ALPACA_API_KEY"] == ""
     assert env_values["ALPACA_SECRET_KEY"] == ""
@@ -107,6 +110,7 @@ def test_deploy_env_example_keeps_safe_phase4_defaults() -> None:
     assert "benzinga rss example" in contents.lower()
     assert "sec rss example" in contents.lower()
     assert "rate limit example" in contents.lower()
+    assert "www.benzinga.com/feeds/news" not in contents
 
 
 def test_verify_phase4_helpers_parse_env_and_check_paper_safety(tmp_path) -> None:
