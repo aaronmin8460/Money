@@ -1,9 +1,14 @@
 [Unit]
 Description=Money news feature refresh
+Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/money
 EnvironmentFile=/etc/money/money.env
-ExecStart=/opt/money/.venv/bin/python scripts/fetch_news_features.py
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/test -x /opt/money/.venv/bin/python
+ExecStart=/opt/money/.venv/bin/python -u scripts/fetch_news_features.py
+TimeoutStartSec=900
+SyslogIdentifier=money-news

@@ -156,7 +156,9 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
             "trading_enabled": settings.trading_enabled,
+            "order_submission_mode": settings.order_submission_mode,
             "auto_trade_enabled": settings.auto_trade_enabled,
+            "auto_trader_lock_path": settings.auto_trader_lock_path,
         },
     )
     return runtime

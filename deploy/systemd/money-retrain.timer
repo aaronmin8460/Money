@@ -3,7 +3,9 @@ Description=Run Money nightly retrain
 
 [Timer]
 OnCalendar=*-*-* 02:15:00
+AccuracySec=1m
 Persistent=true
+Unit=money-retrain.service
 
 [Install]
 WantedBy=timers.target

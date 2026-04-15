@@ -1,9 +1,16 @@
 [Unit]
 Description=Money nightly candidate-model retrain
+Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/money
 EnvironmentFile=/etc/money/money.env
-ExecStart=/bin/bash scripts/run_nightly_retrain.sh
+Environment=PYTHONUNBUFFERED=1
+Environment=APP_DIR=/opt/money
+Environment=PYTHON_BIN=/opt/money/.venv/bin/python
+ExecStartPre=/usr/bin/test -x /opt/money/.venv/bin/python
+ExecStart=/bin/bash /opt/money/scripts/run_nightly_retrain.sh
+TimeoutStartSec=3600
+SyslogIdentifier=money-retrain

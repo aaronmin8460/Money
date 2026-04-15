@@ -27,9 +27,19 @@ app.include_router(signals_router)
 def on_startup() -> None:
     init_logging()
     settings = get_settings()
+    logger = get_logger("api.startup")
+    logger.info(
+        "Application startup initiated",
+        extra={
+            "broker_mode": settings.broker_mode,
+            "broker_backend": settings.broker_backend,
+            "order_submission_mode": settings.order_submission_mode,
+            "auto_trade_enabled": settings.auto_trade_enabled,
+            "auto_trader_lock_path": settings.auto_trader_lock_path,
+        },
+    )
     settings.validate_settings()
     init_db()
-    logger = get_logger("api.startup")
     runtime = get_runtime(settings)
     logger.info(
         "Application startup configuration",
@@ -38,13 +48,25 @@ def on_startup() -> None:
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
             "trading_enabled": settings.trading_enabled,
+            "order_submission_mode": settings.order_submission_mode,
             "auto_trade_enabled": settings.auto_trade_enabled,
             "discord_enabled": settings.discord_notifications_enabled,
+            "auto_trader_lock_path": settings.auto_trader_lock_path,
+            "news_llm_status": settings.news_llm_status,
         },
     )
     notifier = get_discord_notifier(settings)
     if settings.auto_trade_enabled:
-        started = runtime.get_auto_trader().start()
+        logger.info(
+            "AUTO_TRADE_ENABLED is true; attempting in-process auto-trader startup",
+            extra={
+                "order_submission_mode": settings.order_submission_mode,
+                "auto_trader_lock_path": settings.auto_trader_lock_path,
+            },
+        )
+        trader = runtime.get_auto_trader()
+        started = trader.start()
+        trader_status = trader.get_status()
         logger.info(
             "AUTO_TRADE_ENABLED processed on startup",
             extra={
@@ -52,9 +74,20 @@ def on_startup() -> None:
                 "broker_mode": settings.broker_mode,
                 "broker_backend": settings.broker_backend,
                 "active_strategy": settings.active_strategy,
+                "order_submission_mode": settings.order_submission_mode,
+                "auto_trader_running": trader_status["running"],
+                "process_lock_acquired": trader_status["process_lock_acquired"],
+                "process_lock_metadata": trader_status["process_lock_metadata"],
             },
         )
     else:
+        logger.info(
+            "AUTO_TRADE_ENABLED is false; API started without launching the background trader loop",
+            extra={
+                "order_submission_mode": settings.order_submission_mode,
+                "auto_trader_lock_path": settings.auto_trader_lock_path,
+            },
+        )
         notifier.send_system_notification(
             event="Bot started",
             reason="application startup completed",
@@ -62,6 +95,7 @@ def on_startup() -> None:
                 "broker_mode": settings.broker_mode,
                 "active_strategy": settings.active_strategy,
                 "trading_enabled": settings.trading_enabled,
+                "order_submission_mode": settings.order_submission_mode,
                 "auto_trade_enabled": settings.auto_trade_enabled,
                 "discord_enabled": settings.discord_notifications_enabled,
             },
@@ -74,6 +108,7 @@ def on_startup() -> None:
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
             "trading_enabled": settings.trading_enabled,
+            "order_submission_mode": settings.order_submission_mode,
             "auto_trade_enabled": settings.auto_trade_enabled,
             "discord_enabled": settings.discord_notifications_enabled,
         },
@@ -83,19 +118,33 @@ def on_startup() -> None:
 @app.on_event("shutdown")
 def on_shutdown() -> None:
     settings = get_settings()
+    logger = get_logger("api.shutdown")
     notifier = get_discord_notifier(settings)
     runtime = get_runtime(settings)
-    was_auto_trader_running = runtime.get_auto_trader().get_status().get("running", False)
+    trader_status = runtime.get_auto_trader().get_status()
+    was_auto_trader_running = trader_status.get("running", False)
+    logger.info(
+        "Application shutdown initiated",
+        extra={
+            "broker_mode": settings.broker_mode,
+            "broker_backend": settings.broker_backend,
+            "active_strategy": settings.active_strategy,
+            "order_submission_mode": settings.order_submission_mode,
+            "auto_trader_running": was_auto_trader_running,
+            "process_lock_acquired": trader_status.get("process_lock_acquired"),
+            "process_lock_metadata": trader_status.get("process_lock_metadata"),
+        },
+    )
     try:
         close_runtime()
     finally:
-        logger = get_logger("api.shutdown")
         logger.info(
             "Application shutdown complete",
             extra={
                 "broker_mode": settings.broker_mode,
                 "broker_backend": settings.broker_backend,
                 "active_strategy": settings.active_strategy,
+                "order_submission_mode": settings.order_submission_mode,
             },
         )
         if not was_auto_trader_running:
@@ -106,6 +155,7 @@ def on_shutdown() -> None:
                     "broker_mode": settings.broker_mode,
                     "active_strategy": settings.active_strategy,
                     "trading_enabled": settings.trading_enabled,
+                    "order_submission_mode": settings.order_submission_mode,
                     "auto_trade_enabled": settings.auto_trade_enabled,
                     "discord_enabled": settings.discord_notifications_enabled,
                 },

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 
 import uvicorn
 
@@ -19,6 +21,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    print(
+        "money_api_entrypoint=run_paper_api "
+        f"pid={os.getpid()} "
+        f"python_bin={sys.executable} "
+        f"host={args.host} "
+        f"port={args.port} "
+        "workers=1 reload=false",
+        flush=True,
+    )
     uvicorn.run(
         "main:app",
         host=args.host,
@@ -27,6 +38,7 @@ def main() -> None:
         reload=False,
         workers=1,
     )
+    print("money_api_entrypoint_stopped=true", flush=True)
 
 
 if __name__ == "__main__":

@@ -138,38 +138,180 @@ curl -X POST http://127.0.0.1:8000/admin/runtime-safety/resume \
   -d '{"note":"resume after review","reset_consecutive_losing_exits":true}'
 ```
 
-## 7. Recommended EC2/systemd or compose-based paper deployment
+## 7. EC2/systemd paper deployment
 
 Recommended shape:
 
-- Keep a single API/trader process.
-- Prefer systemd for restart ownership on EC2.
-- Use `scripts/run_paper_api.py` instead of multi-worker app servers.
+- Keep one API process and one in-process auto-trader loop.
+- Use `scripts/run_paper_api.py` as the systemd entrypoint.
+- Let systemd own restart behavior.
+- Keep `BROKER_MODE=paper` and `LIVE_TRADING_ENABLED=false`.
 
-Systemd path:
+### Bootstrap the host
 
-- Example service: `deploy/systemd/money-api.service`
-- Example env file: `deploy/env/money.env.example`
-- Recommended setup: copy the service to `/etc/systemd/system/`, place a real env file outside the repo such as `/etc/money/money.env`, and set `API_ADMIN_TOKEN`, paper Alpaca credentials, and a production `DATABASE_URL`.
-
-Compose path:
-
-- `docker-compose.yml` is development-only. It bind-mounts the repo and forces safe local defaults.
-- `docker-compose.prod.yml` is the production-oriented paper deployment shape.
-- The production compose file does not bind-mount the repository, uses `env_file`-driven configuration, preserves the single-process runtime, and exposes a readiness-aware healthcheck.
-
-Compose example:
+The bootstrap script installs Ubuntu packages, creates the venv, seeds `/etc/money/money.env`, and installs the systemd unit templates:
 
 ```bash
-MONEY_ENV_FILE=/etc/money/money.env docker compose -f docker-compose.prod.yml up -d --build
+sudo mkdir -p /opt/money
+sudo chown "$USER:$USER" /opt/money
+git clone https://github.com/aaronmin8460/Money.git /opt/money
+cd /opt/money
+bash deploy/ec2/bootstrap.sh
 ```
 
-For production compose, set one of these in your real env file before starting:
+### Edit the deployment env
 
-- `DATABASE_URL=postgresql+psycopg://USER:PASSWORD@HOST:5432/money`
-- `DATABASE_URL=sqlite:///./data/trading.db`
-- Run `alembic upgrade head` before the first start or let application startup apply the same migration head automatically.
-- See [docs/operations.md](docs/operations.md) for the full persistent paper-trading runbook.
+Bootstrap installs a conservative starter env file at `/etc/money/money.env`. Edit that file before starting services:
+
+```bash
+sudoedit /etc/money/money.env
+```
+
+For the first boot, keep these safe values:
+
+- `TRADING_ENABLED=false`
+- `AUTO_TRADE_ENABLED=false`
+- `LIVE_TRADING_ENABLED=false`
+- `DISCORD_NOTIFICATIONS_ENABLED=false`
+- `NEWS_FEATURES_ENABLED=false`
+- `ML_RETRAIN_ENABLED=false`
+
+Minimum values to fill in for a real EC2 paper deployment:
+
+- `ALPACA_API_KEY`
+- `ALPACA_SECRET_KEY`
+- `API_ADMIN_TOKEN`
+- `DATABASE_URL`
+
+When you are ready for continuous paper order submission, change only these two lines:
+
+- `TRADING_ENABLED=true`
+- `AUTO_TRADE_ENABLED=true`
+
+### Install or refresh the unit files
+
+Bootstrap already installs the default units, but these are the exact refresh commands if you want to re-install them explicitly:
+
+```bash
+cd /opt/money
+sudo install -m 0644 deploy/systemd/money-api.service /etc/systemd/system/money-api.service
+sudo install -m 0644 deploy/systemd/money-news.service /etc/systemd/system/money-news.service
+sudo install -m 0644 deploy/systemd/money-news.timer /etc/systemd/system/money-news.timer
+sudo install -m 0644 deploy/systemd/money-retrain.service /etc/systemd/system/money-retrain.service
+sudo install -m 0644 deploy/systemd/money-retrain.timer /etc/systemd/system/money-retrain.timer
+sudo systemctl daemon-reload
+```
+
+### Enable and start the API plus timers
+
+```bash
+sudo systemctl enable --now money-api.service
+sudo systemctl enable --now money-news.timer
+sudo systemctl enable --now money-retrain.timer
+```
+
+### Verify the service and timers
+
+Exact status commands:
+
+```bash
+sudo systemctl status money-api.service --no-pager
+sudo systemctl status money-news.timer --no-pager
+sudo systemctl status money-retrain.timer --no-pager
+sudo systemctl list-timers --all 'money-*'
+```
+
+Exact journal commands:
+
+```bash
+sudo journalctl -u money-api.service -n 100 --no-pager
+sudo journalctl -u money-news.service -n 100 --no-pager
+sudo journalctl -u money-retrain.service -n 100 --no-pager
+```
+
+Exact API checks:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/health/ready
+curl http://127.0.0.1:8000/auto/status
+curl http://127.0.0.1:8000/config \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+```
+
+Run the full operational verifier:
+
+```bash
+cd /opt/money
+.venv/bin/python scripts/verify_phase4.py \
+  --env-file /etc/money/money.env \
+  --app-dir /opt/money \
+  --base-url http://127.0.0.1:8000
+```
+
+### Verify the auto-trader really started
+
+After you intentionally set `AUTO_TRADE_ENABLED=true`, confirm all three signals:
+
+```bash
+curl http://127.0.0.1:8000/auto/status
+sudo journalctl -u money-api.service -n 150 --no-pager
+```
+
+What to look for:
+
+- `/auto/status` should report `"enabled": true`, `"running": true`, and `"process_lock_acquired": true`.
+- `money-api.service` logs should show the single-process entrypoint, startup configuration, the auto-trader start attempt, and whether the loop lock was acquired.
+- `order_submission_mode` should read `dry_run` for safe first boot or `paper_order_submission` when paper order submission is intentionally enabled.
+
+### Verify hourly news refresh and whether LLM or heuristics ran
+
+Trigger the service manually once if you want an immediate check:
+
+```bash
+sudo systemctl start money-news.service
+sudo journalctl -u money-news.service -n 100 --no-pager
+tail -n 20 /opt/money/logs/news_features.jsonl
+```
+
+What to look for:
+
+- `analysis_mode=llm` with `analysis_reason=llm_success` means the OpenAI path ran.
+- `analysis_mode=heuristic` with reasons such as `news_llm_disabled`, `openai_api_key_missing`, or `llm_fallback_after_error` means the pipeline degraded safely without crashing.
+- The timer should remain active even if LLM is disabled; RSS-only refresh is still valid feature generation.
+
+### Verify nightly retrain behavior
+
+Trigger it manually and inspect the journal:
+
+```bash
+sudo systemctl start money-retrain.service
+sudo journalctl -u money-retrain.service -n 150 --no-pager
+```
+
+What to look for:
+
+- `nightly_retrain_skipped=true reason=ml_retrain_disabled` means the timer path is healthy but intentionally disabled.
+- `nightly_retrain_skipped=true reason=no_training_rows` or `reason=no_models_trained` means sparse data skipped cleanly with exit code `0`.
+- Successful runs log each step and use the project venv explicitly through `/opt/money/.venv/bin/python`.
+
+### Deploy updates safely later
+
+```bash
+cd /opt/money
+bash deploy/ec2/pull_and_restart.sh
+```
+
+That update script does the following:
+
+- `git pull --ff-only`
+- refreshes Python dependencies in the project venv
+- reloads systemd if unit files changed
+- restarts `money-api.service`
+- restarts the news/retrain timers only if they were already enabled or active
+- prints a short post-deploy health summary
+
+Compose files remain in the repository for non-EC2 workflows, but the Phase 4 path is systemd-first.
 
 ## 8. Admin API security expectations
 
@@ -220,7 +362,7 @@ Targeted tests first:
 
 ```bash
 source .venv/bin/activate
-uv run pytest tests/test_config.py tests/test_db_session.py tests/test_api.py tests/test_alembic.py
+pytest tests/test_config.py tests/test_db_session.py tests/test_api.py tests/test_alembic.py tests/test_phase4_ops.py
 ```
 
 API startup sanity check:
@@ -246,4 +388,19 @@ curl -X POST http://127.0.0.1:8000/auto/run-now
 curl -X POST http://127.0.0.1:8000/run-once \
   -H "Content-Type: application/json" \
   -d '{"symbol":"AAPL","asset_class":"equity"}'
+```
+
+Phase 4 EC2 verification:
+
+```bash
+cd /opt/money
+.venv/bin/python scripts/verify_phase4.py \
+  --env-file /etc/money/money.env \
+  --app-dir /opt/money \
+  --base-url http://127.0.0.1:8000
+sudo systemctl status money-api.service --no-pager
+sudo systemctl list-timers --all 'money-*'
+sudo journalctl -u money-api.service -n 100 --no-pager
+sudo journalctl -u money-news.service -n 100 --no-pager
+sudo journalctl -u money-retrain.service -n 100 --no-pager
 ```

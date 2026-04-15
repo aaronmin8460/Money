@@ -409,6 +409,16 @@ class Settings(BaseSettings):
         return "alpaca_paper" if self.is_alpaca_mode else "local_mock"
 
     @property
+    def order_submission_mode(self) -> str:
+        if not self.trading_enabled:
+            return "dry_run"
+        if self.live_trading_enabled:
+            return "live_order_submission"
+        if self.is_paper_mode:
+            return "paper_order_submission"
+        return "mock_order_submission"
+
+    @property
     def effective_max_position_notional(self) -> float:
         return float(self.max_position_notional * self.position_notional_buffer_pct)
 
@@ -830,8 +840,20 @@ class Settings(BaseSettings):
         return max(1, int(value))
 
     @property
+    def news_llm_status(self) -> str:
+        if not self.news_features_enabled:
+            return "news_features_disabled"
+        if not self.news_rss_enabled:
+            return "news_rss_disabled"
+        if not self.news_llm_enabled:
+            return "news_llm_disabled"
+        if not self.openai_api_key:
+            return "openai_api_key_missing"
+        return "available"
+
+    @property
     def news_llm_available(self) -> bool:
-        return self.news_features_enabled and self.news_llm_enabled and bool(self.openai_api_key)
+        return self.news_llm_status == "available"
 
 
 _settings: Settings | None = None

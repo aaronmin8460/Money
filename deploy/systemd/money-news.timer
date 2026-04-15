@@ -3,7 +3,9 @@ Description=Run Money news feature refresh every hour
 
 [Timer]
 OnCalendar=hourly
+AccuracySec=1m
 Persistent=true
+Unit=money-news.service
 
 [Install]
 WantedBy=timers.target

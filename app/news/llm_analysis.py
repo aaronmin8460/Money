@@ -21,7 +21,13 @@ _RISK_TAGS = {
 }
 
 
-def _heuristic_analysis(symbol: str, headlines: list[NewsHeadline]) -> dict[str, Any]:
+def _heuristic_analysis(
+    symbol: str,
+    headlines: list[NewsHeadline],
+    *,
+    reason: str,
+    llm_status: str,
+) -> dict[str, Any]:
     text = " ".join(f"{headline.title} {headline.summary}" for headline in headlines).lower()
     positive_hits = sum(word in text for word in _POSITIVE_WORDS)
     negative_hits = sum(word in text for word in _NEGATIVE_WORDS)
@@ -42,6 +48,8 @@ def _heuristic_analysis(symbol: str, headlines: list[NewsHeadline]) -> dict[str,
         "risk_tags": risk_tags,
         "relevance_score": min(1.0, 0.4 + (0.1 * len(headlines))),
         "analysis_mode": "heuristic",
+        "analysis_reason": reason,
+        "llm_status": llm_status,
     }
 
 
@@ -62,9 +70,25 @@ def analyze_headlines(
             "risk_tags": [],
             "relevance_score": 0.0,
             "analysis_mode": "empty",
+            "analysis_reason": "no_headlines",
+            "llm_status": resolved_settings.news_llm_status,
         }
     if not resolved_settings.news_llm_available:
-        return _heuristic_analysis(symbol, headlines)
+        llm_status = resolved_settings.news_llm_status
+        logger.info(
+            "Using heuristic news analysis",
+            extra={
+                "symbol": symbol,
+                "headline_count": len(headlines),
+                "llm_status": llm_status,
+            },
+        )
+        return _heuristic_analysis(
+            symbol,
+            headlines,
+            reason=llm_status,
+            llm_status=llm_status,
+        )
 
     prompt = (
         "You are classifying market news for feature engineering only.\n"
@@ -83,6 +107,14 @@ def analyze_headlines(
         )
         raw_text = getattr(response, "output_text", "") or ""
         payload = json.loads(raw_text)
+        logger.info(
+            "OpenAI news analysis completed",
+            extra={
+                "symbol": symbol,
+                "headline_count": len(headlines),
+                "openai_model": resolved_settings.openai_model,
+            },
+        )
         return {
             "symbol": symbol,
             "summary": str(payload.get("summary", "")),
@@ -91,7 +123,15 @@ def analyze_headlines(
             "risk_tags": list(payload.get("risk_tags", [])),
             "relevance_score": float(payload.get("relevance_score", 0.0)),
             "analysis_mode": "llm",
+            "analysis_reason": "llm_success",
+            "llm_status": resolved_settings.news_llm_status,
+            "llm_model": resolved_settings.openai_model,
         }
     except Exception as exc:
         logger.warning("OpenAI news analysis failed for %s: %s", symbol, exc)
-        return _heuristic_analysis(symbol, headlines)
+        return _heuristic_analysis(
+            symbol,
+            headlines,
+            reason="llm_fallback_after_error",
+            llm_status=resolved_settings.news_llm_status,
+        )

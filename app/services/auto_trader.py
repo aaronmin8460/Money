@@ -104,13 +104,25 @@ class AutoTrader:
     def start(self) -> bool:
         with self._state_lock:
             if self._running or (self._thread and self._thread.is_alive()):
-                logger.info("Paper auto-trader start skipped because it is already running")
+                logger.info(
+                    "Paper auto-trader start skipped because it is already running",
+                    extra={
+                        "order_submission_mode": self.settings.order_submission_mode,
+                        "lock_path": self.settings.auto_trader_lock_path,
+                        "lock_diagnostics": self._get_process_lock_diagnostics(),
+                    },
+                )
                 return False
             self._process_started_at = datetime.datetime.now(datetime.timezone.utc)
             if not self._acquire_process_lock():
+                lock_diagnostics = self._get_process_lock_diagnostics()
                 logger.warning(
                     "Paper auto-trader start blocked because another process holds the loop lock",
-                    extra={"lock_path": self.settings.auto_trader_lock_path},
+                    extra={
+                        "lock_path": self.settings.auto_trader_lock_path,
+                        "order_submission_mode": self.settings.order_submission_mode,
+                        "lock_diagnostics": lock_diagnostics,
+                    },
                 )
                 return False
 
@@ -126,6 +138,16 @@ class AutoTrader:
                 name="money-auto-trader",
             )
             self._thread.start()
+            lock_diagnostics = self._get_process_lock_diagnostics()
+
+        logger.info(
+            "Paper auto-trader process lock acquired",
+            extra={
+                "lock_path": self.settings.auto_trader_lock_path,
+                "order_submission_mode": self.settings.order_submission_mode,
+                "lock_diagnostics": lock_diagnostics,
+            },
+        )
 
         logger.info(
             "Paper auto-trader is running",
@@ -137,6 +159,7 @@ class AutoTrader:
                 "crypto_only_mode": self.settings.crypto_only_mode,
                 "scan_interval_seconds": self.settings.scan_interval_seconds,
                 "trading_enabled": self.settings.trading_enabled,
+                "order_submission_mode": self.settings.order_submission_mode,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
                 "discord_enabled": self.settings.discord_notifications_enabled,
                 "thread_name": self._thread.name if self._thread else None,
@@ -150,6 +173,7 @@ class AutoTrader:
                 "active_strategy": self.settings.active_strategy,
                 "scan_interval_seconds": self.settings.scan_interval_seconds,
                 "trading_enabled": self.settings.trading_enabled,
+                "order_submission_mode": self.settings.order_submission_mode,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
                 "discord_enabled": self.settings.discord_notifications_enabled,
             },
@@ -174,10 +198,20 @@ class AutoTrader:
         self._release_process_lock()
 
         logger.info(
+            "Paper auto-trader process lock released",
+            extra={
+                "lock_path": self.settings.auto_trader_lock_path,
+                "order_submission_mode": self.settings.order_submission_mode,
+                "lock_diagnostics": self._get_process_lock_diagnostics(),
+            },
+        )
+
+        logger.info(
             "Paper auto-trader stopped",
             extra={
                 "broker_mode": self.settings.broker_mode,
                 "active_strategy": self.settings.active_strategy,
+                "order_submission_mode": self.settings.order_submission_mode,
                 "thread_ident": self._loop_thread_ident,
                 "discord_enabled": self.settings.discord_notifications_enabled,
             },
@@ -189,6 +223,7 @@ class AutoTrader:
                 "broker_mode": self.settings.broker_mode,
                 "active_strategy": self.settings.active_strategy,
                 "trading_enabled": self.settings.trading_enabled,
+                "order_submission_mode": self.settings.order_submission_mode,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
                 "discord_enabled": self.settings.discord_notifications_enabled,
             },
@@ -313,6 +348,8 @@ class AutoTrader:
                 "broker_mode": self.settings.broker_mode,
                 "broker_backend": self.settings.broker_backend,
                 "trading_enabled": self.settings.trading_enabled,
+                "live_trading_enabled": self.settings.live_trading_enabled,
+                "order_submission_mode": self.settings.order_submission_mode,
                 "active_strategy": self.settings.active_strategy,
                 "primary_runtime_strategy": self.settings.primary_runtime_strategy,
                 "scan_interval_seconds": self.settings.scan_interval_seconds,
