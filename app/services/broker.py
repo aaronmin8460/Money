@@ -372,7 +372,7 @@ class PaperBroker(BrokerInterface):
 class AlpacaBroker(BrokerInterface):
     """Adapter for Alpaca paper and live trading APIs."""
 
-    def __init__(self, settings: Settings | None = None):
+    def __init__(self, settings: Settings | None = None, market_data_service: MarketDataService | None = None):
         self.settings = settings or get_settings()
         if not self.settings.is_alpaca_mode:
             raise RuntimeError("AlpacaBroker is only available when BROKER_MODE=paper.")
@@ -388,14 +388,7 @@ class AlpacaBroker(BrokerInterface):
             },
             timeout=10.0,
         )
-        self.market_data_client = httpx.Client(
-            base_url=str(self.settings.alpaca_data_base_url).rstrip("/"),
-            headers={
-                "APCA-API-KEY-ID": self.settings.alpaca_api_key,
-                "APCA-API-SECRET-KEY": self.settings.alpaca_secret_key,
-            },
-            timeout=10.0,
-        )
+        self.market_data_service = market_data_service
         self._asset_cache: dict[str, AssetMetadata] = {}
 
     def _request(
@@ -621,43 +614,14 @@ class AlpacaBroker(BrokerInterface):
         return canceled_orders
 
     def get_latest_price(self, symbol: str, asset_class: AssetClass | str | None = None) -> float:
-        resolved_asset_class = normalize_asset_class(asset_class)
-        if resolved_asset_class == AssetClass.CRYPTO:
-            try:
-                response = self.market_data_client.get(
-                    f"/v1beta3/crypto/{self.settings.alpaca_crypto_location}/latest/trades",
-                    params={"symbols": canonicalize_symbol(symbol, AssetClass.CRYPTO)},
-                )
-                response.raise_for_status()
-                payload = response.json()
-                trade = (payload.get("trades") or {}).get(canonicalize_symbol(symbol, AssetClass.CRYPTO)) or {}
-                return float(trade.get("p", 0.0))
-            except httpx.HTTPStatusError as exc:
-                raise BrokerUpstreamError(
-                    f"Alpaca crypto market data error {exc.response.status_code}: {exc.response.text}"
-                ) from exc
-            except httpx.RequestError as exc:
-                raise BrokerConnectionError(f"Failed to connect to Alpaca market data: {exc}") from exc
-
-        try:
-            response = self.market_data_client.get(
-                f"/v2/stocks/{canonicalize_symbol(symbol, resolved_asset_class)}/trades/latest",
-                params={"feed": "iex"},
+        if self.market_data_service is None:
+            raise BrokerConnectionError(
+                "AlpacaBroker is broker-only in this runtime; configure a MarketDataService for prices."
             )
-            response.raise_for_status()
-            payload = response.json()
-            trade = payload.get("trade") or {}
-            return float(trade.get("p", 0.0))
-        except httpx.HTTPStatusError as exc:
-            raise BrokerUpstreamError(
-                f"Alpaca market data error {exc.response.status_code}: {exc.response.text}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise BrokerConnectionError(f"Failed to connect to Alpaca market data: {exc}") from exc
+        return self.market_data_service.get_latest_price(symbol, asset_class)
 
     def close(self) -> None:
         self.client.close()
-        self.market_data_client.close()
 
 
 def create_broker(
@@ -669,5 +633,5 @@ def create_broker(
     if mode == "mock":
         return PaperBroker(settings, market_data_service=market_data_service or CSVMarketDataService())
     if mode == "paper":
-        return AlpacaBroker(settings)
+        return AlpacaBroker(settings, market_data_service=market_data_service)
     raise ValueError(f"Unsupported broker mode '{settings.broker_mode}'.")

@@ -289,28 +289,33 @@ def test_rejection_notifications_respect_settings(mock_post: Mock) -> None:
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")
-def test_non_2xx_webhook_logs_sanitized_target(mock_post: Mock, caplog) -> None:
+def test_non_2xx_webhook_logs_sanitized_target(mock_post: Mock) -> None:
     mock_post.return_value = build_response(status_code=400, text="bad webhook request")
     settings = Settings(
         _env_file=None,
         broker_mode="mock",
         trading_enabled=False,
+        log_dir=f"{tempfile.gettempdir()}/money-discord-tests-{uuid.uuid4().hex}",
         discord_notifications_enabled=True,
         discord_webhook_url="https://discord.com/api/webhooks/1234567890/super-secret-token",
     )
     notifier = DiscordNotifier(settings)
 
-    sent = notifier.send_system_notification(
-        event="Bot started",
-        reason="background loop started",
-        category="start_stop",
-    )
+    with patch("app.monitoring.discord_notifier.logger.warning") as mock_warning:
+        sent = notifier.send_system_notification(
+            event="Bot started",
+            reason="background loop started",
+            category="start_stop",
+        )
 
     assert sent is False
-    assert "status 400" in caplog.text
-    assert "bad webhook request" in caplog.text
-    assert "discord.com/api/webhooks/1234...7890/***" in caplog.text
-    assert "super-secret-token" not in caplog.text
+    mock_post.assert_called_once()
+    message_template, *message_args = mock_warning.call_args.args
+    rendered_message = message_template % tuple(message_args)
+    assert "status 400" in rendered_message
+    assert "bad webhook request" in rendered_message
+    assert "discord.com/api/webhooks/1234...7890/***" in rendered_message
+    assert "super-secret-token" not in rendered_message
 
 
 @patch("app.monitoring.discord_notifier.httpx.post")

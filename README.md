@@ -13,6 +13,7 @@ FastAPI-based trading bot for paper-safe operation, structured logging, Discord 
 
 - Default mode is `BROKER_MODE=paper`.
 - `.env.example` ships with `TRADING_ENABLED=false`, `AUTO_TRADE_ENABLED=false`, `LIVE_TRADING_ENABLED=false`, `DISCORD_NOTIFICATIONS_ENABLED=false`, `ML_ENABLED=false`, `ML_RETRAIN_ENABLED=false`, `NEWS_FEATURES_ENABLED=false`, and `ALLOW_EXTENDED_HOURS=false`.
+- Alpaca can be used as the broker while market data routes through free providers by asset class. The default composite route is Yahoo Finance for equities/ETFs/options and CoinGecko for crypto.
 - Live trading requires explicit acknowledgement through both `LIVE_TRADING_ENABLED=true` and `LIVE_TRADING_ACK=ENABLE_LIVE_TRADING`.
 - ML can assist ranking and filtering, but it must not bypass hard stops, drawdown limits, or emergency exits.
 - News features can enrich signals, but they never place orders directly.
@@ -59,6 +60,7 @@ Required for most local and paper deployments:
 - `DATABASE_URL`
 - `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` when `BROKER_MODE=paper`
 - `API_ADMIN_TOKEN` for any environment where protected admin or diagnostics routes should be reachable
+- `MARKET_DATA_PROVIDER_DEFAULT=composite` for broker-independent market data; see `docs/market_data_providers.md` for routing and cache/rate-limit settings
 
 Required only when the related feature is enabled:
 
@@ -86,6 +88,7 @@ Update `.env` with your local values:
 
 - keep the paper-safe defaults for the first boot
 - add Alpaca paper credentials only in `.env`
+- keep the free market-data defaults unless you intentionally want Alpaca market data
 - set `API_ADMIN_TOKEN` if you want access to `/config`, `/diagnostics/*`, or `/admin/*`
 - leave Discord disabled until you intentionally want alerts
 

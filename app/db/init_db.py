@@ -46,6 +46,7 @@ def _run_alembic_upgrade() -> bool:
 def init_db() -> None:
     """Initialize or migrate the database schema for the paper trading bot."""
     if _run_alembic_upgrade():
+        Base.metadata.create_all(bind=get_engine())
         return
 
     logger.warning(

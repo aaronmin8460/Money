@@ -1,12 +1,23 @@
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pandas as pd
 import pytest
 
 from app.config.settings import Settings
-from app.domain.models import AssetClass
-from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, infer_asset_class
+from app.domain.models import AssetClass, NormalizedMarketSnapshot, QuoteSnapshot, TradeSnapshot
+from app.services.market_data import (
+    AlpacaMarketDataProvider,
+    AlpacaMarketDataService,
+    CoinGeckoMarketDataProvider,
+    CompositeMarketDataProvider,
+    CSVMarketDataService,
+    TTLCache,
+    YahooFinanceMarketDataProvider,
+    coingecko_coin_id_for_symbol,
+    infer_asset_class,
+)
 from app.strategies.base import Signal
 
 
@@ -341,3 +352,158 @@ class TestMarketDataProtocol:
         service = AlpacaMarketDataService(settings)
         assert hasattr(service, "fetch_bars")
         assert hasattr(service, "get_latest_price")
+
+
+def test_composite_provider_routes_by_asset_class() -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+
+    class StubProvider:
+        def __init__(self, name: str, price: float):
+            self.provider_name = name
+            self.price = price
+
+        def get_latest_price(self, symbol, asset_class=None):
+            return self.price
+
+    composite = CompositeMarketDataProvider(
+        settings,
+        providers={
+            "yfinance": StubProvider("yfinance", 101.0),
+            "coingecko": StubProvider("coingecko", 60000.0),
+        },
+        route_by_asset_class={
+            AssetClass.EQUITY: "yfinance",
+            AssetClass.ETF: "yfinance",
+            AssetClass.CRYPTO: "coingecko",
+            AssetClass.OPTION: "yfinance",
+        },
+        fallback_provider_names=[],
+    )
+
+    assert composite.get_latest_price("AAPL", AssetClass.EQUITY) == 101.0
+    assert composite.get_latest_price("BTC/USD", AssetClass.CRYPTO) == 60000.0
+
+
+def test_composite_provider_falls_back_when_primary_fails() -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+
+    class FailingProvider:
+        provider_name = "primary"
+
+        def get_latest_price(self, symbol, asset_class=None):
+            raise RuntimeError("primary unavailable")
+
+    class FallbackProvider:
+        provider_name = "fallback"
+
+        def get_latest_price(self, symbol, asset_class=None):
+            return 42.0
+
+    composite = CompositeMarketDataProvider(
+        settings,
+        providers={"primary": FailingProvider(), "fallback": FallbackProvider()},
+        route_by_asset_class={AssetClass.EQUITY: "primary"},
+        fallback_provider_names=["fallback"],
+    )
+
+    assert composite.get_latest_price("AAPL", AssetClass.EQUITY) == 42.0
+    assert composite.diagnostics()["recent_fallback_count"] == 1
+
+
+def test_alpaca_429_retry_after_backoff_is_respected() -> None:
+    sleeps: list[float] = []
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        alpaca_api_key="test",
+        alpaca_secret_key="test",
+        market_data_max_retries=1,
+    )
+    service = AlpacaMarketDataProvider(settings, sleeper=sleeps.append)
+    request = httpx.Request("GET", "https://data.alpaca.markets/v2/test")
+    rate_limited = httpx.Response(429, headers={"Retry-After": "2"}, text="slow down", request=request)
+    ok = httpx.Response(200, json={"ok": True}, request=request)
+    service.client.get = MagicMock(side_effect=[rate_limited, ok])
+
+    assert service._request_json("/v2/test") == {"ok": True}
+    assert sleeps == [2.0]
+    assert service.diagnostics()["recent_429_count"] == 1
+
+
+def test_ttl_cache_hits_and_expires() -> None:
+    now = [100.0]
+    cache = TTLCache(clock=lambda: now[0])
+    key = ("provider", "snapshot", "AAPL")
+
+    cache.set(key, {"price": 1}, ttl_seconds=5)
+    assert cache.get(key) == {"price": 1}
+    now[0] = 106.0
+    assert cache.get(key) is None
+    stats = cache.stats()
+    assert stats["hits"] == 1
+    assert stats["expirations"] == 1
+
+
+def test_coingecko_symbol_mapping_and_unmapped_failure() -> None:
+    assert coingecko_coin_id_for_symbol("BTC/USD") == "bitcoin"
+    assert coingecko_coin_id_for_symbol("ETHUSD") == "ethereum"
+    assert coingecko_coin_id_for_symbol("ETHUSDT") == "ethereum"
+    with pytest.raises(ValueError, match="No CoinGecko symbol mapping"):
+        coingecko_coin_id_for_symbol("NOPE/USD")
+
+
+def test_coingecko_batch_snapshot_normalizes_without_real_network() -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+    provider = CoinGeckoMarketDataProvider(settings)
+    provider._request_json = MagicMock(
+        return_value={
+            "bitcoin": {
+                "usd": 60000.0,
+                "usd_24h_vol": 123456.0,
+                "usd_24h_change": 2.5,
+                "last_updated_at": 1710000000,
+            }
+        }
+    )
+
+    snapshots = provider.batch_snapshot(["BTC/USD"], AssetClass.CRYPTO)
+
+    normalized = NormalizedMarketSnapshot.from_dict(snapshots["BTC/USD"]["normalized"])
+    assert normalized.symbol == "BTC/USD"
+    assert normalized.asset_class == AssetClass.CRYPTO
+    assert normalized.evaluation_price == 60000.0
+    assert normalized.source == "coingecko"
+
+
+def test_yfinance_normalized_snapshot_contract_with_partial_quote(monkeypatch) -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+    provider = YahooFinanceMarketDataProvider(settings)
+    timestamp = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        provider,
+        "get_latest_trade",
+        lambda symbol, asset_class: TradeSnapshot(
+            symbol=symbol,
+            asset_class=AssetClass.EQUITY,
+            price=150.0,
+            timestamp=timestamp,
+        ),
+    )
+    monkeypatch.setattr(
+        provider,
+        "get_latest_quote",
+        lambda symbol, asset_class: QuoteSnapshot(
+            symbol=symbol,
+            asset_class=AssetClass.EQUITY,
+            timestamp=timestamp,
+        ),
+    )
+
+    snapshot = provider.get_normalized_snapshot("AAPL", AssetClass.EQUITY)
+
+    assert snapshot.symbol == "AAPL"
+    assert snapshot.asset_class == AssetClass.EQUITY
+    assert snapshot.evaluation_price == 150.0
+    assert snapshot.quote_available is False
+    assert snapshot.source == "yfinance"

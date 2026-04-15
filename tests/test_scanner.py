@@ -5,6 +5,7 @@ import pandas as pd
 from app.domain.models import AssetClass, AssetMetadata, NormalizedMarketSnapshot
 from app.config.settings import Settings
 from app.db.models import AssetCatalogEntry, AssetCatalogSyncRun, RankedOpportunityRecord, ScannerRun
+from app.db.init_db import init_db
 from app.db.session import SessionLocal
 from app.services.asset_catalog import AssetCatalogService
 from app.services.broker import PaperBroker
@@ -45,6 +46,7 @@ def test_scanner_ranks_multi_asset_opportunities(tmp_path) -> None:
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     catalog = AssetCatalogService(broker=broker, settings=settings)
 
+    init_db()
     with SessionLocal() as session:
         session.query(AssetCatalogEntry).delete()
         session.query(AssetCatalogSyncRun).delete()
@@ -107,6 +109,7 @@ def test_scanner_crypto_only_mode_uses_configured_crypto_universe(tmp_path) -> N
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     catalog = AssetCatalogService(broker=broker, settings=settings)
 
+    init_db()
     with SessionLocal() as session:
         session.query(AssetCatalogEntry).delete()
         session.query(AssetCatalogSyncRun).delete()
@@ -287,3 +290,87 @@ def test_scanner_prefilter_ranks_beyond_catalog_order(monkeypatch) -> None:
     assert result.final_evaluation_counts["equity"] == 2
     assert "ZZZ" in result.symbol_snapshots
     assert "AAA" not in result.symbol_snapshots
+
+
+def test_scanner_uses_batch_snapshots_and_reuses_prepared_data() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        min_avg_volume=1,
+        min_dollar_volume=1,
+        min_price=1,
+        scanner_timeframe_by_asset_class={"equity": "15Min"},
+        lookback_bars_by_asset_class={"equity": 30},
+    )
+    assets = {
+        "AAA": AssetMetadata(symbol="AAA", name="AAA", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+        "BBB": AssetMetadata(symbol="BBB", name="BBB", asset_class=AssetClass.EQUITY, exchange="NASDAQ"),
+    }
+    batch_calls: list[tuple[tuple[str, ...], AssetClass]] = []
+    normalized_calls: list[str] = []
+    fetch_calls: list[str] = []
+
+    class StubCatalog:
+        def get_asset(self, symbol: str):
+            return assets.get(symbol)
+
+        def get_scan_universe(self, asset_class=None):
+            return []
+
+    class StubMarketData:
+        def batch_snapshot(self, symbols: list[str], asset_class: AssetClass):
+            batch_calls.append((tuple(symbols), asset_class))
+            return {
+                symbol: {
+                    "normalized": NormalizedMarketSnapshot(
+                        symbol=symbol,
+                        asset_class=AssetClass.EQUITY,
+                        last_trade_price=100.0,
+                        evaluation_price=100.0,
+                        quote_available=False,
+                        quote_stale=False,
+                        price_source_used="last_trade",
+                        session_state="regular",
+                        source="stub_batch",
+                    ).to_dict()
+                }
+                for symbol in symbols
+            }
+
+        def get_normalized_snapshot(self, symbol: str, asset_class: AssetClass):
+            normalized_calls.append(symbol)
+            return NormalizedMarketSnapshot(
+                symbol=symbol,
+                asset_class=asset_class,
+                last_trade_price=100.0,
+                evaluation_price=100.0,
+                quote_available=False,
+                quote_stale=False,
+                price_source_used="last_trade",
+                session_state="regular",
+                source="stub_single",
+            )
+
+        def fetch_bars(self, symbol: str, timeframe: str | None = None, limit: int = 50, asset_class=None):
+            fetch_calls.append(symbol)
+            closes = [95.0, 96.0, 97.0, 98.0, 99.0, 100.0]
+            return pd.DataFrame(
+                {
+                    "Open": closes,
+                    "High": [value + 1 for value in closes],
+                    "Low": [value - 1 for value in closes],
+                    "Close": closes,
+                    "Volume": [1000, 1100, 1200, 1300, 1400, 1500],
+                }
+            )
+
+    scanner = ScannerService(asset_catalog=StubCatalog(), market_data_service=StubMarketData(), settings=settings)
+    result = scanner.scan(symbols=["AAA", "BBB"], limit=5)
+
+    assert result.scanned_count == 2
+    assert batch_calls == [(("AAA", "BBB"), AssetClass.EQUITY)]
+    assert normalized_calls == []
+    assert fetch_calls.count("AAA") == 1
+    assert fetch_calls.count("BBB") == 1
+    assert result.symbol_snapshots["AAA"]["source"] == "stub_batch"

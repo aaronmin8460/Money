@@ -179,24 +179,22 @@ class ScannerService:
 
         if explicit_symbols:
             ordered_symbols = list(dict.fromkeys(explicit_symbols + required_symbols))
-            prepared_assets: list[PreparedScanAsset] = []
-            errors: list[dict[str, str]] = []
             timeframes: dict[str, dict[str, Any]] = {}
             inclusion_by_symbol: dict[str, list[str]] = {}
+            asset_inputs: list[tuple[AssetMetadata, list[str]]] = []
             for symbol in ordered_symbols:
                 base_reasons = []
                 if symbol in explicit_symbols:
                     base_reasons.append("explicit_symbol_request")
                 base_reasons.extend(reason_map.get(symbol, []))
-                prepared_asset, error = self._prepare_asset_for_scan(
-                    self._resolve_asset(symbol, resolved_asset_class),
-                    inclusion_reasons=self._dedupe_reasons(base_reasons),
+                asset_inputs.append(
+                    (
+                        self._resolve_asset(symbol, resolved_asset_class),
+                        self._dedupe_reasons(base_reasons),
+                    )
                 )
-                if error is not None:
-                    errors.append(error)
-                    continue
-                assert prepared_asset is not None
-                prepared_assets.append(prepared_asset)
+            prepared_assets, errors = self._prepare_assets_for_scan(asset_inputs)
+            for prepared_asset in prepared_assets:
                 inclusion_by_symbol[prepared_asset.asset.symbol] = list(prepared_asset.inclusion_reasons)
                 timeframes[prepared_asset.asset.asset_class.value] = self._timeframe_details(prepared_asset.asset.asset_class)
             return ScanSelectionPlan(
@@ -238,7 +236,7 @@ class ScannerService:
                 [],
             ).append("configured_include")
 
-        if self.settings.scan_universe_mode.lower() == "major":
+        if self.settings.scan_universe_mode.lower() == "major" and not self.settings.scan_symbol_allowlist:
             for symbol in self.settings.major_equity_symbols + self.settings.major_crypto_symbols:
                 major_asset = self._resolve_asset(symbol, resolved_asset_class)
                 if not self._matches_asset_class_filter(major_asset, resolved_asset_class):
@@ -267,32 +265,21 @@ class ScannerService:
             }
             timeframes_by_asset_class[current_asset_class.value] = self._timeframe_details(current_asset_class)
 
-            prepared_forced_assets: list[PreparedScanAsset] = []
-            for symbol, reasons in class_forced_symbols.items():
-                prepared_asset, error = self._prepare_asset_for_scan(
-                    self._resolve_asset(symbol, current_asset_class),
-                    inclusion_reasons=reasons,
-                )
-                if error is not None:
-                    errors.append(error)
-                    continue
-                assert prepared_asset is not None
-                prepared_forced_assets.append(prepared_asset)
+            forced_inputs = [
+                (self._resolve_asset(symbol, current_asset_class), reasons)
+                for symbol, reasons in class_forced_symbols.items()
+            ]
+            prepared_forced_assets, forced_errors = self._prepare_assets_for_scan(forced_inputs)
+            errors.extend(forced_errors)
 
-            forced_symbol_set = {item.asset.symbol for item in prepared_forced_assets}
-            scored_broader_assets: list[PreparedScanAsset] = []
+            forced_symbol_set = set(class_forced_symbols.keys()).union({item.asset.symbol for item in prepared_forced_assets})
+            broader_inputs: list[tuple[AssetMetadata, list[str]]] = []
             for asset_candidate in class_universe:
                 if asset_candidate.symbol in forced_symbol_set:
                     continue
-                prepared_asset, error = self._prepare_asset_for_scan(
-                    asset_candidate,
-                    inclusion_reasons=["ranked_universe_candidate"],
-                )
-                if error is not None:
-                    errors.append(error)
-                    continue
-                assert prepared_asset is not None
-                scored_broader_assets.append(prepared_asset)
+                broader_inputs.append((asset_candidate, ["ranked_universe_candidate"]))
+            scored_broader_assets, broader_errors = self._prepare_assets_for_scan(broader_inputs)
+            errors.extend(broader_errors)
 
             scored_broader_assets.sort(
                 key=lambda item: (item.prefilter_score, item.asset.symbol),
@@ -552,21 +539,129 @@ class ScannerService:
             resolved_asset_class = infer_asset_class(symbol)
         return canonicalize_symbol(symbol, resolved_asset_class)
 
+    def _prepare_assets_for_scan(
+        self,
+        asset_inputs: list[tuple[AssetMetadata, list[str]]],
+    ) -> tuple[list[PreparedScanAsset], list[dict[str, str]]]:
+        if not asset_inputs:
+            return [], []
+
+        snapshots: dict[str, NormalizedMarketSnapshot] = {}
+        grouped: dict[AssetClass, list[AssetMetadata]] = {}
+        for asset, _reasons in asset_inputs:
+            grouped.setdefault(asset.asset_class, []).append(asset)
+
+        for asset_class, assets in grouped.items():
+            snapshots.update(self._batch_snapshots_for_scan(assets, asset_class))
+
+        bars_cache: dict[tuple[str, str, str, int], pd.DataFrame] = {}
+        prepared_assets: list[PreparedScanAsset] = []
+        errors: list[dict[str, str]] = []
+        for asset, reasons in asset_inputs:
+            prepared_asset, error = self._prepare_asset_for_scan(
+                asset,
+                inclusion_reasons=reasons,
+                prepared_snapshot=snapshots.get(asset.symbol),
+                bars_cache=bars_cache,
+            )
+            if error is not None:
+                errors.append(error)
+                continue
+            assert prepared_asset is not None
+            prepared_assets.append(prepared_asset)
+        return prepared_assets, errors
+
+    def _batch_snapshots_for_scan(
+        self,
+        assets: list[AssetMetadata],
+        asset_class: AssetClass,
+    ) -> dict[str, NormalizedMarketSnapshot]:
+        if not assets:
+            return {}
+        batch_snapshot = getattr(self.market_data_service, "batch_snapshot", None)
+        if not callable(batch_snapshot):
+            return {}
+        symbols = [asset.symbol for asset in assets]
+        try:
+            payloads = batch_snapshot(symbols, asset_class)
+        except Exception as exc:
+            logger.warning(
+                "Scanner batch snapshot failed",
+                extra={"asset_class": asset_class.value, "symbol_count": len(symbols), "error": str(exc)},
+            )
+            return {}
+
+        snapshots: dict[str, NormalizedMarketSnapshot] = {}
+        for symbol, payload in (payloads or {}).items():
+            canonical_symbol = canonicalize_symbol(symbol, asset_class)
+            normalized = self._normalized_snapshot_from_batch_payload(canonical_symbol, asset_class, payload)
+            if normalized is not None:
+                snapshots[canonical_symbol] = normalized
+        return snapshots
+
+    def _normalized_snapshot_from_batch_payload(
+        self,
+        symbol: str,
+        asset_class: AssetClass,
+        payload: Any,
+    ) -> NormalizedMarketSnapshot | None:
+        if isinstance(payload, NormalizedMarketSnapshot):
+            return payload
+        if not isinstance(payload, dict):
+            return None
+        normalized_payload = payload.get("normalized") or payload.get("normalized_snapshot")
+        if isinstance(normalized_payload, NormalizedMarketSnapshot):
+            return normalized_payload
+        if isinstance(normalized_payload, dict):
+            return NormalizedMarketSnapshot.from_dict(normalized_payload)
+        if "evaluation_price" in payload or "last_trade_price" in payload:
+            candidate = dict(payload)
+            candidate.setdefault("symbol", symbol)
+            candidate.setdefault("asset_class", asset_class.value)
+            return NormalizedMarketSnapshot.from_dict(candidate)
+        return None
+
     def _prepare_asset_for_scan(
         self,
         asset: AssetMetadata,
         *,
         inclusion_reasons: list[str] | None = None,
+        prepared_snapshot: NormalizedMarketSnapshot | None = None,
+        bars_cache: dict[tuple[str, str, str, int], pd.DataFrame] | None = None,
     ) -> tuple[PreparedScanAsset | None, dict[str, str] | None]:
         try:
-            snapshot = self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
-            bars = self.market_data_service.fetch_bars(
-                asset.symbol,
-                asset_class=asset.asset_class,
-                timeframe=self.settings.scanner_timeframe_for_asset_class(asset.asset_class),
-                limit=max(30, self.settings.lookback_bars_for_asset_class(asset.asset_class)),
-            )
+            snapshot = prepared_snapshot or self.market_data_service.get_normalized_snapshot(asset.symbol, asset.asset_class)
+            timeframe = self.settings.scanner_timeframe_for_asset_class(asset.asset_class)
+            limit = max(30, self.settings.lookback_bars_for_asset_class(asset.asset_class))
+            cache_key = (asset.symbol, asset.asset_class.value, timeframe, limit)
+            bars = bars_cache.get(cache_key) if bars_cache is not None else None
+            if bars is None:
+                bars = self.market_data_service.fetch_bars(
+                    asset.symbol,
+                    asset_class=asset.asset_class,
+                    timeframe=timeframe,
+                    limit=limit,
+                )
+                if bars_cache is not None:
+                    bars_cache[cache_key] = bars
             prefilter_metrics = self._compute_prefilter_metrics(asset, bars, snapshot)
+            prefilter_metrics["provider_data_quality"] = {
+                "source": snapshot.source,
+                "quote_available": snapshot.quote_available,
+                "quote_stale": snapshot.quote_stale,
+                "fallback_pricing_used": snapshot.fallback_pricing_used,
+                "price_source_used": snapshot.price_source_used,
+                "missing_fields": [
+                    field
+                    for field, missing in {
+                        "bid_price": snapshot.bid_price is None,
+                        "ask_price": snapshot.ask_price is None,
+                        "spread_pct": snapshot.spread_pct is None,
+                        "source_timestamp": snapshot.source_timestamp is None,
+                    }.items()
+                    if missing
+                ],
+            }
             prefilter_score = self._prefilter_score(prefilter_metrics)
             return (
                 PreparedScanAsset(

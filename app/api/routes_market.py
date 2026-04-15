@@ -44,3 +44,14 @@ def market_snapshot(request: Request, response: Response, symbol: str, asset_cla
 @rate_limit_market()
 def market_session(request: Request, response: Response, asset_class: str) -> dict[str, object]:
     return get_runtime().market_data_service.get_session_status(asset_class).to_dict()
+
+
+@router.get("/options/chain")
+@rate_limit_market()
+def market_option_chain(
+    request: Request,
+    response: Response,
+    symbol: str,
+    expiration: str | None = None,
+) -> dict[str, object]:
+    return get_runtime().market_data_service.get_option_chain(symbol, expiration)

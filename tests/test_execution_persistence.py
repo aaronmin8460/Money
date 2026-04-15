@@ -5,6 +5,7 @@ import json
 import pytest
 
 from app.config.settings import Settings
+from app.db.init_db import init_db
 from app.db.models import FillRecord, NormalizedSignalRecord
 from app.db.session import SessionLocal
 from app.domain.models import AssetClass
@@ -38,6 +39,7 @@ def test_execution_persists_signal_and_fill_records(tmp_path) -> None:
         settings=settings,
     )
 
+    init_db()
     with SessionLocal() as session:
         session.query(NormalizedSignalRecord).filter(NormalizedSignalRecord.symbol == "TSTX").delete()
         session.query(FillRecord).filter(FillRecord.symbol == "TSTX").delete()
@@ -626,6 +628,7 @@ def test_persisted_order_metadata_includes_order_intent_and_exit_stage(tmp_path)
         settings=settings,
     )
 
+    init_db()
     with SessionLocal() as session:
         session.query(FillRecord).filter(FillRecord.symbol == "AAPL").delete()
         session.query(NormalizedSignalRecord).filter(NormalizedSignalRecord.symbol == "AAPL").delete()

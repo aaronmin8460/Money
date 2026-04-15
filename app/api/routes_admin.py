@@ -212,6 +212,11 @@ def diagnostics_data_feed(request: Request, response: Response, symbol: str | No
     return {
         "symbol": resolved_symbol,
         "asset_class": resolved_asset_class,
+        "provider_health": (
+            runtime.market_data_service.diagnostics()
+            if hasattr(runtime.market_data_service, "diagnostics")
+            else {"provider": type(runtime.market_data_service).__name__}
+        ),
         "quote": runtime.market_data_service.get_latest_quote(resolved_symbol, resolved_asset_class).to_dict(),
         "trade": runtime.market_data_service.get_latest_trade(resolved_symbol, resolved_asset_class).to_dict(),
         "session": runtime.market_data_service.get_session_status(resolved_asset_class).to_dict(),
@@ -292,6 +297,11 @@ def diagnostics_auto(request: Request, response: Response) -> dict[str, Any]:
         "running": status["running"],
         "broker_mode": runtime.settings.broker_mode,
         "broker_backend": runtime.settings.broker_backend,
+        "market_data": (
+            runtime.market_data_service.diagnostics()
+            if hasattr(runtime.market_data_service, "diagnostics")
+            else {"provider": type(runtime.market_data_service).__name__}
+        ),
         "active_strategy": runtime.settings.active_strategy,
         "primary_runtime_strategy": status["primary_runtime_strategy"],
         "primary_runtime_asset_class": status["primary_runtime_asset_class"],

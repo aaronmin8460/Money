@@ -11,7 +11,7 @@ from app.portfolio.portfolio import Portfolio
 from app.risk.risk_manager import RiskManager
 from app.services.asset_catalog import AssetCatalogService
 from app.services.broker import BrokerInterface, create_broker
-from app.services.market_data import AlpacaMarketDataService, CSVMarketDataService, MarketDataService
+from app.services.market_data import MarketDataService, create_market_data_service
 from app.services.market_overview import MarketOverviewService
 from app.services.runtime_safety import RuntimeSafetyManager
 from app.services.scanner import ScannerService
@@ -96,13 +96,8 @@ _runtime_lock = threading.Lock()
 
 
 def _compose_runtime(settings: Settings) -> RuntimeContainer:
-    market_data_service: MarketDataService
-    if settings.is_alpaca_mode:
-        market_data_service = AlpacaMarketDataService(settings)
-        broker = create_broker(settings)
-    else:
-        market_data_service = CSVMarketDataService()
-        broker = create_broker(settings, market_data_service=market_data_service)
+    market_data_service: MarketDataService = create_market_data_service(settings)
+    broker = create_broker(settings, market_data_service=market_data_service)
 
     portfolio = Portfolio()
     risk_manager = RiskManager(portfolio, settings=settings, broker=broker)
@@ -162,6 +157,11 @@ def _build_runtime(settings: Settings) -> RuntimeContainer:
             "auto_trader_lock_path": settings.auto_trader_lock_path,
             "enabled_news_sources": settings.enabled_news_sources,
             "rate_limit_enabled": settings.rate_limit_enabled,
+            "market_data": (
+                runtime.market_data_service.diagnostics()
+                if hasattr(runtime.market_data_service, "diagnostics")
+                else {"provider": type(runtime.market_data_service).__name__}
+            ),
         },
     )
     return runtime

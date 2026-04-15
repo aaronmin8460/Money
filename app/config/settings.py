@@ -20,31 +20,37 @@ DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
     AssetClass.EQUITY.value: "15Min",
     AssetClass.ETF.value: "15Min",
     AssetClass.CRYPTO.value: "15Min",
+    AssetClass.OPTION.value: "1D",
 }
 DEFAULT_REGIME_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
     AssetClass.EQUITY.value: "1D",
     AssetClass.ETF.value: "1D",
     AssetClass.CRYPTO.value: "4H",
+    AssetClass.OPTION.value: "1D",
 }
 DEFAULT_SCANNER_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
     AssetClass.EQUITY.value: "15Min",
     AssetClass.ETF.value: "15Min",
     AssetClass.CRYPTO.value: "15Min",
+    AssetClass.OPTION.value: "1D",
 }
 DEFAULT_LOOKBACK_BARS_BY_ASSET_CLASS: dict[str, int] = {
-    AssetClass.EQUITY.value: 120,
-    AssetClass.ETF.value: 120,
-    AssetClass.CRYPTO.value: 160,
+    AssetClass.EQUITY.value: 90,
+    AssetClass.ETF.value: 90,
+    AssetClass.CRYPTO.value: 120,
+    AssetClass.OPTION.value: 60,
 }
 DEFAULT_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS: dict[str, int] = {
-    AssetClass.EQUITY.value: 50,
-    AssetClass.ETF.value: 50,
-    AssetClass.CRYPTO.value: 50,
+    AssetClass.EQUITY.value: 25,
+    AssetClass.ETF.value: 20,
+    AssetClass.CRYPTO.value: 20,
+    AssetClass.OPTION.value: 10,
 }
 DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS: dict[str, int] = {
-    AssetClass.EQUITY.value: 15,
-    AssetClass.ETF.value: 15,
-    AssetClass.CRYPTO.value: 15,
+    AssetClass.EQUITY.value: 10,
+    AssetClass.ETF.value: 8,
+    AssetClass.CRYPTO.value: 8,
+    AssetClass.OPTION.value: 5,
 }
 
 
@@ -268,6 +274,27 @@ class Settings(BaseSettings):
         env="FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS",
     )
     alpaca_data_base_url: AnyHttpUrl = Field("https://data.alpaca.markets", env="ALPACA_DATA_BASE_URL")
+    market_data_provider_default: str = Field("composite", env="MARKET_DATA_PROVIDER_DEFAULT")
+    equity_data_provider: str = Field("yfinance", env="EQUITY_DATA_PROVIDER")
+    etf_data_provider: str = Field("yfinance", env="ETF_DATA_PROVIDER")
+    crypto_data_provider: str = Field("coingecko", env="CRYPTO_DATA_PROVIDER")
+    option_data_provider: str = Field("yfinance", env="OPTION_DATA_PROVIDER")
+    market_data_fallback_providers: list[str] = Field(default_factory=lambda: ["alpaca"], env="MARKET_DATA_FALLBACK_PROVIDERS")
+    provider_rate_limits_per_minute: dict[str, int] = Field(
+        default_factory=lambda: {"alpaca": 120, "yfinance": 30, "coingecko": 25, "tradier": 60},
+        env="PROVIDER_RATE_LIMITS_PER_MINUTE",
+    )
+    snapshot_cache_ttl_seconds: float = Field(5.0, env="SNAPSHOT_CACHE_TTL_SECONDS")
+    intraday_bars_cache_ttl_seconds: float = Field(30.0, env="INTRADAY_BARS_CACHE_TTL_SECONDS")
+    daily_bars_cache_ttl_seconds: float = Field(300.0, env="DAILY_BARS_CACHE_TTL_SECONDS")
+    option_chain_cache_ttl_seconds: float = Field(60.0, env="OPTION_CHAIN_CACHE_TTL_SECONDS")
+    market_data_max_retries: int = Field(2, env="MARKET_DATA_MAX_RETRIES")
+    market_data_backoff_base_seconds: float = Field(1.0, env="MARKET_DATA_BACKOFF_BASE_SECONDS")
+    market_data_backoff_max_seconds: float = Field(30.0, env="MARKET_DATA_BACKOFF_MAX_SECONDS")
+    coingecko_base_url: AnyHttpUrl = Field("https://api.coingecko.com", env="COINGECKO_BASE_URL")
+    coingecko_api_key: str | None = Field(None, env="COINGECKO_API_KEY")
+    tradier_api_token: str | None = Field(None, env="TRADIER_API_TOKEN")
+    tradier_base_url: AnyHttpUrl = Field("https://api.tradier.com", env="TRADIER_BASE_URL")
     max_position_notional: float = Field(10000.0, env="MAX_POSITION_NOTIONAL")
     position_notional_buffer_pct: float = Field(0.995, env="POSITION_NOTIONAL_BUFFER_PCT")
     max_symbol_allocation_pct: float = Field(0.10, env="MAX_SYMBOL_ALLOCATION_PCT")
@@ -370,7 +397,7 @@ class Settings(BaseSettings):
     max_consecutive_losing_exits: int = Field(3, env="MAX_CONSECUTIVE_LOSING_EXITS")
     halt_on_reconcile_mismatch: bool = Field(True, env="HALT_ON_RECONCILE_MISMATCH")
     halt_on_startup_sync_failure: bool = Field(True, env="HALT_ON_STARTUP_SYNC_FAILURE")
-    scan_universe_mode: str = Field("full", env="SCAN_UNIVERSE_MODE")
+    scan_universe_mode: str = Field("major", env="SCAN_UNIVERSE_MODE")
     major_equity_symbols: list[str] = Field(
         default_factory=lambda: ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "SPY", "QQQ", "IWM"],
         env="MAJOR_EQUITY_SYMBOLS",
@@ -712,7 +739,15 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("alpaca_api_key", "alpaca_secret_key", "api_admin_token", "openai_api_key", mode="before")
+    @field_validator(
+        "alpaca_api_key",
+        "alpaca_secret_key",
+        "api_admin_token",
+        "openai_api_key",
+        "coingecko_api_key",
+        "tradier_api_token",
+        mode="before",
+    )
     def parse_optional_secret_value(cls, value: str | None) -> str | None:
         if isinstance(value, str) and not value.strip():
             return None
@@ -721,6 +756,10 @@ class Settings(BaseSettings):
     @field_validator("excluded_symbols", "included_symbols", mode="before")
     def parse_symbol_lists(cls, value: str | list[str], info: ValidationInfo) -> list[str]:
         return _parse_json_list(value, info.field_name.upper())
+
+    @field_validator("market_data_fallback_providers", mode="before")
+    def parse_market_data_fallback_providers(cls, value: str | list[str]) -> list[str]:
+        return [item.strip().lower() for item in _parse_string_list(value, "MARKET_DATA_FALLBACK_PROVIDERS") if item.strip()]
 
     @field_validator("watchlists", mode="before")
     def parse_watchlists(cls, value: str | dict[str, Any]) -> dict[str, list[str]]:
@@ -745,6 +784,7 @@ class Settings(BaseSettings):
         "dust_position_max_qty_by_asset_class",
         "strategy_switches",
         "active_strategy_by_asset_class",
+        "provider_rate_limits_per_minute",
         "news_source_weights",
         "aggressive_max_positions_per_asset_class",
         "aggressive_scan_interval_seconds_by_asset_class",
@@ -795,6 +835,31 @@ class Settings(BaseSettings):
             for key, value in self.news_source_weights.items()
             if str(key).strip()
         }
+        allowed_market_data_providers = {"composite", "alpaca", "yfinance", "coingecko", "tradier", "csv", "mock"}
+        self.market_data_provider_default = str(self.market_data_provider_default or "composite").strip().lower()
+        if self.market_data_provider_default not in allowed_market_data_providers:
+            raise ValueError(
+                "MARKET_DATA_PROVIDER_DEFAULT must be one of: alpaca, coingecko, composite, csv, mock, tradier, yfinance."
+            )
+        for field_name in ("equity_data_provider", "etf_data_provider", "crypto_data_provider", "option_data_provider"):
+            provider_name = str(getattr(self, field_name) or "").strip().lower()
+            if not provider_name:
+                provider_name = "composite"
+            if provider_name not in allowed_market_data_providers:
+                raise ValueError(f"{field_name.upper()} must be a supported market data provider.")
+            setattr(self, field_name, provider_name)
+        self.market_data_fallback_providers = [
+            provider
+            for provider in dict.fromkeys(str(item).strip().lower() for item in self.market_data_fallback_providers)
+            if provider and provider in allowed_market_data_providers and provider != "composite"
+        ]
+        self.provider_rate_limits_per_minute = {
+            str(key).strip().lower(): max(0, int(value))
+            for key, value in self.provider_rate_limits_per_minute.items()
+            if str(key).strip()
+        }
+        for provider_name, default_limit in {"alpaca": 120, "yfinance": 30, "coingecko": 25, "tradier": 60}.items():
+            self.provider_rate_limits_per_minute.setdefault(provider_name, default_limit)
 
         if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
             raise ValueError("POSITION_NOTIONAL_BUFFER_PCT must be greater than 0 and less than or equal to 1.")
@@ -804,6 +869,20 @@ class Settings(BaseSettings):
             raise ValueError("BROKER_ORDER_STATUS_IGNORE_TERMINAL_OLDER_THAN_MINUTES must be >= 0.")
         if self.quote_stale_after_seconds < 0:
             raise ValueError("QUOTE_STALE_AFTER_SECONDS must be >= 0.")
+        if self.snapshot_cache_ttl_seconds < 0:
+            raise ValueError("SNAPSHOT_CACHE_TTL_SECONDS must be >= 0.")
+        if self.intraday_bars_cache_ttl_seconds < 0:
+            raise ValueError("INTRADAY_BARS_CACHE_TTL_SECONDS must be >= 0.")
+        if self.daily_bars_cache_ttl_seconds < 0:
+            raise ValueError("DAILY_BARS_CACHE_TTL_SECONDS must be >= 0.")
+        if self.option_chain_cache_ttl_seconds < 0:
+            raise ValueError("OPTION_CHAIN_CACHE_TTL_SECONDS must be >= 0.")
+        if self.market_data_max_retries < 0:
+            raise ValueError("MARKET_DATA_MAX_RETRIES must be >= 0.")
+        if self.market_data_backoff_base_seconds < 0:
+            raise ValueError("MARKET_DATA_BACKOFF_BASE_SECONDS must be >= 0.")
+        if self.market_data_backoff_max_seconds < 0:
+            raise ValueError("MARKET_DATA_BACKOFF_MAX_SECONDS must be >= 0.")
         if self.entry_tranches <= 0:
             raise ValueError("ENTRY_TRANCHES must be greater than 0.")
         if len(self.entry_tranche_weights) != self.entry_tranches:

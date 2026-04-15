@@ -57,9 +57,13 @@ def test_asset_class_timeframe_defaults_are_available() -> None:
     assert settings.regime_timeframe_for_asset_class(AssetClass.EQUITY) == "1D"
     assert settings.regime_timeframe_for_asset_class(AssetClass.CRYPTO) == "4H"
     assert settings.scanner_timeframe_for_asset_class(AssetClass.ETF) == "15Min"
-    assert settings.lookback_bars_for_asset_class(AssetClass.CRYPTO) == 160
-    assert settings.universe_prefilter_limit_for_asset_class(AssetClass.EQUITY) == 50
-    assert settings.final_evaluation_limit_for_asset_class(AssetClass.EQUITY) == 15
+    assert settings.lookback_bars_for_asset_class(AssetClass.CRYPTO) == 120
+    assert settings.universe_prefilter_limit_for_asset_class(AssetClass.EQUITY) == 25
+    assert settings.final_evaluation_limit_for_asset_class(AssetClass.EQUITY) == 10
+    assert settings.market_data_provider_default == "composite"
+    assert settings.equity_data_provider == "yfinance"
+    assert settings.crypto_data_provider == "coingecko"
+    assert settings.provider_rate_limits_per_minute["yfinance"] == 30
 
 
 def test_active_symbols_uses_default_symbols_by_default() -> None:
@@ -374,5 +378,10 @@ def test_env_example_uses_safe_defaults_and_placeholders() -> None:
     assert env_values["ALPACA_SECRET_KEY"] == ""
     assert env_values["DISCORD_WEBHOOK_URL"] == ""
     assert env_values["API_ADMIN_TOKEN"] == ""
+    assert env_values["MARKET_DATA_PROVIDER_DEFAULT"] == "composite"
+    assert env_values["EQUITY_DATA_PROVIDER"] == "yfinance"
+    assert env_values["ETF_DATA_PROVIDER"] == "yfinance"
+    assert env_values["CRYPTO_DATA_PROVIDER"] == "coingecko"
+    assert env_values["OPTION_DATA_PROVIDER"] == "yfinance"
     assert "1492154001083469857" not in contents
     assert "PK2JJVNJM44OQ7VJGHI5K5K2S5" not in contents

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.config.settings import Settings
+from app.db.init_db import init_db
 from app.db.models import AssetCatalogEntry, AssetCatalogSyncRun
 from app.db.session import SessionLocal
 from app.services.asset_catalog import AssetCatalogService
@@ -23,6 +24,7 @@ def test_asset_catalog_sync_persists_assets(tmp_path) -> None:
     broker = PaperBroker(settings=settings, market_data_service=market_data)
     service = AssetCatalogService(broker=broker, settings=settings)
 
+    init_db()
     with SessionLocal() as session:
         session.query(AssetCatalogEntry).delete()
         session.query(AssetCatalogSyncRun).delete()
