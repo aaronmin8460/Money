@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Response
 
+from app.api.rate_limit import rate_limit_market
 from app.services.runtime import get_runtime
 
 router = APIRouter(prefix="/market", tags=["market"])
 
 
 @router.get("/bars")
+@rate_limit_market()
 def market_bars(
+    request: Request,
+    response: Response,
     symbol: str,
     asset_class: str,
     timeframe: str = "1D",
@@ -19,20 +23,24 @@ def market_bars(
 
 
 @router.get("/quote")
-def market_quote(symbol: str, asset_class: str) -> dict[str, object]:
+@rate_limit_market()
+def market_quote(request: Request, response: Response, symbol: str, asset_class: str) -> dict[str, object]:
     return get_runtime().market_data_service.get_latest_quote(symbol, asset_class).to_dict()
 
 
 @router.get("/trade")
-def market_trade(symbol: str, asset_class: str) -> dict[str, object]:
+@rate_limit_market()
+def market_trade(request: Request, response: Response, symbol: str, asset_class: str) -> dict[str, object]:
     return get_runtime().market_data_service.get_latest_trade(symbol, asset_class).to_dict()
 
 
 @router.get("/snapshot")
-def market_snapshot(symbol: str, asset_class: str) -> dict[str, object]:
+@rate_limit_market()
+def market_snapshot(request: Request, response: Response, symbol: str, asset_class: str) -> dict[str, object]:
     return get_runtime().market_data_service.get_snapshot(symbol, asset_class)
 
 
 @router.get("/session")
-def market_session(asset_class: str) -> dict[str, object]:
+@rate_limit_market()
+def market_session(request: Request, response: Response, asset_class: str) -> dict[str, object]:
     return get_runtime().market_data_service.get_session_status(asset_class).to_dict()

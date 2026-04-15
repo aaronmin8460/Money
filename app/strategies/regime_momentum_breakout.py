@@ -50,7 +50,11 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
         self.regime_symbol = "SPY"
         self.regime_long_sma = 20
         self.regime_short_sma = 10
-        self.profiles: dict[AssetClass, AssetSignalProfile] = default_signal_profiles()
+        self.profiles_by_mode: dict[str, dict[AssetClass, AssetSignalProfile]] = {
+            "conservative": default_signal_profiles("conservative"),
+            "balanced": default_signal_profiles("balanced"),
+            "aggressive": default_signal_profiles("aggressive"),
+        }
 
     def generate_signals(
         self,
@@ -60,7 +64,8 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
     ) -> list[TradeSignal]:
         symbol_df, benchmark_df, regime_df = self._unpack_data(data)
         asset_class = context.asset.asset_class if context else AssetClass.EQUITY
-        profile = self._profile_for(asset_class)
+        profile_name = str((context.metadata if context else {}).get("trading_profile") or "conservative")
+        profile = self._profile_for(asset_class, profile_name)
         if symbol_df.empty or len(symbol_df) < max(profile.sma_long_window, self.regime_long_sma):
             return [self._build_hold_signal(symbol, asset_class, "insufficient_data", "Insufficient data.")]
 
@@ -148,8 +153,10 @@ class RegimeMomentumBreakoutStrategy(BaseStrategy):
         )
         return [signal]
 
-    def _profile_for(self, asset_class: AssetClass) -> AssetSignalProfile:
-        return self.profiles.get(asset_class, self.profiles[AssetClass.EQUITY])
+    def _profile_for(self, asset_class: AssetClass, profile_name: str) -> AssetSignalProfile:
+        normalized = str(profile_name or "conservative").strip().lower()
+        profiles = self.profiles_by_mode.get(normalized, self.profiles_by_mode["conservative"])
+        return profiles.get(asset_class, profiles[AssetClass.EQUITY])
 
     def _unpack_data(self, data: Any) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None]:
         if isinstance(data, dict):

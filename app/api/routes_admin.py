@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.api.admin_auth import require_admin_auth
+from app.api.rate_limit import rate_limit_admin, rate_limit_health
 from app.api.schemas import ResetLocalStateRequest, RuntimeSafetyActionRequest, RuntimeSafetyResumeRequest
 from app.config.settings import get_settings
 from app.db.session import check_database_connection
@@ -24,13 +25,22 @@ logger = get_logger("api.admin")
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
+@rate_limit_health()
+def health(request: Request, response: Response) -> dict[str, Any]:
     settings = get_settings()
-    return {"status": "ok", "mode": settings.broker_mode}
+    return {
+        "status": "ok",
+        "mode": settings.broker_mode,
+        "trading_profile": settings.effective_trading_profile,
+        "enabled_news_sources": settings.enabled_news_sources,
+        "news_llm_status": settings.news_llm_status,
+        "rate_limit_enabled": settings.rate_limit_enabled,
+    }
 
 
 @router.get("/health/ready")
-def health_ready() -> JSONResponse:
+@rate_limit_health()
+def health_ready(request: Request, response: Response) -> JSONResponse:
     try:
         settings = get_settings()
         settings.validate_settings()
@@ -43,25 +53,38 @@ def health_ready() -> JSONResponse:
             extra={"error_type": type(exc).__name__},
         )
         return JSONResponse(status_code=503, content={"status": "not_ready"})
-    return JSONResponse(status_code=200, content={"status": "ok"})
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok",
+            "trading_profile": settings.effective_trading_profile,
+            "enabled_news_sources": settings.enabled_news_sources,
+            "news_llm_status": settings.news_llm_status,
+            "rate_limit_enabled": settings.rate_limit_enabled,
+        },
+    )
 
 
 @protected_router.get("/config")
-def config() -> dict[str, Any]:
+@rate_limit_admin()
+def config(request: Request, response: Response) -> dict[str, Any]:
     settings = get_runtime().settings
     return {
         "app_env": settings.app_env,
         "log_dir": settings.log_dir,
         "broker_mode": settings.broker_mode,
         "broker_backend": settings.broker_backend,
+        "trading_profile": settings.effective_trading_profile,
+        "trading_profile_summary": settings.trading_profile_summary,
         "trading_enabled": settings.trading_enabled,
         "order_submission_mode": settings.order_submission_mode,
         "live_trading_enabled": settings.live_trading_enabled,
-        "short_selling_enabled": settings.short_selling_enabled,
+        "short_selling_enabled": settings.effective_short_selling_enabled,
         "auto_trade_enabled": settings.auto_trade_enabled,
         "active_strategy": settings.active_strategy,
         "primary_runtime_strategy": settings.primary_runtime_strategy,
         "active_strategy_by_asset_class": settings.active_strategy_by_asset_class,
+        "candidate_strategies_by_asset_class": settings.resolved_trading_profile.candidate_strategies_by_asset_class,
         "default_symbols": settings.default_symbols,
         "active_symbols": settings.active_symbols,
         "active_crypto_symbols": settings.active_crypto_symbols,
@@ -71,21 +94,22 @@ def config() -> dict[str, Any]:
         "primary_runtime_asset_class": settings.primary_runtime_asset_class.value,
         "universe_scan_enabled": settings.universe_scan_enabled,
         "universe_refresh_minutes": settings.universe_refresh_minutes,
-        "scan_interval_seconds": settings.scan_interval_seconds,
-        "scan_interval_seconds_by_asset_class": settings.scan_interval_seconds_by_asset_class,
+        "scan_interval_seconds": settings.effective_scan_interval_seconds,
+        "scan_interval_seconds_by_asset_class": settings.resolved_trading_profile.scan_interval_seconds_by_asset_class,
         "max_risk_per_trade": settings.max_risk_per_trade,
+        "effective_risk_per_trade_pct": settings.effective_risk_per_trade_pct,
         "max_total_exposure": settings.max_total_exposure,
-        "max_positions_total": settings.max_positions_total,
-        "max_positions_per_asset_class": settings.max_positions_per_asset_class,
+        "max_positions_total": settings.effective_max_positions_total,
+        "max_positions_per_asset_class": settings.resolved_trading_profile.max_positions_per_asset_class,
         "max_position_notional": settings.max_position_notional,
         "position_notional_buffer_pct": settings.position_notional_buffer_pct,
         "effective_max_position_notional": settings.effective_max_position_notional,
         "entry_tranches": settings.entry_tranches,
         "entry_tranche_weights": settings.entry_tranche_weights,
-        "scale_in_mode": settings.scale_in_mode,
-        "min_bars_between_tranches": settings.min_bars_between_tranches,
-        "minutes_between_tranches": settings.minutes_between_tranches,
-        "add_on_favorable_move_pct": settings.add_on_favorable_move_pct,
+        "scale_in_mode": settings.effective_scale_in_mode,
+        "min_bars_between_tranches": settings.effective_min_bars_between_tranches,
+        "minutes_between_tranches": settings.effective_minutes_between_tranches,
+        "add_on_favorable_move_pct": settings.effective_add_on_favorable_move_pct,
         "allow_average_down": settings.allow_average_down,
         "max_notional_per_position": settings.max_notional_per_position,
         "max_notional_per_asset_class": settings.max_notional_per_asset_class,
@@ -96,7 +120,7 @@ def config() -> dict[str, Any]:
         "min_avg_volume": settings.min_avg_volume,
         "max_spread_pct": settings.max_spread_pct,
         "quote_stale_after_seconds": settings.quote_stale_after_seconds,
-        "allow_extended_hours": settings.allow_extended_hours,
+        "allow_extended_hours": settings.effective_allow_extended_hours,
         "watchlists": settings.watchlists,
         "excluded_symbols": settings.excluded_symbols,
         "included_symbols": settings.included_symbols,
@@ -110,7 +134,7 @@ def config() -> dict[str, Any]:
         "halt_on_startup_sync_failure": settings.halt_on_startup_sync_failure,
         "ml_enabled": settings.ml_enabled,
         "ml_model_type": settings.ml_model_type,
-        "ml_min_score_threshold": settings.ml_min_score_threshold,
+        "ml_min_score_threshold": settings.effective_ml_min_score_threshold,
         "ml_min_train_rows": settings.ml_min_train_rows,
         "ml_retrain_enabled": settings.ml_retrain_enabled,
         "ml_promotion_min_auc": settings.ml_promotion_min_auc,
@@ -125,15 +149,38 @@ def config() -> dict[str, Any]:
         "news_llm_enabled": settings.news_llm_enabled,
         "news_llm_available": settings.news_llm_available,
         "news_llm_status": settings.news_llm_status,
+        "enabled_news_sources": settings.enabled_news_sources,
+        "news_source_ids": settings.news_source_ids,
+        "benzinga_rss_enabled": settings.benzinga_rss_enabled,
+        "benzinga_rss_urls": settings.benzinga_rss_urls,
+        "sec_rss_enabled": settings.sec_rss_enabled,
+        "sec_rss_urls": settings.sec_rss_urls,
+        "sec_user_agent": settings.sec_user_agent,
+        "news_fetch_timeout_seconds": settings.news_fetch_timeout_seconds,
+        "news_fetch_retry_count": settings.news_fetch_retry_count,
+        "news_fetch_backoff_seconds": settings.news_fetch_backoff_seconds,
+        "news_dedupe_window_minutes": settings.news_dedupe_window_minutes,
+        "news_source_weights": settings.news_source_weights,
+        "news_enable_source_diversity_features": settings.news_enable_source_diversity_features,
         "openai_model": settings.openai_model,
         "news_max_headlines_per_ticker": settings.news_max_headlines_per_ticker,
         "news_lookback_hours": settings.news_lookback_hours,
+        "rate_limit_enabled": settings.rate_limit_enabled,
+        "rate_limit_default": settings.rate_limit_default,
+        "rate_limit_storage_uri": settings.rate_limit_storage_uri,
+        "rate_limit_headers_enabled": settings.rate_limit_headers_enabled,
+        "rate_limit_scanner": settings.rate_limit_scanner,
+        "rate_limit_admin": settings.rate_limit_admin,
+        "rate_limit_market": settings.rate_limit_market,
+        "rate_limit_signals": settings.rate_limit_signals,
+        "rate_limit_health_exempt": settings.rate_limit_health_exempt,
         "auto_trader_lock_path": settings.auto_trader_lock_path,
     }
 
 
 @protected_router.get("/diagnostics/universe")
-def diagnostics_universe() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_universe(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     assets = runtime.asset_catalog.get_scan_universe()
     return {
@@ -146,7 +193,8 @@ def diagnostics_universe() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/data-feed")
-def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = None) -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_data_feed(request: Request, response: Response, symbol: str | None = None, asset_class: str | None = None) -> dict[str, Any]:
     runtime = get_runtime()
     resolved_symbol = symbol.strip().upper() if symbol else None
     if not resolved_symbol:
@@ -175,7 +223,8 @@ def diagnostics_data_feed(symbol: str | None = None, asset_class: str | None = N
 
 
 @protected_router.get("/diagnostics/strategies")
-def diagnostics_strategies() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_strategies(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     registry = runtime.strategy_registry
     strategies = []
@@ -192,13 +241,25 @@ def diagnostics_strategies() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/strategy")
-def diagnostics_strategy() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_strategy(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     strategy_name = runtime.settings.primary_runtime_strategy
     strategy = runtime.strategy_registry.get(strategy_name)
     trader_status = runtime.get_auto_trader().get_status()
+    available_strategies = []
+    for candidate in runtime.strategy_registry.list_available():
+        available_strategies.append(
+            {
+                "name": candidate.name,
+                "supported_asset_classes": sorted(item.value for item in candidate.supported_asset_classes),
+                "signal_only": candidate.signal_only,
+                "active": candidate.name == runtime.settings.active_strategy,
+            }
+        )
     return {
         "active_strategy": runtime.settings.active_strategy,
+        "trading_profile": runtime.settings.effective_trading_profile,
         "primary_runtime_strategy": strategy_name,
         "primary_runtime_asset_class": runtime.settings.primary_runtime_asset_class.value,
         "broker_mode": runtime.settings.broker_mode,
@@ -209,12 +270,14 @@ def diagnostics_strategy() -> dict[str, Any]:
         "symbol_evaluations": trader_status["last_symbol_evaluations"],
         "latest_scanned_symbols": trader_status["last_scanned_symbols"],
         "strategy_routing": trader_status["strategy_routing"],
-        "available_strategies": diagnostics_strategies()["strategies"],
+        "candidate_strategy_routing": trader_status["candidate_strategy_routing"],
+        "available_strategies": available_strategies,
     }
 
 
 @protected_router.get("/diagnostics/auto")
-def diagnostics_auto() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_auto(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker(source="diagnostics_auto")
     trader = runtime.get_auto_trader()
@@ -223,6 +286,8 @@ def diagnostics_auto() -> dict[str, Any]:
     return {
         "trading_enabled": runtime.settings.trading_enabled,
         "auto_trade_enabled": runtime.settings.auto_trade_enabled,
+        "trading_profile": runtime.settings.effective_trading_profile,
+        "trading_profile_summary": runtime.settings.trading_profile_summary,
         "enabled": status["enabled"],
         "running": status["running"],
         "broker_mode": runtime.settings.broker_mode,
@@ -236,8 +301,8 @@ def diagnostics_auto() -> dict[str, Any]:
         "crypto_only_mode": status["crypto_only_mode"],
         "market_open": status["market_open"],
         "market_session_state": status["market_session_state"],
-        "allow_extended_hours": runtime.settings.allow_extended_hours,
-        "scan_interval_seconds": runtime.settings.scan_interval_seconds,
+        "allow_extended_hours": runtime.settings.effective_allow_extended_hours,
+        "scan_interval_seconds": runtime.settings.effective_scan_interval_seconds,
         "scan_summary_notifications_enabled": status["scan_summary_notifications_enabled"],
         "last_cycle_id": status["last_cycle_id"],
         "last_run_time": status["last_run_time"],
@@ -282,10 +347,12 @@ def diagnostics_auto() -> dict[str, Any]:
         "ml_model_type": status["ml_model_type"],
         "ml_min_score_threshold": status["ml_min_score_threshold"],
         "news_features_enabled": status["news_features_enabled"],
+        "enabled_news_sources": status["enabled_news_sources"],
         "auto_trader_lock_path": status["auto_trader_lock_path"],
         "process_lock_acquired": status["process_lock_acquired"],
         "process_lock_metadata": status["process_lock_metadata"],
         "cycle_in_progress": status["cycle_in_progress"],
+        "rate_limit_enabled": runtime.settings.rate_limit_enabled,
         "runtime_safety": status["runtime_safety"],
         "runtime_halted": status["runtime_halted"],
         "new_entries_allowed": status["new_entries_allowed"],
@@ -294,7 +361,8 @@ def diagnostics_auto() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/runtime-safety")
-def diagnostics_runtime_safety() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_runtime_safety(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     trader = runtime.get_auto_trader()
     status = trader.get_status()
@@ -311,7 +379,8 @@ def diagnostics_runtime_safety() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/reconciliation")
-def diagnostics_reconciliation(refresh: bool = True) -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_reconciliation(request: Request, response: Response, refresh: bool = True) -> dict[str, Any]:
     runtime = get_runtime()
     if refresh:
         runtime.sync_with_broker(source="diagnostics_reconciliation")
@@ -323,14 +392,16 @@ def diagnostics_reconciliation(refresh: bool = True) -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/risk")
-def diagnostics_risk(limit: int = 10) -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_risk(request: Request, response: Response, limit: int = 10) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker(source="diagnostics_risk")
     return runtime.risk_manager.get_diagnostics(limit=limit)
 
 
 @protected_router.get("/diagnostics/portfolio")
-def diagnostics_portfolio() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_portfolio(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker(source="diagnostics_portfolio")
     broker_positions = []
@@ -368,7 +439,8 @@ def diagnostics_portfolio() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/tranches")
-def diagnostics_tranches() -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_tranches(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     return {
         "active_strategy": runtime.settings.active_strategy,
@@ -377,17 +449,21 @@ def diagnostics_tranches() -> dict[str, Any]:
 
 
 @protected_router.get("/diagnostics/rejections/latest")
-def diagnostics_rejections_latest(limit: int = 10) -> dict[str, Any]:
+@rate_limit_admin()
+def diagnostics_rejections_latest(request: Request, response: Response, limit: int = 10) -> dict[str, Any]:
     runtime = get_runtime()
     return runtime.risk_manager.get_rejection_snapshot(limit=limit)
 
 
 @protected_router.post("/admin/reset-local-state")
+@rate_limit_admin()
 def admin_reset_local_state(
-    request: ResetLocalStateRequest | None = Body(default=None),
+    request: Request,
+    response: Response,
+    payload: ResetLocalStateRequest | None = Body(default=None),
 ) -> dict[str, Any]:
     runtime = get_runtime()
-    payload = request or ResetLocalStateRequest()
+    payload = payload or ResetLocalStateRequest()
     try:
         return reset_local_state(
             LocalStateResetOptions(
@@ -403,20 +479,26 @@ def admin_reset_local_state(
 
 
 @protected_router.post("/admin/runtime-safety/halt")
+@rate_limit_admin()
 def admin_runtime_safety_halt(
-    request: RuntimeSafetyActionRequest | None = Body(default=None),
+    request: Request,
+    response: Response,
+    payload: RuntimeSafetyActionRequest | None = Body(default=None),
 ) -> dict[str, Any]:
     runtime = get_runtime()
-    payload = request or RuntimeSafetyActionRequest()
+    payload = payload or RuntimeSafetyActionRequest()
     return runtime.runtime_safety.manual_halt(operator_note=payload.note)
 
 
 @protected_router.post("/admin/runtime-safety/resume")
+@rate_limit_admin()
 def admin_runtime_safety_resume(
-    request: RuntimeSafetyResumeRequest | None = Body(default=None),
+    request: Request,
+    response: Response,
+    payload: RuntimeSafetyResumeRequest | None = Body(default=None),
 ) -> dict[str, Any]:
     runtime = get_runtime()
-    payload = request or RuntimeSafetyResumeRequest()
+    payload = payload or RuntimeSafetyResumeRequest()
     return runtime.runtime_safety.resume(
         operator_note=payload.note,
         reset_consecutive_losing_exits=payload.reset_consecutive_losing_exits,
@@ -424,7 +506,8 @@ def admin_runtime_safety_resume(
 
 
 @protected_router.post("/admin/notifications/test")
-def admin_notifications_test() -> dict[str, Any]:
+@rate_limit_admin()
+def admin_notifications_test(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     settings = runtime.settings
     if settings.app_env.lower() != "development":

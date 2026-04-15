@@ -32,7 +32,10 @@ class AssetSignalProfile:
     min_atr_pct: float
     max_atr_pct: float
     max_breakout_distance_atr: float
+    immediate_breakout_distance_atr: float
     retest_tolerance_pct: float
+    allow_reclaim_entry: bool
+    reclaim_tolerance_pct: float
     stop_atr_multiple: float
     target_atr_multiple: float
     compression_threshold: float
@@ -101,8 +104,9 @@ class SignalQualityScore:
     risk_component: float
 
 
-def default_signal_profiles() -> dict[AssetClass, AssetSignalProfile]:
-    return {
+def default_signal_profiles(profile_name: str = "conservative") -> dict[AssetClass, AssetSignalProfile]:
+    profile_name = str(profile_name or "conservative").strip().lower()
+    profiles = {
         AssetClass.EQUITY: AssetSignalProfile(
             breakout_window=20,
             ema_window=10,
@@ -117,7 +121,10 @@ def default_signal_profiles() -> dict[AssetClass, AssetSignalProfile]:
             min_atr_pct=0.005,
             max_atr_pct=0.12,
             max_breakout_distance_atr=0.85,
+            immediate_breakout_distance_atr=0.35,
             retest_tolerance_pct=0.012,
+            allow_reclaim_entry=False,
+            reclaim_tolerance_pct=0.0,
             stop_atr_multiple=1.9,
             target_atr_multiple=3.1,
             compression_threshold=0.95,
@@ -136,12 +143,74 @@ def default_signal_profiles() -> dict[AssetClass, AssetSignalProfile]:
             min_atr_pct=0.002,
             max_atr_pct=0.06,
             max_breakout_distance_atr=0.65,
+            immediate_breakout_distance_atr=0.3,
             retest_tolerance_pct=0.008,
+            allow_reclaim_entry=False,
+            reclaim_tolerance_pct=0.0,
             stop_atr_multiple=1.6,
             target_atr_multiple=2.6,
             compression_threshold=0.98,
         ),
     }
+    if profile_name == "balanced":
+        profiles[AssetClass.EQUITY] = AssetSignalProfile(
+            **{
+                **profiles[AssetClass.EQUITY].__dict__,
+                "min_relative_volume": 1.08,
+                "min_reward_risk": 1.25,
+                "max_breakout_distance_atr": 0.95,
+                "immediate_breakout_distance_atr": 0.45,
+                "retest_tolerance_pct": 0.015,
+                "allow_reclaim_entry": True,
+                "reclaim_tolerance_pct": 0.004,
+                "compression_threshold": 1.0,
+            }
+        )
+        profiles[AssetClass.ETF] = AssetSignalProfile(
+            **{
+                **profiles[AssetClass.ETF].__dict__,
+                "min_relative_volume": 1.02,
+                "min_reward_risk": 1.15,
+                "max_breakout_distance_atr": 0.72,
+                "immediate_breakout_distance_atr": 0.38,
+                "retest_tolerance_pct": 0.01,
+                "allow_reclaim_entry": True,
+                "reclaim_tolerance_pct": 0.003,
+                "compression_threshold": 1.0,
+            }
+        )
+    elif profile_name == "aggressive":
+        profiles[AssetClass.EQUITY] = AssetSignalProfile(
+            **{
+                **profiles[AssetClass.EQUITY].__dict__,
+                "min_relative_volume": 1.02,
+                "min_reward_risk": 1.18,
+                "max_breakout_distance_atr": 1.1,
+                "immediate_breakout_distance_atr": 0.6,
+                "retest_tolerance_pct": 0.018,
+                "allow_reclaim_entry": True,
+                "reclaim_tolerance_pct": 0.008,
+                "stop_atr_multiple": 1.7,
+                "target_atr_multiple": 2.8,
+                "compression_threshold": 1.04,
+            }
+        )
+        profiles[AssetClass.ETF] = AssetSignalProfile(
+            **{
+                **profiles[AssetClass.ETF].__dict__,
+                "min_relative_volume": 1.0,
+                "min_reward_risk": 1.1,
+                "max_breakout_distance_atr": 0.8,
+                "immediate_breakout_distance_atr": 0.45,
+                "retest_tolerance_pct": 0.012,
+                "allow_reclaim_entry": True,
+                "reclaim_tolerance_pct": 0.005,
+                "stop_atr_multiple": 1.45,
+                "target_atr_multiple": 2.4,
+                "compression_threshold": 1.02,
+            }
+        )
+    return profiles
 
 
 def add_pipeline_indicators(df: pd.DataFrame, profile: AssetSignalProfile) -> pd.DataFrame:
@@ -272,6 +341,7 @@ def resolve_breakout_state(df: pd.DataFrame, profile: AssetSignalProfile) -> Bre
     latest = df.iloc[-1]
     close = safe_float(latest.get("Close")) or 0.0
     low = safe_float(latest.get("Low")) or close
+    ema_fast = safe_float(latest.get("ema_fast")) or close
     breakout_level = safe_float(latest.get("breakout_level"))
     atr = safe_float(latest.get("atr"))
     if breakout_level is None or atr in {None, 0.0}:
@@ -288,8 +358,20 @@ def resolve_breakout_state(df: pd.DataFrame, profile: AssetSignalProfile) -> Bre
     breakout_distance_atr = max(0.0, (close - breakout_level) / atr)
     retest_valid = low <= (breakout_level * (1 + profile.retest_tolerance_pct))
     extended_move = breakout_distance_atr > profile.max_breakout_distance_atr
-    is_valid = close > breakout_level and not extended_move and (retest_valid or breakout_distance_atr <= 0.35)
+    breakout_valid = close > breakout_level and not extended_move and (
+        retest_valid or breakout_distance_atr <= profile.immediate_breakout_distance_atr
+    )
+    reclaim_valid = (
+        profile.allow_reclaim_entry
+        and not extended_move
+        and close >= breakout_level * (1 - profile.reclaim_tolerance_pct)
+        and close >= ema_fast
+        and retest_valid
+    )
+    is_valid = breakout_valid or reclaim_valid
     breakout_strength = max(0.0, min(1.0, 1.0 - (breakout_distance_atr / max(profile.max_breakout_distance_atr, 1e-6))))
+    if reclaim_valid and close <= breakout_level:
+        breakout_strength *= 0.92
     return BreakoutState(
         is_valid=is_valid,
         breakout_level=breakout_level,
@@ -299,8 +381,12 @@ def resolve_breakout_state(df: pd.DataFrame, profile: AssetSignalProfile) -> Bre
         extended_move=extended_move,
         reason=(
             "Breakout trigger confirmed."
-            if is_valid
-            else ("Move is too extended above breakout." if extended_move else "Breakout trigger not confirmed.")
+            if breakout_valid
+            else (
+                "Reclaim + pullback continuation trigger confirmed."
+                if reclaim_valid
+                else ("Move is too extended above breakout." if extended_move else "Breakout trigger not confirmed.")
+            )
         ),
     )
 

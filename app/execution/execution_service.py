@@ -842,7 +842,7 @@ class ExecutionService:
         if is_regular_session:
             return proposal, None
 
-        if not self.settings.allow_extended_hours:
+        if not self.settings.effective_allow_extended_hours:
             return proposal, RiskDecision(
                 approved=False,
                 reason="Market is closed and extended-hours trading is disabled.",
@@ -851,7 +851,7 @@ class ExecutionService:
                     "symbol": signal.symbol,
                     "asset_class": asset_class.value,
                     "session_state": session_state,
-                    "allow_extended_hours": self.settings.allow_extended_hours,
+                    "allow_extended_hours": self.settings.effective_allow_extended_hours,
                 },
             )
 
@@ -864,7 +864,7 @@ class ExecutionService:
                     "symbol": signal.symbol,
                     "asset_class": asset_class.value,
                     "session_state": session_state,
-                    "allow_extended_hours": self.settings.allow_extended_hours,
+                    "allow_extended_hours": self.settings.effective_allow_extended_hours,
                 },
             )
 
@@ -900,7 +900,7 @@ class ExecutionService:
         updated_metadata["extended_hours"] = True
         updated_metadata["extended_hours_submission"] = {
             "session_state": session_state,
-            "allow_extended_hours": self.settings.allow_extended_hours,
+            "allow_extended_hours": self.settings.effective_allow_extended_hours,
             "order_type": "limit",
             "time_in_force": "day",
         }
@@ -986,7 +986,7 @@ class ExecutionService:
             "tranche_number": scale_in_meta.get("tranche_number"),
             "tranche_count_total": scale_in_meta.get("tranche_count_total"),
             "tranche_notional": scale_in_meta.get("next_tranche_notional"),
-            "scale_in_mode": scale_in_meta.get("scale_in_mode", self.settings.scale_in_mode),
+            "scale_in_mode": scale_in_meta.get("scale_in_mode", self.settings.effective_scale_in_mode),
             "allow_average_down": scale_in_meta.get("allow_average_down", self.settings.allow_average_down),
             "tranche_consumes_new_slot": bool(scale_in_meta.get("tranche_consumes_new_slot", True)),
             "allow_duplicate_buy_for_scale_in": bool(scale_in_meta.get("is_valid_next_tranche", False)),
@@ -1080,18 +1080,18 @@ class ExecutionService:
             self._decimal(self.settings.max_total_exposure) - current_total_exposure,
         )
         symbol_allocation_cap = self._round_money(
-            equity * self._decimal(self.settings.max_symbol_allocation_pct)
+            equity * self._decimal(self.settings.effective_max_symbol_allocation_pct)
         )
         class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
             asset_class.value,
-            self.settings.max_symbol_allocation_pct,
+            self.settings.effective_max_symbol_allocation_pct,
         )
         class_allocation_cap = self._round_money(equity * self._decimal(class_allocation_pct))
         remaining_symbol_allocation = max(Decimal("0"), symbol_allocation_cap - symbol_exposure)
         remaining_class_allocation = max(Decimal("0"), class_allocation_cap - current_class_exposure)
         remaining_slots = max(
             1,
-            self.settings.max_concurrent_positions - (
+            self.settings.effective_max_positions_total - (
                 len(self.portfolio.positions)
                 if bool(scale_in_meta.get("tranche_consumes_new_slot", True))
                 else max(0, len(self.portfolio.positions) - 1)
@@ -1099,7 +1099,7 @@ class ExecutionService:
         )
         slot_budget = self._round_money(remaining_total_exposure / self._decimal(remaining_slots))
         risk_per_trade_budget = self._round_money(
-            equity * self._decimal(self.settings.risk_per_trade_pct)
+            equity * self._decimal(self.settings.effective_risk_per_trade_pct)
         )
         risk_notional_cap = None
         if signal.stop_price is not None:
@@ -1199,7 +1199,7 @@ class ExecutionService:
                     "projected_position_notional_after_fill": float(
                         self._round_money(projected_position_notional_after_fill)
                     ),
-                    "scale_in_mode": scale_in_meta.get("scale_in_mode", self.settings.scale_in_mode),
+                    "scale_in_mode": scale_in_meta.get("scale_in_mode", self.settings.effective_scale_in_mode),
                     "allow_average_down": scale_in_meta.get("allow_average_down", self.settings.allow_average_down),
                     "tranche_consumes_new_slot": bool(scale_in_meta.get("tranche_consumes_new_slot", True)),
                     "decision_reason": scale_in_meta.get("decision_reason"),
@@ -1217,11 +1217,11 @@ class ExecutionService:
         account = self.risk_manager.get_account_snapshot()
         equity = self._decimal(account["equity"])
         symbol_allocation_cap = self._round_money(
-            equity * self._decimal(self.settings.max_symbol_allocation_pct)
+            equity * self._decimal(self.settings.effective_max_symbol_allocation_pct)
         )
         class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
             asset_class.value,
-            self.settings.max_symbol_allocation_pct,
+            self.settings.effective_max_symbol_allocation_pct,
         )
         class_allocation_cap = self._round_money(equity * self._decimal(class_allocation_pct))
         current_class_exposure = self._decimal(
@@ -1243,7 +1243,7 @@ class ExecutionService:
             asset_class=asset_class,
             target_position_notional=total_target_notional,
             tranche_weights=self.settings.entry_tranche_weights,
-            scale_in_mode=self.settings.scale_in_mode,
+            scale_in_mode=self.settings.effective_scale_in_mode,
             allow_average_down=self.settings.allow_average_down,
             decision_reason="Initial tranche plan created.",
         )
@@ -1261,7 +1261,7 @@ class ExecutionService:
             "next_tranche_notional": float(next_tranche["next_tranche_notional"]),
             "remaining_allocation": float(next_tranche["remaining_allocation"]),
             "target_position_notional": total_target_notional,
-            "scale_in_mode": self.settings.scale_in_mode,
+            "scale_in_mode": self.settings.effective_scale_in_mode,
             "allow_average_down": self.settings.allow_average_down,
             "tranche_consumes_new_slot": True,
             "decision_reason": "Initial tranche approved.",
@@ -1354,13 +1354,13 @@ class ExecutionService:
 
         if plan.scale_in_mode == "time":
             now = datetime.now(timezone.utc)
-            if plan.last_tranche_fill_time is not None and self.settings.minutes_between_tranches > 0:
+            if plan.last_tranche_fill_time is not None and self.settings.effective_minutes_between_tranches > 0:
                 elapsed_minutes = (now - plan.last_tranche_fill_time).total_seconds() / 60.0
-                if elapsed_minutes < self.settings.minutes_between_tranches:
+                if elapsed_minutes < self.settings.effective_minutes_between_tranches:
                     return ScaleInDecision(
                         approved=False,
                         reason=(
-                            f"Add-on blocked: wait at least {self.settings.minutes_between_tranches} minutes "
+                            f"Add-on blocked: wait at least {self.settings.effective_minutes_between_tranches} minutes "
                             "between tranches."
                         ),
                         rule="tranche_time_wait",
@@ -1369,17 +1369,17 @@ class ExecutionService:
                             "blocked_reason": "Time wait rule not satisfied.",
                             "symbol": symbol,
                             "elapsed_minutes": elapsed_minutes,
-                            "required_minutes": self.settings.minutes_between_tranches,
+                            "required_minutes": self.settings.effective_minutes_between_tranches,
                         },
                     )
 
-            if plan.last_tranche_fill_bar_index is not None and self.settings.min_bars_between_tranches > 0:
+            if plan.last_tranche_fill_bar_index is not None and self.settings.effective_min_bars_between_tranches > 0:
                 elapsed_bars = self.tranche_state.get_scan_bar_index() - plan.last_tranche_fill_bar_index
-                if elapsed_bars < self.settings.min_bars_between_tranches:
+                if elapsed_bars < self.settings.effective_min_bars_between_tranches:
                     return ScaleInDecision(
                         approved=False,
                         reason=(
-                            f"Add-on blocked: wait at least {self.settings.min_bars_between_tranches} scan bars "
+                            f"Add-on blocked: wait at least {self.settings.effective_min_bars_between_tranches} scan bars "
                             "between tranches."
                         ),
                         rule="tranche_bar_wait",
@@ -1388,7 +1388,7 @@ class ExecutionService:
                             "blocked_reason": "Bar wait rule not satisfied.",
                             "symbol": symbol,
                             "elapsed_bars": elapsed_bars,
-                            "required_bars": self.settings.min_bars_between_tranches,
+                            "required_bars": self.settings.effective_min_bars_between_tranches,
                         },
                     )
 
@@ -1397,7 +1397,7 @@ class ExecutionService:
             if reference_price is None:
                 reference_price = price
             favorable_multiplier = Decimal("1") + (
-                self._decimal(self.settings.add_on_favorable_move_pct) / Decimal("100")
+                self._decimal(self.settings.effective_add_on_favorable_move_pct) / Decimal("100")
             )
             required_price = self._decimal(reference_price) * favorable_multiplier
             if self._decimal(price) < required_price:
@@ -1414,7 +1414,7 @@ class ExecutionService:
                         "reference_price": reference_price,
                         "required_price": float(self._round_price(required_price, plan.asset_class)),
                         "current_price": price,
-                        "add_on_favorable_move_pct": self.settings.add_on_favorable_move_pct,
+                        "add_on_favorable_move_pct": self.settings.effective_add_on_favorable_move_pct,
                     },
                 )
 
@@ -1631,7 +1631,7 @@ class ExecutionService:
         signal.metrics.setdefault("has_tracked_long_position", has_tracked_long_position)
         signal.metrics.setdefault("has_sellable_long_position", has_tracked_long_position)
         signal.metrics.setdefault("has_coverable_short_position", has_coverable_short_position)
-        signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
+        signal.metrics.setdefault("short_selling_enabled", self.settings.effective_short_selling_enabled)
         signal.metrics["tracked_position_quantity"] = position.quantity if position is not None else 0.0
         signal.metrics["tracked_position_side"] = str(position.side) if position is not None else None
         signal.metrics["tracked_position_direction"] = (
@@ -1655,7 +1655,7 @@ class ExecutionService:
                 signal.signal_type = "exit"
                 signal.order_intent = "long_exit"
                 signal.reduce_only = True
-            elif signal.order_intent == "short_entry" or self.settings.short_selling_enabled:
+            elif signal.order_intent == "short_entry" or self.settings.effective_short_selling_enabled:
                 signal.signal_type = "entry"
                 signal.order_intent = "short_entry"
                 signal.reduce_only = False

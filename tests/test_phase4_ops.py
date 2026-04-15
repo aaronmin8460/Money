@@ -85,12 +85,17 @@ def test_deploy_env_example_keeps_safe_phase4_defaults() -> None:
     assert env_values["TRADING_ENABLED"] == "false"
     assert env_values["AUTO_TRADE_ENABLED"] == "false"
     assert env_values["LIVE_TRADING_ENABLED"] == "false"
+    assert env_values["TRADING_PROFILE"] == "conservative"
+    assert env_values["AGGRESSIVE_MODE_ENABLED"] == "false"
     assert env_values["DISCORD_NOTIFICATIONS_ENABLED"] == "false"
     assert env_values["ML_ENABLED"] == "false"
     assert env_values["ML_RETRAIN_ENABLED"] == "false"
     assert env_values["NEWS_FEATURES_ENABLED"] == "false"
     assert env_values["NEWS_RSS_ENABLED"] == "false"
     assert env_values["NEWS_LLM_ENABLED"] == "false"
+    assert env_values["BENZINGA_RSS_ENABLED"] == "false"
+    assert env_values["SEC_RSS_ENABLED"] == "false"
+    assert env_values["RATE_LIMIT_ENABLED"] == "false"
     assert env_values["ALPACA_API_KEY"] == ""
     assert env_values["ALPACA_SECRET_KEY"] == ""
     assert env_values["DISCORD_WEBHOOK_URL"] == ""
@@ -98,6 +103,10 @@ def test_deploy_env_example_keeps_safe_phase4_defaults() -> None:
     assert env_values["API_ADMIN_TOKEN"] == ""
     assert "paper dry-run" in contents.lower()
     assert "paper order-submission mode" in contents.lower()
+    assert "aggressive paper profile example" in contents.lower()
+    assert "benzinga rss example" in contents.lower()
+    assert "sec rss example" in contents.lower()
+    assert "rate limit example" in contents.lower()
 
 
 def test_verify_phase4_helpers_parse_env_and_check_paper_safety(tmp_path) -> None:

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import json
 
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+from app.api.rate_limit import configure_rate_limiter
 from app.api.routes_admin import router as admin_router
 from app.api.routes_assets import router as assets_router
 from app.api.routes_market import router as market_router
@@ -23,17 +27,58 @@ app.include_router(scanner_router)
 app.include_router(signals_router)
 
 
+@app.middleware("http")
+async def normalize_rate_limit_response(request, call_next):
+    response = await call_next(request)
+    if response.status_code != 429:
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    payload: dict[str, object] = {}
+    if body:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+
+    limit_description = str(
+        payload.get("limit")
+        or payload.get("detail")
+        or payload.get("error")
+        or "rate limit exceeded"
+    )
+    normalized = JSONResponse(
+        status_code=429,
+        content={
+            "error": "rate_limit_exceeded",
+            "detail": "Too many requests. Please retry later.",
+            "limit": limit_description,
+            "path": request.url.path,
+        },
+    )
+    for header_name in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset", "Retry-After"):
+        header_value = response.headers.get(header_name)
+        if header_value is not None:
+            normalized.headers[header_name] = header_value
+    return normalized
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     init_logging()
     settings = get_settings()
     logger = get_logger("api.startup")
+    configure_rate_limiter(app, settings)
     logger.info(
         "Application startup initiated",
         extra={
             "broker_mode": settings.broker_mode,
             "broker_backend": settings.broker_backend,
             "order_submission_mode": settings.order_submission_mode,
+            "trading_profile": settings.effective_trading_profile,
             "auto_trade_enabled": settings.auto_trade_enabled,
             "auto_trader_lock_path": settings.auto_trader_lock_path,
         },
@@ -47,12 +92,17 @@ def on_startup() -> None:
             "broker_mode": settings.broker_mode,
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
+            "trading_profile": settings.effective_trading_profile,
+            "trading_profile_summary": settings.trading_profile_summary,
             "trading_enabled": settings.trading_enabled,
             "order_submission_mode": settings.order_submission_mode,
             "auto_trade_enabled": settings.auto_trade_enabled,
             "discord_enabled": settings.discord_notifications_enabled,
             "auto_trader_lock_path": settings.auto_trader_lock_path,
             "news_llm_status": settings.news_llm_status,
+            "enabled_news_sources": settings.enabled_news_sources,
+            "rate_limit_enabled": settings.rate_limit_enabled,
+            "rate_limit_default": settings.rate_limit_default,
         },
     )
     notifier = get_discord_notifier(settings)
@@ -74,6 +124,7 @@ def on_startup() -> None:
                 "broker_mode": settings.broker_mode,
                 "broker_backend": settings.broker_backend,
                 "active_strategy": settings.active_strategy,
+                "trading_profile": settings.effective_trading_profile,
                 "order_submission_mode": settings.order_submission_mode,
                 "auto_trader_running": trader_status["running"],
                 "process_lock_acquired": trader_status["process_lock_acquired"],
@@ -94,6 +145,7 @@ def on_startup() -> None:
             details={
                 "broker_mode": settings.broker_mode,
                 "active_strategy": settings.active_strategy,
+                "trading_profile": settings.effective_trading_profile,
                 "trading_enabled": settings.trading_enabled,
                 "order_submission_mode": settings.order_submission_mode,
                 "auto_trade_enabled": settings.auto_trade_enabled,
@@ -107,6 +159,7 @@ def on_startup() -> None:
             "broker_mode": settings.broker_mode,
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
+            "trading_profile": settings.effective_trading_profile,
             "trading_enabled": settings.trading_enabled,
             "order_submission_mode": settings.order_submission_mode,
             "auto_trade_enabled": settings.auto_trade_enabled,
@@ -129,6 +182,7 @@ def on_shutdown() -> None:
             "broker_mode": settings.broker_mode,
             "broker_backend": settings.broker_backend,
             "active_strategy": settings.active_strategy,
+            "trading_profile": settings.effective_trading_profile,
             "order_submission_mode": settings.order_submission_mode,
             "auto_trader_running": was_auto_trader_running,
             "process_lock_acquired": trader_status.get("process_lock_acquired"),
@@ -144,6 +198,7 @@ def on_shutdown() -> None:
                 "broker_mode": settings.broker_mode,
                 "broker_backend": settings.broker_backend,
                 "active_strategy": settings.active_strategy,
+                "trading_profile": settings.effective_trading_profile,
                 "order_submission_mode": settings.order_submission_mode,
             },
         )
@@ -154,6 +209,7 @@ def on_shutdown() -> None:
                 details={
                     "broker_mode": settings.broker_mode,
                     "active_strategy": settings.active_strategy,
+                    "trading_profile": settings.effective_trading_profile,
                     "trading_enabled": settings.trading_enabled,
                     "order_submission_mode": settings.order_submission_mode,
                     "auto_trade_enabled": settings.auto_trade_enabled,

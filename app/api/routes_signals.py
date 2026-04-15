@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request, Response
 
+from app.api.rate_limit import rate_limit_signals
 from app.api.schemas import SignalRunRequest
 from app.db.models import NormalizedSignalRecord
 from app.db.session import SessionLocal
@@ -38,7 +39,8 @@ def _serialize_signal(row: NormalizedSignalRecord) -> dict[str, object]:
 
 
 @router.get("/signals")
-def list_signals(limit: int = Query(50, ge=1, le=250)) -> list[dict[str, object]]:
+@rate_limit_signals()
+def list_signals(request: Request, response: Response, limit: int = Query(50, ge=1, le=250)) -> list[dict[str, object]]:
     with SessionLocal() as session:
         rows = (
             session.query(NormalizedSignalRecord)
@@ -50,15 +52,17 @@ def list_signals(limit: int = Query(50, ge=1, le=250)) -> list[dict[str, object]
 
 
 @router.post("/signals/run")
-def run_signals(request: SignalRunRequest) -> dict[str, object]:
+@rate_limit_signals()
+def run_signals(request: Request, response: Response, payload: SignalRunRequest) -> dict[str, object]:
     trader = get_runtime().get_auto_trader()
-    if request.symbol:
-        return trader.run_symbol_now(request.symbol, request.asset_class)
+    if payload.symbol:
+        return trader.run_symbol_now(payload.symbol, payload.asset_class)
     return trader.run_now()
 
 
 @router.get("/signals/top")
-def top_signals(limit: int = Query(10, ge=1, le=100)) -> list[dict[str, object]]:
+@rate_limit_signals()
+def top_signals(request: Request, response: Response, limit: int = Query(10, ge=1, le=100)) -> list[dict[str, object]]:
     with SessionLocal() as session:
         rows = (
             session.query(NormalizedSignalRecord)

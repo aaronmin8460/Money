@@ -186,7 +186,11 @@ def test_health_route_is_lightweight_and_public(monkeypatch) -> None:
         response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "mode": "mock"}
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["mode"] == "mock"
+    assert payload["trading_profile"] == "conservative"
+    assert payload["rate_limit_enabled"] is False
 
 
 def test_readiness_route_returns_ok_for_valid_runtime_and_database(tmp_path) -> None:
@@ -198,7 +202,10 @@ def test_readiness_route_returns_ok_for_valid_runtime_and_database(tmp_path) -> 
         response = client.get("/health/ready")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["trading_profile"] == "conservative"
+    assert payload["rate_limit_enabled"] is False
 
 
 def test_readiness_route_returns_503_when_database_check_fails(monkeypatch) -> None:

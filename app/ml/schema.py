@@ -62,6 +62,12 @@ class SignalFeatureRow:
     news_sentiment_score: float | None
     news_relevance_score: float | None
     news_risk_tags_count: float | None
+    news_catalyst_score: float | None
+    news_source_diversity_count: float | None
+    news_cross_source_confirmation: float | None
+    news_benzinga_headline_count: float | None
+    news_sec_event_flag: float | None
+    news_sec_form_type: str | None
     outcome_classification: str | None = None
     label: int | None = None
     label_source: str | None = None
@@ -123,6 +129,12 @@ class SignalFeatureRow:
             "news_sentiment_score": self.news_sentiment_score,
             "news_relevance_score": self.news_relevance_score,
             "news_risk_tags_count": self.news_risk_tags_count,
+            "news_catalyst_score": self.news_catalyst_score,
+            "news_source_diversity_count": self.news_source_diversity_count,
+            "news_cross_source_confirmation": self.news_cross_source_confirmation,
+            "news_benzinga_headline_count": self.news_benzinga_headline_count,
+            "news_sec_event_flag": self.news_sec_event_flag,
+            "news_sec_form_type": self.news_sec_form_type,
             "outcome_classification": self.outcome_classification,
             "label": self.label,
             "label_source": self.label_source,

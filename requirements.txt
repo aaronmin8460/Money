@@ -16,3 +16,4 @@ scikit-learn
 joblib
 feedparser
 openai
+slowapi

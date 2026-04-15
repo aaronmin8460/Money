@@ -156,8 +156,9 @@ class AutoTrader:
                 "broker_backend": self.settings.broker_backend,
                 "active_strategy": self.settings.active_strategy,
                 "primary_runtime_strategy": self.settings.primary_runtime_strategy,
+                "trading_profile": self.settings.effective_trading_profile,
                 "crypto_only_mode": self.settings.crypto_only_mode,
-                "scan_interval_seconds": self.settings.scan_interval_seconds,
+                "scan_interval_seconds": self.settings.effective_scan_interval_seconds,
                 "trading_enabled": self.settings.trading_enabled,
                 "order_submission_mode": self.settings.order_submission_mode,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
@@ -171,7 +172,8 @@ class AutoTrader:
             details={
                 "broker_mode": self.settings.broker_mode,
                 "active_strategy": self.settings.active_strategy,
-                "scan_interval_seconds": self.settings.scan_interval_seconds,
+                "trading_profile": self.settings.effective_trading_profile,
+                "scan_interval_seconds": self.settings.effective_scan_interval_seconds,
                 "trading_enabled": self.settings.trading_enabled,
                 "order_submission_mode": self.settings.order_submission_mode,
                 "auto_trade_enabled": self.settings.auto_trade_enabled,
@@ -340,19 +342,21 @@ class AutoTrader:
                 scan_ranking_limit = (
                     max(1, len(self.settings.active_symbols))
                     if scan_selection_mode == "configured_active_symbols"
-                    else max(10, self.settings.max_positions_total * 3)
+                    else max(10, self.settings.effective_max_positions_total * 3)
                 )
             return {
                 "enabled": self.settings.auto_trade_enabled,
                 "running": self._running,
                 "broker_mode": self.settings.broker_mode,
                 "broker_backend": self.settings.broker_backend,
+                "trading_profile": self.settings.effective_trading_profile,
+                "trading_profile_summary": self.settings.trading_profile_summary,
                 "trading_enabled": self.settings.trading_enabled,
                 "live_trading_enabled": self.settings.live_trading_enabled,
                 "order_submission_mode": self.settings.order_submission_mode,
                 "active_strategy": self.settings.active_strategy,
                 "primary_runtime_strategy": self.settings.primary_runtime_strategy,
-                "scan_interval_seconds": self.settings.scan_interval_seconds,
+                "scan_interval_seconds": self.settings.effective_scan_interval_seconds,
                 "last_run_time": self._last_run_time.isoformat() if self._last_run_time else None,
                 "active_symbols": self.settings.active_symbols,
                 "active_crypto_symbols": self.settings.active_crypto_symbols,
@@ -395,7 +399,12 @@ class AutoTrader:
                     asset_class.value: self.settings.strategy_for_asset_class(asset_class)
                     for asset_class in sorted(self.settings.enabled_asset_class_set, key=lambda item: item.value)
                 },
-                "allow_extended_hours": self.settings.allow_extended_hours,
+                "candidate_strategy_routing": {
+                    asset_class.value: self.settings.candidate_strategies_for_asset_class(asset_class)
+                    for asset_class in sorted(self.settings.enabled_asset_class_set, key=lambda item: item.value)
+                },
+                "allow_extended_hours": self.settings.effective_allow_extended_hours,
+                "short_selling_enabled": self.settings.effective_short_selling_enabled,
                 "cycle_in_progress": self._cycle_guard.locked(),
                 "scan_summary_notifications_enabled": self.settings.discord_notify_scan_summary,
                 "last_cycle_id": self._last_cycle_id,
@@ -417,8 +426,9 @@ class AutoTrader:
                 "open_positions_count": len(self.portfolio.positions),
                 "ml_enabled": self.settings.ml_enabled,
                 "ml_model_type": self.settings.ml_model_type,
-                "ml_min_score_threshold": self.settings.ml_min_score_threshold,
+                "ml_min_score_threshold": self.settings.effective_ml_min_score_threshold,
                 "news_features_enabled": self.settings.news_features_enabled,
+                "enabled_news_sources": self.settings.enabled_news_sources,
                 "auto_trader_lock_path": self.settings.auto_trader_lock_path,
                 "process_lock_acquired": self._process_lock_handle is not None,
                 "process_lock_metadata": lock_metadata,
@@ -434,8 +444,8 @@ class AutoTrader:
             for asset_class in self._enabled_asset_classes()
         ]
         if not intervals:
-            return max(1.0, float(self.settings.scan_interval_seconds))
-        return max(1.0, float(min([self.settings.scan_interval_seconds, *intervals])))
+            return max(1.0, float(self.settings.effective_scan_interval_seconds))
+        return max(1.0, float(min([self.settings.effective_scan_interval_seconds, *intervals])))
 
     def _enabled_asset_classes(self) -> list[AssetClass]:
         ordered = [AssetClass.EQUITY, AssetClass.ETF, AssetClass.CRYPTO, AssetClass.OPTION]
@@ -612,14 +622,47 @@ class AutoTrader:
         except Exception:
             self._market_session_state = None
 
+    def _candidate_strategies_for_asset(
+        self,
+        asset: AssetMetadata,
+        *,
+        prefer_primary_strategy: bool = False,
+    ) -> list[Any]:
+        primary_strategy = self._select_strategy_for_asset(asset)
+        if prefer_primary_strategy:
+            return [primary_strategy]
+
+        requested_names = self.settings.candidate_strategies_for_asset_class(asset.asset_class)
+        strategies: list[Any] = []
+        seen_names: set[str] = set()
+        if primary_strategy.supports(asset.asset_class):
+            strategies.append(primary_strategy)
+            seen_names.add(getattr(primary_strategy, "name", "").strip().lower())
+
+        for name in requested_names:
+            try:
+                strategy = self.strategy_registry.get(name)
+            except Exception:
+                continue
+            normalized_name = getattr(strategy, "name", "").strip().lower()
+            if strategy.supports(asset.asset_class) and normalized_name not in seen_names:
+                strategies.append(strategy)
+                seen_names.add(normalized_name)
+
+        if strategies:
+            return strategies
+
+        return [primary_strategy]
+
     def _select_strategy_for_asset(self, asset: AssetMetadata) -> Any:
-        requested_name = self.settings.strategy_for_asset_class(asset.asset_class)
-        try:
-            strategy = self.strategy_registry.get(requested_name)
+        requested_names = self.settings.candidate_strategies_for_asset_class(asset.asset_class)
+        for name in requested_names:
+            try:
+                strategy = self.strategy_registry.get(name)
+            except Exception:
+                continue
             if strategy.supports(asset.asset_class):
                 return strategy
-        except Exception:
-            pass
 
         try:
             active_strategy = self.strategy_registry.get(self.settings.active_strategy)
@@ -660,7 +703,9 @@ class AutoTrader:
                 "benchmark_bars": benchmark_bars,
                 "entry_timeframe": entry_timeframe,
                 "regime_timeframe": regime_timeframe,
-                "short_selling_enabled": self.settings.short_selling_enabled,
+                "short_selling_enabled": self.settings.effective_short_selling_enabled,
+                "trading_profile": self.settings.effective_trading_profile,
+                "trading_profile_summary": self.settings.trading_profile_summary,
                 **position_state,
                 "normalized_snapshot": snapshot.to_dict(),
                 "tracked_position": (
@@ -901,7 +946,8 @@ class AutoTrader:
         evaluation_mode: str = "auto",
         precomputed_snapshot: dict[str, Any] | None = None,
     ) -> TradeSignal:
-        strategy = self._select_strategy_for_asset(asset)
+        strategies = self._candidate_strategies_for_asset(asset, prefer_primary_strategy=prefer_primary_strategy)
+        strategy = strategies[0]
         normalized_snapshot = self._get_normalized_snapshot(asset, precomputed_snapshot)
 
         if not strategy.supports(asset.asset_class):
@@ -929,7 +975,7 @@ class AutoTrader:
         if asset.asset_class in {AssetClass.EQUITY, AssetClass.ETF}:
             session_status = self.market_data_service.get_session_status(asset.asset_class)
             is_regular_session = session_status.session_state in {SessionState.REGULAR.value, SessionState.REGULAR}
-            if not is_regular_session and not self.settings.allow_extended_hours:
+            if not is_regular_session and not self.settings.effective_allow_extended_hours:
                 return TradeSignal(
                     symbol=asset.symbol,
                     signal=Signal.HOLD,
@@ -946,50 +992,72 @@ class AutoTrader:
                         "evaluation_mode": evaluation_mode,
                         "session_state": getattr(session_status.session_state, 'value', str(session_status.session_state)),
                         "is_regular_session": is_regular_session,
-                        "allow_extended_hours": self.settings.allow_extended_hours,
+                        "allow_extended_hours": self.settings.effective_allow_extended_hours,
                         "normalized_snapshot": normalized_snapshot.to_dict(),
                         "strategy_selected": strategy.name,
+                        "candidate_strategy_pool": [item.name for item in strategies],
                         "asset_class": asset.asset_class.value,
                     },
                 )
 
-        entry_bars, regime_bars, benchmark_bars, entry_timeframe, regime_timeframe = self._fetch_strategy_bars(
-            asset,
-            strategy=strategy,
-        )
-        context = self._build_context(
-            asset,
-            entry_bars,
-            strategy=strategy,
-            snapshot=normalized_snapshot,
-            entry_timeframe=entry_timeframe,
-            regime_timeframe=regime_timeframe,
-            regime_bars=regime_bars,
-            benchmark_bars=benchmark_bars,
-        )
-        candidate_signals: list[TradeSignal] = []
-        strategy_input: Any = entry_bars
-        strategy_name = getattr(strategy, "name", "")
-        if strategy_name == "equity_momentum_breakout":
-            strategy_input = {
-                "symbol": entry_bars,
-                "benchmark": benchmark_bars,
-                "regime": regime_bars,
-            }
-        elif strategy_name == "crypto_momentum_trend" and regime_timeframe != entry_timeframe:
-            strategy_input = {
-                "entry": entry_bars,
-                "regime": regime_bars,
-            }
-        try:
-            candidate_signals.extend(strategy.generate_signals(asset.symbol, strategy_input, context=context))
-        except TypeError as exc:
-            if "unexpected keyword argument 'context'" not in str(exc):
-                raise
-            candidate_signals.extend(strategy.generate_signals(asset.symbol, strategy_input))
-        except Exception as exc:
-            logger.warning("Strategy evaluation failed for %s: %s", asset.symbol, exc)
-        if not candidate_signals:
+        evaluated_candidates: list[tuple[TradeSignal, Any, Any, str, str, str]] = []
+        for candidate_strategy in strategies:
+            entry_bars, regime_bars, benchmark_bars, entry_timeframe, regime_timeframe = self._fetch_strategy_bars(
+                asset,
+                strategy=candidate_strategy,
+            )
+            context = self._build_context(
+                asset,
+                entry_bars,
+                strategy=candidate_strategy,
+                snapshot=normalized_snapshot,
+                entry_timeframe=entry_timeframe,
+                regime_timeframe=regime_timeframe,
+                regime_bars=regime_bars,
+                benchmark_bars=benchmark_bars,
+            )
+            strategy_input: Any = entry_bars
+            strategy_name = getattr(candidate_strategy, "name", "")
+            if strategy_name == "equity_momentum_breakout":
+                strategy_input = {
+                    "symbol": entry_bars,
+                    "benchmark": benchmark_bars,
+                    "regime": regime_bars,
+                }
+            elif strategy_name == "crypto_momentum_trend" and regime_timeframe != entry_timeframe:
+                strategy_input = {
+                    "entry": entry_bars,
+                    "regime": regime_bars,
+                }
+
+            candidate_signals: list[TradeSignal] = []
+            try:
+                candidate_signals.extend(candidate_strategy.generate_signals(asset.symbol, strategy_input, context=context))
+            except TypeError as exc:
+                if "unexpected keyword argument 'context'" not in str(exc):
+                    raise
+                candidate_signals.extend(candidate_strategy.generate_signals(asset.symbol, strategy_input))
+            except Exception as exc:
+                logger.warning("Strategy evaluation failed for %s/%s: %s", asset.symbol, candidate_strategy.name, exc)
+                continue
+
+            for candidate_signal in candidate_signals:
+                if candidate_signal.metrics is None:
+                    candidate_signal.metrics = {}
+                candidate_signal.metrics.setdefault("strategy_selected", candidate_strategy.name)
+                candidate_signal.metrics.setdefault("candidate_strategy_pool", [item.name for item in strategies])
+                evaluated_candidates.append(
+                    (
+                        candidate_signal,
+                        entry_bars,
+                        regime_bars,
+                        entry_timeframe,
+                        regime_timeframe,
+                        candidate_strategy.name,
+                    )
+                )
+
+        if not evaluated_candidates:
             return TradeSignal(
                 symbol=asset.symbol,
                 signal=Signal.HOLD,
@@ -1003,15 +1071,16 @@ class AutoTrader:
                     "evaluation_mode": evaluation_mode,
                     "normalized_snapshot": normalized_snapshot.to_dict(),
                     "strategy_selected": strategy.name,
+                    "candidate_strategy_pool": [item.name for item in strategies],
                     "asset_class": asset.asset_class.value,
                 },
             )
-        signal = sorted(
-            candidate_signals,
+        signal, entry_bars, regime_bars, entry_timeframe, regime_timeframe, selected_strategy_name = sorted(
+            evaluated_candidates,
             key=lambda item: (
-                item.signal != Signal.HOLD,
-                item.confidence_score or 0.0,
-                item.momentum_score or 0.0,
+                item[0].signal != Signal.HOLD,
+                item[0].confidence_score or 0.0,
+                item[0].momentum_score or 0.0,
             ),
             reverse=True,
         )[0]
@@ -1031,7 +1100,8 @@ class AutoTrader:
         signal.metrics.setdefault("latest_volume", latest_volume)
         signal.metrics["spread_pct"] = normalized_snapshot.spread_pct
         signal.metrics["decision_code"] = signal.metrics.get("decision_code") or ("no_signal" if signal.signal == Signal.HOLD else "signal")
-        signal.metrics["strategy_selected"] = strategy.name
+        signal.metrics["strategy_selected"] = selected_strategy_name
+        signal.metrics.setdefault("candidate_strategy_pool", [item.name for item in strategies])
         signal.metrics["entry_timeframe"] = entry_timeframe
         signal.metrics["regime_timeframe"] = regime_timeframe
         signal.metrics["entry_bar_count"] = len(entry_bars)
@@ -1067,7 +1137,7 @@ class AutoTrader:
         signal.metrics.setdefault("has_tracked_long_position", has_sellable_long_position)
         signal.metrics.setdefault("has_sellable_long_position", has_sellable_long_position)
         signal.metrics.setdefault("has_coverable_short_position", has_coverable_short_position)
-        signal.metrics.setdefault("short_selling_enabled", self.settings.short_selling_enabled)
+        signal.metrics.setdefault("short_selling_enabled", self.settings.effective_short_selling_enabled)
         signal.metrics.setdefault(
             "tracked_position_direction",
             tracked_position.direction.value if tracked_position is not None else None,
@@ -1086,7 +1156,7 @@ class AutoTrader:
                     blocked_reason="Exit-only sell ignored: no tracked long position is available to exit.",
                 )
             elif signal.order_intent == "short_entry":
-                if not self.settings.short_selling_enabled:
+                if not self.settings.effective_short_selling_enabled:
                     return self._build_blocked_hold_signal(
                         signal,
                         decision_code="short_selling_disabled",
@@ -1095,7 +1165,7 @@ class AutoTrader:
                     )
                 signal.signal_type = "entry"
                 signal.reduce_only = False
-            elif self.settings.short_selling_enabled:
+            elif self.settings.effective_short_selling_enabled:
                 signal.signal_type = "entry"
                 signal.order_intent = "short_entry"
                 signal.reduce_only = False
@@ -1458,6 +1528,7 @@ class AutoTrader:
                         row["strategy_score"] = ranking.get("strategy_score")
                         row["entry_ml_score"] = ranking.get("entry_ml_score")
                         row["risk_quality_adjustment"] = ranking.get("risk_quality_adjustment")
+                        row["catalyst_adjustment"] = ranking.get("catalyst_adjustment")
                 selected_signals = skipped_hold_signals + sell_signals
                 if not sell_signals:
                     selected_signals += selected_buy_signals
@@ -1514,6 +1585,7 @@ class AutoTrader:
                             "strategy_score": ((signal.metrics or {}).get("buy_ranking") or {}).get("strategy_score"),
                             "entry_ml_score": ((signal.metrics or {}).get("buy_ranking") or {}).get("entry_ml_score"),
                             "risk_quality_adjustment": ((signal.metrics or {}).get("buy_ranking") or {}).get("risk_quality_adjustment"),
+                            "catalyst_adjustment": ((signal.metrics or {}).get("buy_ranking") or {}).get("catalyst_adjustment"),
                             "selection_rule": ((signal.metrics or {}).get("buy_ranking") or {}).get("selection_rule"),
                             "selection_reason": ((signal.metrics or {}).get("buy_ranking") or {}).get("selection_reason"),
                         }
@@ -2107,6 +2179,8 @@ class AutoTrader:
         signal.metrics.setdefault("current_stop", position_state["current_stop"])
         signal.metrics.setdefault("tp1_hit", position_state["tp1_hit"])
         signal.metrics.setdefault("tp2_hit", position_state["tp2_hit"])
+        signal.metrics["trading_profile"] = self.settings.effective_trading_profile
+        signal.metrics["trading_profile_version"] = self.settings.aggressive_profile_version
         if ranked_opportunity is not None:
             signal.metrics["scan_signal_quality_score"] = getattr(ranked_opportunity, "signal_quality_score", None)
             signal.metrics["scan_tags"] = list(getattr(ranked_opportunity, "tags", []))
@@ -2144,21 +2218,57 @@ class AutoTrader:
             adjustment -= 0.25
         return adjustment
 
+    def _news_catalyst_adjustment(self, signal: TradeSignal) -> float:
+        weight = self.settings.effective_news_catalyst_weight
+        if weight <= 0:
+            return 0.0
+        news_features = dict((signal.metrics or {}).get("news_features") or {})
+        catalyst_score = self._safe_float(news_features.get("catalyst_score")) or 0.0
+        source_diversity_count = self._safe_float(news_features.get("source_diversity_count")) or 0.0
+        cross_source_confirmation = 1.0 if bool(news_features.get("cross_source_confirmation")) else 0.0
+        sec_event_flag = 1.0 if bool(news_features.get("sec_event_flag")) else 0.0
+        sec_caution_flag = 1.0 if bool(news_features.get("sec_caution_flag")) else 0.0
+
+        adjustment = catalyst_score * weight
+        adjustment += min(0.12, source_diversity_count * 0.04)
+        adjustment += cross_source_confirmation * 0.1
+        adjustment += sec_event_flag * 0.05
+        adjustment -= sec_caution_flag * 0.15
+        return max(-0.3, min(0.4, adjustment))
+
     def _rank_buy_signals(self, buy_signals: list[TradeSignal]) -> list[TradeSignal]:
         ranked_signals: list[TradeSignal] = []
         for signal in buy_signals:
             strategy_score = self._strategy_signal_score(signal)
             entry_ml_score = self._entry_ml_score(signal)
             risk_quality_adjustment = self._risk_quality_adjustment(signal)
-            combined_score = strategy_score + entry_ml_score + risk_quality_adjustment
+            catalyst_adjustment = self._news_catalyst_adjustment(signal)
+            combined_score = strategy_score + entry_ml_score + risk_quality_adjustment + catalyst_adjustment
             if signal.metrics is None:
                 signal.metrics = {}
             signal.metrics["buy_ranking"] = {
                 "strategy_score": strategy_score,
                 "entry_ml_score": entry_ml_score,
                 "risk_quality_adjustment": risk_quality_adjustment,
+                "catalyst_adjustment": catalyst_adjustment,
                 "combined_score": combined_score,
             }
+            if abs(catalyst_adjustment) >= 0.05:
+                logger.info(
+                    "Applied catalyst-aware ranking adjustment",
+                    extra={
+                        "symbol": signal.symbol,
+                        "trading_profile": self.settings.effective_trading_profile,
+                        "catalyst_adjustment": catalyst_adjustment,
+                        "catalyst_score": ((signal.metrics or {}).get("news_features") or {}).get("catalyst_score"),
+                        "source_diversity_count": ((signal.metrics or {}).get("news_features") or {}).get(
+                            "source_diversity_count"
+                        ),
+                        "cross_source_confirmation": ((signal.metrics or {}).get("news_features") or {}).get(
+                            "cross_source_confirmation"
+                        ),
+                    },
+                )
             ranked_signals.append(signal)
         return sorted(
             ranked_signals,
@@ -2171,8 +2281,8 @@ class AutoTrader:
         if price <= 0:
             return 0.0
         reward_risk = float((signal.metrics or {}).get("reward_risk_ratio") or 1.0)
-        symbol_cap = equity * self.settings.max_symbol_allocation_pct
-        risk_budget = equity * self.settings.risk_per_trade_pct
+        symbol_cap = equity * self.settings.effective_max_symbol_allocation_pct
+        risk_budget = equity * self.settings.effective_risk_per_trade_pct
         stop_price = signal.stop_price
         if stop_price is not None and price > stop_price:
             stop_distance = price - float(stop_price)
@@ -2197,7 +2307,8 @@ class AutoTrader:
             for symbol in self.portfolio.positions
         }
         projected_class_exposure = dict(self.portfolio.exposure_by_asset_class())
-        available_slots = max(0, self.settings.max_concurrent_positions - len(self.portfolio.positions))
+        projected_class_counts = dict(self.portfolio.position_counts_by_asset_class())
+        available_slots = max(0, self.settings.effective_max_positions_total - len(self.portfolio.positions))
         new_slot_count = 0
         active_symbol_cooldowns = {
             item["symbol"]
@@ -2224,10 +2335,10 @@ class AutoTrader:
                 selection_rule = "portfolio_exposure_limit"
                 selection_reason = "Portfolio max concurrent position limit reached for this cycle."
             else:
-                symbol_cap = equity * self.settings.max_symbol_allocation_pct
+                symbol_cap = equity * self.settings.effective_max_symbol_allocation_pct
                 class_cap = equity * self.settings.max_asset_class_allocation_pct.get(
                     asset_key,
-                    self.settings.max_symbol_allocation_pct,
+                    self.settings.effective_max_symbol_allocation_pct,
                 )
                 projected_symbol_total = projected_symbol_exposure.get(symbol, 0.0) + estimated_notional
                 projected_class_total = projected_class_exposure.get(asset_key, 0.0) + estimated_notional
@@ -2237,11 +2348,16 @@ class AutoTrader:
                 elif projected_class_total > class_cap:
                     selection_rule = "portfolio_exposure_limit"
                     selection_reason = "Per-asset-class allocation cap would be exceeded."
+                elif consumes_new_slot and projected_class_counts.get(asset_key, 0) >= self.settings.max_positions_for_asset_class(asset_key):
+                    selection_rule = "portfolio_position_count_limit"
+                    selection_reason = "Per-asset-class position count would be exceeded."
                 else:
                     selected.append(signal)
                     selected_symbols.add(symbol)
                     projected_symbol_exposure[symbol] = projected_symbol_total
                     projected_class_exposure[asset_key] = projected_class_total
+                    if consumes_new_slot:
+                        projected_class_counts[asset_key] = projected_class_counts.get(asset_key, 0) + 1
                     if consumes_new_slot:
                         new_slot_count += 1
 
@@ -2316,7 +2432,7 @@ class AutoTrader:
             entry_price=signal.entry_price,
             reason=(
                 f"Skipped: skipped_low_ml_score "
-                f"(score={(result.score or 0.0):.3f}, threshold={self.settings.ml_min_score_threshold:.3f})."
+                f"(score={(result.score or 0.0):.3f}, threshold={self.settings.effective_ml_min_score_threshold:.3f})."
             ),
             timestamp=signal.timestamp,
             atr=signal.atr,

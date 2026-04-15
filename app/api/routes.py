@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Request, Response
 
+from app.api.rate_limit import rate_limit_admin, rate_limit_default, rate_limit_signals
 from app.api.schemas import (
     AccountSummary,
     BacktestRequest,
@@ -26,7 +27,8 @@ router = APIRouter()
 
 
 @router.get("/broker/status", response_model=BrokerStatus)
-def broker_status() -> BrokerStatus:
+@rate_limit_default()
+def broker_status(request: Request, response: Response) -> BrokerStatus:
     settings = get_runtime().settings
     return BrokerStatus(
         broker_mode=settings.broker_mode,
@@ -36,11 +38,13 @@ def broker_status() -> BrokerStatus:
         safe_dry_run=not settings.trading_enabled,
         broker_label="Alpaca Paper" if settings.is_alpaca_mode else "Local Mock",
         live_trading_enabled=settings.live_trading_enabled,
+        trading_profile=settings.effective_trading_profile,
     )
 
 
 @router.get("/broker/account", response_model=AccountSummary)
-def broker_account() -> AccountSummary:
+@rate_limit_default()
+def broker_account(request: Request, response: Response) -> AccountSummary:
     runtime = get_runtime()
     try:
         runtime.sync_with_broker()
@@ -56,20 +60,23 @@ def broker_account() -> AccountSummary:
 
 
 @router.get("/positions")
-def positions() -> list[dict[str, Any]]:
+@rate_limit_default()
+def positions(request: Request, response: Response) -> list[dict[str, Any]]:
     runtime = get_runtime()
     runtime.sync_with_broker()
     return runtime.broker.get_positions()
 
 
 @router.get("/orders")
-def orders() -> list[dict[str, Any]]:
+@rate_limit_default()
+def orders(request: Request, response: Response) -> list[dict[str, Any]]:
     runtime = get_runtime()
     return runtime.broker.list_orders()
 
 
 @router.get("/trades")
-def trades() -> list[dict[str, Any]]:
+@rate_limit_default()
+def trades(request: Request, response: Response) -> list[dict[str, Any]]:
     from app.db.models import FillRecord
     from app.db.session import SessionLocal
 
@@ -92,16 +99,18 @@ def trades() -> list[dict[str, Any]]:
 
 
 @router.get("/risk")
-def risk() -> dict[str, Any]:
+@rate_limit_default()
+def risk(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker()
     return runtime.risk_manager.get_runtime_snapshot()
 
 
 @router.post("/run-once", response_model=RunOnceResult)
-def run_once(request: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[str, Any]:
+@rate_limit_admin()
+def run_once(request: Request, response: Response, payload: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[str, Any]:
     runtime = get_runtime()
-    if not request.symbol or not request.symbol.strip():
+    if not payload.symbol or not payload.symbol.strip():
         raise HTTPException(
             status_code=400,
             detail=(
@@ -109,10 +118,10 @@ def run_once(request: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[s
                 '{"symbol": "BTC/USD"} or {"symbol": "AAPL"} or as a query parameter ?symbol=AAPL'
             ),
         )
-    symbol = request.symbol.strip().upper()
+    symbol = payload.symbol.strip().upper()
     trader = runtime.get_auto_trader()
     try:
-        result = trader.run_symbol_now(symbol, request.asset_class)
+        result = trader.run_symbol_now(symbol, payload.asset_class)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except ValueError as exc:
@@ -131,14 +140,15 @@ def run_once(request: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[s
 
 
 @router.post("/backtest")
-def backtest(request: BacktestRequest) -> dict[str, Any]:
-    csv_path = request.csv_path or "data/sample.csv"
+@rate_limit_admin()
+def backtest(request: Request, response: Response, payload: BacktestRequest) -> dict[str, Any]:
+    csv_path = payload.csv_path or "data/sample.csv"
     path = Path(csv_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"CSV file not found: {csv_path}")
 
     try:
-        result = run_backtest(path, request.symbol)
+        result = run_backtest(path, payload.symbol)
     except Exception as exc:
         logger.error("Backtest failed", exc_info=exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -147,13 +157,15 @@ def backtest(request: BacktestRequest) -> dict[str, Any]:
 
 
 @router.get("/auto/status")
-def auto_status() -> dict[str, Any]:
+@rate_limit_signals()
+def auto_status(request: Request, response: Response) -> dict[str, Any]:
     trader = get_runtime().get_auto_trader()
     return trader.get_status()
 
 
 @router.post("/auto/start")
-def auto_start() -> dict[str, str]:
+@rate_limit_admin()
+def auto_start(request: Request, response: Response) -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
     if trader.start():
         return {"message": "Auto-trader started"}
@@ -161,7 +173,8 @@ def auto_start() -> dict[str, str]:
 
 
 @router.post("/auto/stop")
-def auto_stop() -> dict[str, str]:
+@rate_limit_admin()
+def auto_stop(request: Request, response: Response) -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
     if trader.stop():
         return {"message": "Auto-trader stopped"}
@@ -169,19 +182,22 @@ def auto_stop() -> dict[str, str]:
 
 
 @router.post("/auto/run-now")
-def auto_run_now() -> dict[str, Any]:
+@rate_limit_admin()
+def auto_run_now(request: Request, response: Response) -> dict[str, Any]:
     trader = get_runtime().get_auto_trader()
     return trader.run_now()
 
 
 @router.get("/strategy/signals")
-def strategy_signals() -> dict[str, Any]:
+@rate_limit_signals()
+def strategy_signals(request: Request, response: Response) -> dict[str, Any]:
     trader = get_runtime().get_auto_trader()
     return {"signals": trader.get_status()["last_signals"]}
 
 
 @router.get("/strategy/positions")
-def strategy_positions() -> dict[str, Any]:
+@rate_limit_signals()
+def strategy_positions(request: Request, response: Response) -> dict[str, Any]:
     runtime = get_runtime()
     runtime.sync_with_broker()
     return {"positions": runtime.portfolio.positions_snapshot()}

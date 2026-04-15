@@ -10,7 +10,7 @@ from app.config.settings import get_settings
 from app.monitoring.logger import get_logger, init_logging
 from app.news.feature_store import NewsFeatureStore
 from app.news.llm_analysis import analyze_headlines
-from app.news.rss_ingest import fetch_rss_headlines
+from app.news.rss_ingest import fetch_configured_headlines
 from app.news.ticker_mapper import group_headlines_by_symbol
 
 logger = get_logger("scripts.news_fetch")
@@ -34,6 +34,7 @@ def main() -> None:
                 "news_features_enabled": settings.news_features_enabled,
                 "news_rss_enabled": settings.news_rss_enabled,
                 "news_llm_status": settings.news_llm_status,
+                "enabled_news_sources": settings.enabled_news_sources,
             },
         )
         print("news_fetch_skipped=true reason=news_pipeline_disabled")
@@ -47,9 +48,11 @@ def main() -> None:
             "news_lookback_hours": settings.news_lookback_hours,
             "news_llm_status": settings.news_llm_status,
             "openai_model": settings.openai_model,
+            "enabled_news_sources": settings.enabled_news_sources,
         },
     )
-    headlines = fetch_rss_headlines(lookback_hours=settings.news_lookback_hours)
+    fetch_result = fetch_configured_headlines(settings)
+    headlines = fetch_result.deduped_items
     grouped = group_headlines_by_symbol(
         headlines,
         known_symbols=symbols,
@@ -72,7 +75,12 @@ def main() -> None:
         stored += 1
     summary = {
         "news_fetch_skipped": False,
-        "headlines": len(headlines),
+        "total_fetched": fetch_result.total_fetched,
+        "total_deduped": fetch_result.total_deduped,
+        "duplicate_count": fetch_result.duplicate_count,
+        "fetched_count_by_source": fetch_result.fetched_count_by_source,
+        "deduped_count_by_source": fetch_result.deduped_count_by_source,
+        "source_errors": fetch_result.errors,
         "symbols_grouped": len(grouped),
         "symbols_analyzed": stored,
         "news_llm_status": settings.news_llm_status,
@@ -82,10 +90,15 @@ def main() -> None:
     logger.info("News feature refresh completed", extra=summary)
     print(
         "news_fetch_skipped=false "
-        f"headlines={len(headlines)} "
+        f"total_fetched={fetch_result.total_fetched} "
+        f"total_deduped={fetch_result.total_deduped} "
+        f"duplicate_count={fetch_result.duplicate_count} "
         f"symbols_grouped={len(grouped)} "
         f"symbols_analyzed={stored} "
         f"news_llm_status={settings.news_llm_status} "
+        f"fetched_count_by_source={json.dumps(fetch_result.fetched_count_by_source, sort_keys=True)} "
+        f"deduped_count_by_source={json.dumps(fetch_result.deduped_count_by_source, sort_keys=True)} "
+        f"source_errors={json.dumps(fetch_result.errors, sort_keys=True)} "
         f"analysis_modes={json.dumps(dict(analysis_modes), sort_keys=True)} "
         f"analysis_reasons={json.dumps(dict(analysis_reasons), sort_keys=True)}"
     )

@@ -15,9 +15,15 @@ def map_headline_to_symbols(
     known_symbols: Iterable[str],
 ) -> list[str]:
     known = {symbol.upper(): symbol.upper() for symbol in known_symbols}
+    pre_mapped = [symbol.upper() for symbol in getattr(headline, "symbol_candidates", []) if symbol.upper() in known]
+    if pre_mapped:
+        return sorted(set(pre_mapped))
+
     title = headline.title.upper()
     summary = headline.summary.upper()
-    text = f"{title} {summary}"
+    company_name = str((getattr(headline, "raw_metadata", {}) or {}).get("company_name") or "").upper()
+    form_type = str((getattr(headline, "raw_metadata", {}) or {}).get("form_type") or "").upper()
+    text = f"{title} {summary} {company_name} {form_type}"
     matched: list[str] = []
     for token in _TOKEN_PATTERN.findall(text):
         normalized = token.lstrip("$").upper()

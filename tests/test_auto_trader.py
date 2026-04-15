@@ -2,8 +2,10 @@ import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from app.services import auto_trader as auto_trader_module
 from app.config.settings import Settings
@@ -966,6 +968,179 @@ def test_auto_trader_prefers_exit_signals_before_new_entries(monkeypatch) -> Non
     assert processed_signals == [("MSFT", "SELL", "stop")]
     aapl_evaluation = next(item for item in trader.get_status()["last_symbol_evaluations"] if item["symbol"] == "AAPL")
     assert aapl_evaluation["action"] == "skipped"
+
+
+def test_aggressive_profile_uses_catalyst_bonus_to_change_buy_ranking() -> None:
+    conservative_trader = AutoTrader(
+        Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=True,
+            auto_trader_lock_path=_test_lock_path(),
+        )
+    )
+    aggressive_trader = AutoTrader(
+        Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=True,
+            trading_profile="aggressive",
+            aggressive_mode_enabled=True,
+            aggressive_news_catalyst_weight=0.35,
+            auto_trader_lock_path=_test_lock_path(),
+        )
+    )
+
+    plain_signal = TradeSignal(
+        symbol="MSFT",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="equity_momentum_breakout",
+        price=100.0,
+        entry_price=100.0,
+        stop_price=96.0,
+        confidence_score=0.58,
+        liquidity_score=0.9,
+        metrics={
+            "strategy_score": 0.58,
+            "reward_risk_ratio": 2.0,
+            "breakout_distance_atr": 0.2,
+            "spread_pct": 0.002,
+            "ml": {"score": 0.58, "passed": True},
+            "news_features": {"catalyst_score": 0.0},
+        },
+    )
+    catalyst_signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="equity_momentum_breakout",
+        price=100.0,
+        entry_price=100.0,
+        stop_price=96.0,
+        confidence_score=0.52,
+        liquidity_score=0.9,
+        metrics={
+            "strategy_score": 0.52,
+            "reward_risk_ratio": 2.0,
+            "breakout_distance_atr": 0.2,
+            "spread_pct": 0.002,
+            "ml": {"score": 0.58, "passed": True},
+            "news_features": {
+                "catalyst_score": 0.85,
+                "source_diversity_count": 2,
+                "cross_source_confirmation": True,
+                "sec_event_flag": True,
+                "sec_caution_flag": False,
+            },
+        },
+    )
+
+    conservative_ranked = conservative_trader._rank_buy_signals([plain_signal, catalyst_signal])
+    assert [signal.symbol for signal in conservative_ranked] == ["MSFT", "AAPL"]
+    assert ((conservative_ranked[1].metrics or {}).get("buy_ranking") or {}).get("catalyst_adjustment") == 0.0
+
+    aggressive_plain = TradeSignal(**plain_signal.to_dict())
+    aggressive_catalyst = TradeSignal(**catalyst_signal.to_dict())
+    aggressive_ranked = aggressive_trader._rank_buy_signals([aggressive_plain, aggressive_catalyst])
+
+    assert [signal.symbol for signal in aggressive_ranked] == ["AAPL", "MSFT"]
+    assert (((aggressive_ranked[0].metrics or {}).get("buy_ranking") or {}).get("catalyst_adjustment") or 0.0) > 0.0
+
+
+def test_aggressive_profile_relaxes_ml_filter_without_disabling_it(monkeypatch) -> None:
+    conservative_trader = AutoTrader(
+        Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=True,
+            ml_min_score_threshold=0.55,
+            auto_trader_lock_path=_test_lock_path(),
+        )
+    )
+    aggressive_trader = AutoTrader(
+        Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=True,
+            ml_min_score_threshold=0.55,
+            trading_profile="aggressive",
+            aggressive_mode_enabled=True,
+            aggressive_entry_threshold_adjustment=-0.10,
+            auto_trader_lock_path=_test_lock_path(),
+        )
+    )
+    low_score_result = SimpleNamespace(
+        enabled=True,
+        score=0.5,
+        threshold=0.55,
+        passed=False,
+        purpose="entry",
+        model_type="logistic_regression",
+        reason="below_threshold",
+        to_dict=lambda: {
+            "enabled": True,
+            "score": 0.5,
+            "threshold": 0.55,
+            "passed": False,
+            "purpose": "entry",
+            "model_type": "logistic_regression",
+            "reason": "below_threshold",
+        },
+    )
+    aggressive_pass_result = SimpleNamespace(
+        enabled=True,
+        score=0.5,
+        threshold=0.45,
+        passed=True,
+        purpose="entry",
+        model_type="logistic_regression",
+        reason="score_above_threshold",
+        to_dict=lambda: {
+            "enabled": True,
+            "score": 0.5,
+            "threshold": 0.45,
+            "passed": True,
+            "purpose": "entry",
+            "model_type": "logistic_regression",
+            "reason": "score_above_threshold",
+        },
+    )
+
+    conservative_signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="equity_momentum_breakout",
+        price=100.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        reason="Candidate breakout",
+    )
+    aggressive_signal = TradeSignal(
+        symbol="AAPL",
+        signal=Signal.BUY,
+        asset_class=AssetClass.EQUITY,
+        strategy_name="equity_momentum_breakout",
+        price=100.0,
+        entry_price=100.0,
+        stop_price=95.0,
+        reason="Candidate breakout",
+    )
+
+    monkeypatch.setattr(conservative_trader.ml_scorer, "score_signal", lambda *args, **kwargs: low_score_result)
+    monkeypatch.setattr(aggressive_trader.ml_scorer, "score_signal", lambda *args, **kwargs: aggressive_pass_result)
+
+    conservative_filtered = conservative_trader._apply_ml_score_filter(conservative_signal)
+    aggressive_filtered = aggressive_trader._apply_ml_score_filter(aggressive_signal)
+
+    assert conservative_filtered.signal == Signal.HOLD
+    assert aggressive_filtered.signal == Signal.BUY
+    assert aggressive_trader.settings.effective_ml_min_score_threshold == pytest.approx(0.45)
 
 
 def test_broker_order_status_cache_persists_and_reloads_correctly(tmp_path: Path) -> None:

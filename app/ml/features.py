@@ -19,6 +19,7 @@ CATEGORICAL_FEATURES = [
     "session_state",
     "price_source_used",
     "news_sentiment_label",
+    "news_sec_form_type",
 ]
 
 NUMERIC_FEATURES = [
@@ -61,6 +62,11 @@ NUMERIC_FEATURES = [
     "news_sentiment_score",
     "news_relevance_score",
     "news_risk_tags_count",
+    "news_catalyst_score",
+    "news_source_diversity_count",
+    "news_cross_source_confirmation",
+    "news_benzinga_headline_count",
+    "news_sec_event_flag",
 ]
 
 
@@ -190,6 +196,12 @@ def build_signal_feature_row(
         news_sentiment_score=_safe_float((news_features or {}).get("sentiment_score")),
         news_relevance_score=_safe_float((news_features or {}).get("relevance_score")),
         news_risk_tags_count=float(len(risk_tags)),
+        news_catalyst_score=_safe_float((news_features or {}).get("catalyst_score")),
+        news_source_diversity_count=_safe_float((news_features or {}).get("source_diversity_count")),
+        news_cross_source_confirmation=_safe_float(bool((news_features or {}).get("cross_source_confirmation"))),
+        news_benzinga_headline_count=_safe_float((news_features or {}).get("benzinga_headline_count")),
+        news_sec_event_flag=_safe_float(bool((news_features or {}).get("sec_event_flag"))),
+        news_sec_form_type=_safe_str((news_features or {}).get("sec_form_type")),
         outcome_classification=outcome_classification,
         label=label,
         label_source=label_source,

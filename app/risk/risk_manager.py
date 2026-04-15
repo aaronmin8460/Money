@@ -81,11 +81,13 @@ class RiskManager:
             "auto_trade_enabled": self.settings.auto_trade_enabled,
             "live_trading_enabled": self.settings.live_trading_enabled,
             "kill_switch_enabled": self.settings.kill_switch_enabled,
-            "short_selling_enabled": self.settings.short_selling_enabled,
+            "trading_profile": self.settings.effective_trading_profile,
+            "trading_profile_summary": self.settings.trading_profile_summary,
+            "short_selling_enabled": self.settings.effective_short_selling_enabled,
             "broker_mode": self.settings.broker_mode,
             "broker_backend": self.settings.broker_backend,
             "active_strategy": self.settings.active_strategy,
-            "allow_extended_hours": self.settings.allow_extended_hours,
+            "allow_extended_hours": self.settings.effective_allow_extended_hours,
             "cash": account["cash"],
             "equity": account["equity"],
             "buying_power": account["buying_power"],
@@ -314,7 +316,7 @@ class RiskManager:
             )
 
         if resolved_order_profile == "short_entry":
-            if not self.settings.short_selling_enabled:
+            if not self.settings.effective_short_selling_enabled:
                 if order_intent == "short_entry":
                     return RiskDecision(
                         False,
@@ -473,7 +475,7 @@ class RiskManager:
                     details=decision_details,
                 )
 
-            max_positions = self.settings.max_positions_total
+            max_positions = self.settings.effective_max_positions_total
             if tranche_consumes_new_slot:
                 if len(self.portfolio.positions) >= max_positions:
                     return RiskDecision(
@@ -484,12 +486,7 @@ class RiskManager:
                     )
 
             positions_by_class = self.portfolio.position_counts_by_asset_class()
-            class_limit = int(
-                self.settings.max_positions_per_asset_class.get(
-                    resolved_asset_class.value,
-                    max_positions,
-                )
-            )
+            class_limit = int(self.settings.max_positions_for_asset_class(resolved_asset_class))
             if tranche_consumes_new_slot and positions_by_class.get(resolved_asset_class.value, 0) >= class_limit:
                 return RiskDecision(
                     False,
@@ -519,7 +516,7 @@ class RiskManager:
             symbol_position = self.portfolio.get_position(symbol)
             symbol_exposure = self._decimal(abs(self.portfolio.position_market_value(symbol) or 0.0))
             symbol_allocation_limit = self._round_money(
-                self._decimal(account["equity"]) * self._decimal(self.settings.max_symbol_allocation_pct)
+                self._decimal(account["equity"]) * self._decimal(self.settings.effective_max_symbol_allocation_pct)
             )
             if symbol_exposure + order_notional > symbol_allocation_limit:
                 return RiskDecision(
@@ -531,7 +528,7 @@ class RiskManager:
 
             class_allocation_pct = self.settings.max_asset_class_allocation_pct.get(
                 resolved_asset_class.value,
-                self.settings.max_symbol_allocation_pct,
+                self.settings.effective_max_symbol_allocation_pct,
             )
             class_allocation_limit = self._round_money(
                 self._decimal(account["equity"]) * self._decimal(class_allocation_pct)
@@ -616,7 +613,7 @@ class RiskManager:
 
                 trade_risk = self._round_money(quantity_decimal * self._decimal(risk_per_share))
                 max_trade_risk = self._round_money(
-                    self._decimal(account["equity"]) * self._decimal(self.settings.max_risk_per_trade)
+                    self._decimal(account["equity"]) * self._decimal(self.settings.effective_risk_per_trade_pct)
                 )
                 if trade_risk > max_trade_risk:
                     return RiskDecision(
@@ -629,7 +626,7 @@ class RiskManager:
         if (
             self.settings.is_alpaca_mode
             and resolved_asset_class != AssetClass.CRYPTO
-            and not self.settings.allow_extended_hours
+            and not self.settings.effective_allow_extended_hours
         ):
             broker = self.broker
             if broker is not None and hasattr(broker, "is_market_open") and not broker.is_market_open(resolved_asset_class):
@@ -915,7 +912,8 @@ class RiskManager:
             "position_direction": candidate_position_direction,
             "reduce_only": reduce_only,
             "exit_stage": exit_stage,
-            "short_selling_enabled": self.settings.short_selling_enabled,
+            "trading_profile": self.settings.effective_trading_profile,
+            "short_selling_enabled": self.settings.effective_short_selling_enabled,
             "is_risk_reducing_order": reduces_exposure,
             "is_risk_reducing_sell": side == "SELL" and reduces_exposure,
             "is_exposure_increasing_order": increases_exposure,

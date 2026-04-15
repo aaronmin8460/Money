@@ -6,6 +6,13 @@ from typing import Annotated, Any, List
 from pydantic import AnyHttpUrl, Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
 
+from app.config.trading_profile import (
+    DEFAULT_AGGRESSIVE_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS,
+    DEFAULT_AGGRESSIVE_SCAN_INTERVAL_SECONDS_BY_ASSET_CLASS,
+    DEFAULT_AGGRESSIVE_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS,
+    ResolvedTradingProfile,
+    resolve_trading_profile,
+)
 from app.domain.models import AssetClass
 
 
@@ -55,6 +62,38 @@ def _parse_json_list(value: str | list[str] | None, field_name: str) -> list[str
     if not isinstance(parsed, list):
         raise ValueError(f"{field_name} must be a JSON array.")
     return [str(item).strip().upper() for item in parsed if str(item).strip()]
+
+
+def _parse_string_list(
+    value: str | list[str] | None,
+    field_name: str,
+    *,
+    upper: bool = False,
+) -> list[str]:
+    if value is None:
+        return []
+    parsed_values: list[str]
+    if isinstance(value, list):
+        parsed_values = [str(item).strip() for item in value if str(item).strip()]
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field_name} must be valid JSON: {exc}") from exc
+            if not isinstance(parsed, list):
+                raise ValueError(f"{field_name} must be a JSON array.")
+            parsed_values = [str(item).strip() for item in parsed if str(item).strip()]
+        else:
+            parsed_values = [part.strip() for part in stripped.split(",") if part.strip()]
+    else:
+        raise ValueError(f"{field_name} must be a JSON array, comma-separated string, or list.")
+    if upper:
+        return [item.upper() for item in parsed_values]
+    return parsed_values
 
 
 def _dedupe_symbols(symbols: list[str]) -> list[str]:
@@ -150,6 +189,9 @@ class Settings(BaseSettings):
     trading_enabled: bool = Field(False, env="TRADING_ENABLED")
     live_trading_enabled: bool = Field(False, env="LIVE_TRADING_ENABLED")
     live_trading_ack: str | None = Field(None, env="LIVE_TRADING_ACK")
+    trading_profile: str = Field("conservative", env="TRADING_PROFILE")
+    aggressive_mode_enabled: bool = Field(False, env="AGGRESSIVE_MODE_ENABLED")
+    aggressive_profile_version: str = Field("v1", env="AGGRESSIVE_PROFILE_VERSION")
     discord_notifications_enabled: bool = Field(False, env="DISCORD_NOTIFICATIONS_ENABLED")
     discord_webhook_url: AnyHttpUrl | None = Field(None, env="DISCORD_WEBHOOK_URL")
     discord_notify_dry_runs: bool = Field(False, env="DISCORD_NOTIFY_DRY_RUNS")
@@ -374,6 +416,66 @@ class Settings(BaseSettings):
     openai_model: str = Field("gpt-4.1-nano", env="OPENAI_MODEL")
     news_max_headlines_per_ticker: int = Field(8, env="NEWS_MAX_HEADLINES_PER_TICKER")
     news_lookback_hours: int = Field(24, env="NEWS_LOOKBACK_HOURS")
+    news_source_ids: list[str] = Field(default_factory=list, env="NEWS_SOURCE_IDS")
+    benzinga_rss_enabled: bool = Field(False, env="BENZINGA_RSS_ENABLED")
+    benzinga_rss_urls: list[str] = Field(
+        default_factory=lambda: ["https://www.benzinga.com/feeds/news"],
+        env="BENZINGA_RSS_URLS",
+    )
+    sec_rss_enabled: bool = Field(False, env="SEC_RSS_ENABLED")
+    sec_rss_urls: list[str] = Field(
+        default_factory=lambda: [
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-k&count=100&output=atom",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-q&count=100&output=atom",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=10-k&count=100&output=atom",
+            "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=13d&count=100&output=atom",
+        ],
+        env="SEC_RSS_URLS",
+    )
+    sec_user_agent: str = Field("MoneyBot/1.0 (paper-safe research; contact unset)", env="SEC_USER_AGENT")
+    news_fetch_timeout_seconds: float = Field(10.0, env="NEWS_FETCH_TIMEOUT_SECONDS")
+    news_fetch_retry_count: int = Field(2, env="NEWS_FETCH_RETRY_COUNT")
+    news_fetch_backoff_seconds: float = Field(1.5, env="NEWS_FETCH_BACKOFF_SECONDS")
+    news_dedupe_window_minutes: int = Field(45, env="NEWS_DEDUPE_WINDOW_MINUTES")
+    news_source_weights: dict[str, float] = Field(default_factory=dict, env="NEWS_SOURCE_WEIGHTS")
+    news_enable_source_diversity_features: bool = Field(True, env="NEWS_ENABLE_SOURCE_DIVERSITY_FEATURES")
+    rate_limit_enabled: bool = Field(False, env="RATE_LIMIT_ENABLED")
+    rate_limit_default: str = Field("120/minute", env="RATE_LIMIT_DEFAULT")
+    rate_limit_storage_uri: str = Field("memory://", env="RATE_LIMIT_STORAGE_URI")
+    rate_limit_headers_enabled: bool = Field(True, env="RATE_LIMIT_HEADERS_ENABLED")
+    rate_limit_scanner: str = Field("12/minute", env="RATE_LIMIT_SCANNER")
+    rate_limit_admin: str = Field("10/minute", env="RATE_LIMIT_ADMIN")
+    rate_limit_market: str = Field("60/minute", env="RATE_LIMIT_MARKET")
+    rate_limit_signals: str = Field("30/minute", env="RATE_LIMIT_SIGNALS")
+    rate_limit_health_exempt: bool = Field(True, env="RATE_LIMIT_HEALTH_EXEMPT")
+    aggressive_entry_threshold_adjustment: float = Field(-0.08, env="AGGRESSIVE_ENTRY_THRESHOLD_ADJUSTMENT")
+    aggressive_max_positions: int = Field(5, env="AGGRESSIVE_MAX_POSITIONS")
+    aggressive_max_positions_per_asset_class: dict[str, int] = Field(
+        default_factory=lambda: {
+            AssetClass.EQUITY.value: 4,
+            AssetClass.ETF.value: 4,
+            AssetClass.CRYPTO.value: 3,
+            AssetClass.OPTION.value: 1,
+        },
+        env="AGGRESSIVE_MAX_POSITIONS_PER_ASSET_CLASS",
+    )
+    aggressive_risk_per_trade_pct: float = Field(0.0125, env="AGGRESSIVE_RISK_PER_TRADE_PCT")
+    aggressive_max_symbol_allocation_pct: float = Field(0.12, env="AGGRESSIVE_MAX_SYMBOL_ALLOCATION_PCT")
+    aggressive_scan_interval_seconds_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_AGGRESSIVE_SCAN_INTERVAL_SECONDS_BY_ASSET_CLASS),
+        env="AGGRESSIVE_SCAN_INTERVAL_SECONDS_BY_ASSET_CLASS",
+    )
+    aggressive_universe_prefilter_limit_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_AGGRESSIVE_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS),
+        env="AGGRESSIVE_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS",
+    )
+    aggressive_final_evaluation_limit_by_asset_class: dict[str, int] = Field(
+        default_factory=lambda: dict(DEFAULT_AGGRESSIVE_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS),
+        env="AGGRESSIVE_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS",
+    )
+    aggressive_news_catalyst_weight: float = Field(0.35, env="AGGRESSIVE_NEWS_CATALYST_WEIGHT")
+    aggressive_shorts_enabled: bool = Field(False, env="AGGRESSIVE_SHORTS_ENABLED")
+    aggressive_extended_hours_enabled: bool = Field(False, env="AGGRESSIVE_EXTENDED_HOURS_ENABLED")
 
     class Config:
         env_file = ".env"
@@ -503,6 +605,83 @@ class Settings(BaseSettings):
     def primary_runtime_strategy(self) -> str:
         return self.strategy_for_asset_class(self.primary_runtime_asset_class)
 
+    @property
+    def resolved_trading_profile(self) -> ResolvedTradingProfile:
+        return resolve_trading_profile(self)
+
+    @property
+    def trading_profile_summary(self) -> dict[str, object]:
+        return self.resolved_trading_profile.to_dict()
+
+    @property
+    def effective_trading_profile(self) -> str:
+        return self.resolved_trading_profile.name
+
+    @property
+    def effective_scan_interval_seconds(self) -> int:
+        intervals = list(self.resolved_trading_profile.scan_interval_seconds_by_asset_class.values())
+        if not intervals:
+            return max(1, int(self.scan_interval_seconds))
+        return max(1, min(intervals))
+
+    @property
+    def effective_max_positions_total(self) -> int:
+        return int(self.resolved_trading_profile.max_positions_total)
+
+    @property
+    def effective_risk_per_trade_pct(self) -> float:
+        return float(self.resolved_trading_profile.risk_per_trade_pct)
+
+    @property
+    def effective_max_symbol_allocation_pct(self) -> float:
+        return float(self.resolved_trading_profile.max_symbol_allocation_pct)
+
+    @property
+    def effective_allow_extended_hours(self) -> bool:
+        return bool(self.resolved_trading_profile.allow_extended_hours)
+
+    @property
+    def effective_short_selling_enabled(self) -> bool:
+        return bool(self.resolved_trading_profile.short_selling_enabled)
+
+    @property
+    def effective_scale_in_mode(self) -> str:
+        return str(self.resolved_trading_profile.scale_in_mode)
+
+    @property
+    def effective_min_bars_between_tranches(self) -> int:
+        return int(self.resolved_trading_profile.min_bars_between_tranches)
+
+    @property
+    def effective_minutes_between_tranches(self) -> int:
+        return int(self.resolved_trading_profile.minutes_between_tranches)
+
+    @property
+    def effective_add_on_favorable_move_pct(self) -> float:
+        return float(self.resolved_trading_profile.add_on_favorable_move_pct)
+
+    @property
+    def effective_ml_min_score_threshold(self) -> float:
+        return float(self.resolved_trading_profile.ml_min_score_threshold)
+
+    @property
+    def effective_news_catalyst_weight(self) -> float:
+        return float(self.resolved_trading_profile.news_catalyst_weight)
+
+    @property
+    def enabled_news_sources(self) -> list[str]:
+        active_sources = ["reuters", "marketwatch"]
+        if self.benzinga_rss_enabled:
+            active_sources.append("benzinga")
+        if self.sec_rss_enabled:
+            active_sources.append("sec")
+        if self.news_source_ids:
+            active_set = set(self.news_source_ids)
+            if "default_rss" in active_set:
+                active_set.update({"reuters", "marketwatch"})
+            return [source for source in active_sources if source in active_set]
+        return active_sources
+
     @field_validator("default_symbols", "crypto_symbols", "major_equity_symbols", "major_crypto_symbols", mode="before")
     def parse_default_symbols(cls, value: str | List[str]) -> List[str]:
         return _parse_json_list(value, "SYMBOLS")
@@ -510,6 +689,14 @@ class Settings(BaseSettings):
     @field_validator("enabled_asset_classes", mode="before")
     def parse_enabled_asset_classes(cls, value: str | list[str]) -> list[str]:
         return [item.lower() for item in _parse_json_list(value, "ENABLED_ASSET_CLASSES")]
+
+    @field_validator("news_source_ids", mode="before")
+    def parse_news_source_ids(cls, value: str | list[str]) -> list[str]:
+        return [item.lower() for item in _parse_string_list(value, "NEWS_SOURCE_IDS")]
+
+    @field_validator("benzinga_rss_urls", "sec_rss_urls", mode="before")
+    def parse_url_lists(cls, value: str | list[str], info: ValidationInfo) -> list[str]:
+        return _parse_string_list(value, info.field_name.upper())
 
     @field_validator("entry_tranche_weights", mode="before")
     def parse_entry_tranche_weights(cls, value: str | list[float] | list[str]) -> list[float]:
@@ -558,6 +745,11 @@ class Settings(BaseSettings):
         "dust_position_max_qty_by_asset_class",
         "strategy_switches",
         "active_strategy_by_asset_class",
+        "news_source_weights",
+        "aggressive_max_positions_per_asset_class",
+        "aggressive_scan_interval_seconds_by_asset_class",
+        "aggressive_universe_prefilter_limit_by_asset_class",
+        "aggressive_final_evaluation_limit_by_asset_class",
         mode="before",
     )
     def parse_json_objects(cls, value: str | dict[str, Any], info: ValidationInfo) -> dict[str, Any]:
@@ -575,6 +767,12 @@ class Settings(BaseSettings):
                 f"got '{self.broker_mode}'. The legacy alias 'alpaca' is still accepted."
             )
         self.broker_mode = mode
+        self.trading_profile = str(self.trading_profile or "conservative").strip().lower()
+        if self.aggressive_mode_enabled and self.trading_profile == "conservative":
+            self.trading_profile = "aggressive"
+        if self.trading_profile not in {"conservative", "balanced", "aggressive"}:
+            raise ValueError("TRADING_PROFILE must be one of: conservative, balanced, aggressive.")
+        self.aggressive_profile_version = str(self.aggressive_profile_version or "v1").strip() or "v1"
 
         if self.strategy_name:
             self.active_strategy = self.strategy_name
@@ -588,6 +786,14 @@ class Settings(BaseSettings):
             str(key).strip().lower(): str(value).strip().lower()
             for key, value in self.active_strategy_by_asset_class.items()
             if str(key).strip() and str(value).strip()
+        }
+        self.news_source_ids = list(dict.fromkeys(item.lower() for item in self.news_source_ids if str(item).strip()))
+        self.benzinga_rss_urls = [item for item in self.benzinga_rss_urls if str(item).strip()]
+        self.sec_rss_urls = [item for item in self.sec_rss_urls if str(item).strip()]
+        self.news_source_weights = {
+            str(key).strip().lower(): float(value)
+            for key, value in self.news_source_weights.items()
+            if str(key).strip()
         }
 
         if self.position_notional_buffer_pct <= 0 or self.position_notional_buffer_pct > 1:
@@ -613,11 +819,18 @@ class Settings(BaseSettings):
             )
         if self.max_symbol_allocation_pct <= 0 or self.max_symbol_allocation_pct > 1:
             raise ValueError("MAX_SYMBOL_ALLOCATION_PCT must be between 0 and 1.")
+        if self.aggressive_max_symbol_allocation_pct <= 0 or self.aggressive_max_symbol_allocation_pct > 1:
+            raise ValueError("AGGRESSIVE_MAX_SYMBOL_ALLOCATION_PCT must be between 0 and 1.")
         if any(value <= 0 or value > 1 for value in self.max_asset_class_allocation_pct.values()):
             raise ValueError("MAX_ASSET_CLASS_ALLOCATION_PCT values must each be between 0 and 1.")
         self.scan_interval_seconds_by_asset_class = {
             str(key).strip().lower(): max(1, int(value))
             for key, value in self.scan_interval_seconds_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.aggressive_scan_interval_seconds_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.aggressive_scan_interval_seconds_by_asset_class.items()
             if str(key).strip()
         }
         self.entry_timeframe_by_asset_class = {
@@ -645,9 +858,24 @@ class Settings(BaseSettings):
             for key, value in self.universe_prefilter_limit_by_asset_class.items()
             if str(key).strip()
         }
+        self.aggressive_universe_prefilter_limit_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.aggressive_universe_prefilter_limit_by_asset_class.items()
+            if str(key).strip()
+        }
         self.final_evaluation_limit_by_asset_class = {
             str(key).strip().lower(): max(1, int(value))
             for key, value in self.final_evaluation_limit_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.aggressive_final_evaluation_limit_by_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.aggressive_final_evaluation_limit_by_asset_class.items()
+            if str(key).strip()
+        }
+        self.aggressive_max_positions_per_asset_class = {
+            str(key).strip().lower(): max(1, int(value))
+            for key, value in self.aggressive_max_positions_per_asset_class.items()
             if str(key).strip()
         }
         for asset_class, default_value in DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS.items():
@@ -662,10 +890,25 @@ class Settings(BaseSettings):
             self.universe_prefilter_limit_by_asset_class.setdefault(asset_class, default_value)
         for asset_class, default_value in DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS.items():
             self.final_evaluation_limit_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_AGGRESSIVE_SCAN_INTERVAL_SECONDS_BY_ASSET_CLASS.items():
+            self.aggressive_scan_interval_seconds_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_AGGRESSIVE_UNIVERSE_PREFILTER_LIMIT_BY_ASSET_CLASS.items():
+            self.aggressive_universe_prefilter_limit_by_asset_class.setdefault(asset_class, default_value)
+        for asset_class, default_value in DEFAULT_AGGRESSIVE_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS.items():
+            self.aggressive_final_evaluation_limit_by_asset_class.setdefault(asset_class, default_value)
         for asset_class in DEFAULT_FINAL_EVALUATION_LIMIT_BY_ASSET_CLASS:
             final_limit = self.final_evaluation_limit_by_asset_class[asset_class]
             prefilter_limit = self.universe_prefilter_limit_by_asset_class.get(asset_class, final_limit)
             self.universe_prefilter_limit_by_asset_class[asset_class] = max(final_limit, prefilter_limit)
+            aggressive_final_limit = self.aggressive_final_evaluation_limit_by_asset_class.get(asset_class, final_limit)
+            aggressive_prefilter_limit = self.aggressive_universe_prefilter_limit_by_asset_class.get(
+                asset_class,
+                aggressive_final_limit,
+            )
+            self.aggressive_universe_prefilter_limit_by_asset_class[asset_class] = max(
+                aggressive_final_limit,
+                aggressive_prefilter_limit,
+            )
         if self.dust_position_max_notional < 0:
             raise ValueError("DUST_POSITION_MAX_NOTIONAL must be >= 0.")
         self.dust_position_max_qty_by_asset_class = {
@@ -729,12 +972,38 @@ class Settings(BaseSettings):
             raise ValueError("NEWS_MAX_HEADLINES_PER_TICKER must be >= 1.")
         if self.news_lookback_hours < 1:
             raise ValueError("NEWS_LOOKBACK_HOURS must be >= 1.")
+        if self.news_fetch_timeout_seconds <= 0:
+            raise ValueError("NEWS_FETCH_TIMEOUT_SECONDS must be > 0.")
+        if self.news_fetch_retry_count < 0:
+            raise ValueError("NEWS_FETCH_RETRY_COUNT must be >= 0.")
+        if self.news_fetch_backoff_seconds < 0:
+            raise ValueError("NEWS_FETCH_BACKOFF_SECONDS must be >= 0.")
+        if self.news_dedupe_window_minutes < 0:
+            raise ValueError("NEWS_DEDUPE_WINDOW_MINUTES must be >= 0.")
         if self.min_bars_between_tranches < 0:
             raise ValueError("MIN_BARS_BETWEEN_TRANCHES must be >= 0.")
         if self.minutes_between_tranches < 0:
             raise ValueError("MINUTES_BETWEEN_TRANCHES must be >= 0.")
         if self.add_on_favorable_move_pct < 0:
             raise ValueError("ADD_ON_FAVORABLE_MOVE_PCT must be >= 0.")
+        if self.aggressive_max_positions < 1:
+            raise ValueError("AGGRESSIVE_MAX_POSITIONS must be >= 1.")
+        if not 0 < self.aggressive_risk_per_trade_pct <= 1:
+            raise ValueError("AGGRESSIVE_RISK_PER_TRADE_PCT must be between 0 and 1.")
+        if not -1 <= self.aggressive_entry_threshold_adjustment <= 1:
+            raise ValueError("AGGRESSIVE_ENTRY_THRESHOLD_ADJUSTMENT must be between -1 and 1.")
+        if self.aggressive_news_catalyst_weight < 0:
+            raise ValueError("AGGRESSIVE_NEWS_CATALYST_WEIGHT must be >= 0.")
+        if not self.rate_limit_default.strip():
+            raise ValueError("RATE_LIMIT_DEFAULT must not be empty.")
+        if not self.rate_limit_scanner.strip():
+            raise ValueError("RATE_LIMIT_SCANNER must not be empty.")
+        if not self.rate_limit_admin.strip():
+            raise ValueError("RATE_LIMIT_ADMIN must not be empty.")
+        if not self.rate_limit_market.strip():
+            raise ValueError("RATE_LIMIT_MARKET must not be empty.")
+        if not self.rate_limit_signals.strip():
+            raise ValueError("RATE_LIMIT_SIGNALS must not be empty.")
 
         if self.is_paper_mode and not self.has_alpaca_credentials:
             raise ValueError(
@@ -795,6 +1064,13 @@ class Settings(BaseSettings):
             return "crypto_momentum_trend"
         return self.active_strategy
 
+    def candidate_strategies_for_asset_class(self, asset_class: AssetClass | str) -> list[str]:
+        key = asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class).strip().lower()
+        resolved = self.resolved_trading_profile.strategies_for_asset_class(key)
+        if resolved:
+            return resolved
+        return [self.strategy_for_asset_class(key)]
+
     def _asset_class_key(self, asset_class: AssetClass | str) -> str:
         return asset_class.value if isinstance(asset_class, AssetClass) else str(asset_class).strip().lower()
 
@@ -819,7 +1095,7 @@ class Settings(BaseSettings):
 
     def scan_interval_for_asset_class(self, asset_class: AssetClass | str) -> int:
         key = self._asset_class_key(asset_class)
-        value = self.scan_interval_seconds_by_asset_class.get(key)
+        value = self.resolved_trading_profile.scan_interval_seconds_by_asset_class.get(key)
         if value is None:
             return max(1, int(self.scan_interval_seconds))
         return max(1, int(value))
@@ -827,16 +1103,23 @@ class Settings(BaseSettings):
     def universe_prefilter_limit_for_asset_class(self, asset_class: AssetClass | str) -> int:
         key = self._asset_class_key(asset_class)
         final_limit = self.final_evaluation_limit_for_asset_class(asset_class)
-        value = self.universe_prefilter_limit_by_asset_class.get(key)
+        value = self.resolved_trading_profile.universe_prefilter_limit_by_asset_class.get(key)
         if value is None:
             return max(final_limit, self.scanner_limit_per_asset_class)
         return max(final_limit, int(value))
 
     def final_evaluation_limit_for_asset_class(self, asset_class: AssetClass | str) -> int:
         key = self._asset_class_key(asset_class)
-        value = self.final_evaluation_limit_by_asset_class.get(key)
+        value = self.resolved_trading_profile.final_evaluation_limit_by_asset_class.get(key)
         if value is None:
             return max(1, min(self.scanner_limit_per_asset_class, 15))
+        return max(1, int(value))
+
+    def max_positions_for_asset_class(self, asset_class: AssetClass | str) -> int:
+        key = self._asset_class_key(asset_class)
+        value = self.resolved_trading_profile.max_positions_per_asset_class.get(key)
+        if value is None:
+            return self.effective_max_positions_total
         return max(1, int(value))
 
     @property

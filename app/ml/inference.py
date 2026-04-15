@@ -78,7 +78,7 @@ class SignalScorer:
             self.settings.entry_model_enabled if purpose == "entry" else self.settings.exit_model_enabled
         )
         threshold = (
-            float(self.settings.ml_min_score_threshold)
+            float(self.settings.effective_ml_min_score_threshold)
             if purpose == "entry"
             else float(self.settings.ml_exit_min_score)
         )

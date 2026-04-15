@@ -138,6 +138,104 @@ curl -X POST http://127.0.0.1:8000/admin/runtime-safety/resume \
   -d '{"note":"resume after review","reset_consecutive_losing_exits":true}'
 ```
 
+## 6A. Phase 5: Aggressive Paper, Diversified News, And Rate Limiting
+
+Phase 5 adds three explicit operator-facing features:
+
+- `TRADING_PROFILE=conservative|balanced|aggressive` so aggressive behavior is opt-in instead of replacing the safe default.
+- Multi-source news ingestion with source attribution, Benzinga RSS support, and SEC filing/disclosure feeds that stay feature-only.
+- FastAPI rate limiting with `slowapi`, including stricter limits for scanner/admin paths and a structured 429 response.
+
+Aggressive paper mode stays paper-first:
+
+- Keep `BROKER_MODE=paper`
+- Keep `LIVE_TRADING_ENABLED=false`
+- Enable aggressive behavior only after conservative paper verification is clean
+- Hard risk controls, kill switches, drawdown limits, and emergency exits still win over aggressive entries
+
+Example aggressive paper profile:
+
+```bash
+cat <<'EOF' >> .env
+TRADING_PROFILE=aggressive
+AGGRESSIVE_MODE_ENABLED=true
+AGGRESSIVE_PROFILE_VERSION=v1
+AGGRESSIVE_SHORTS_ENABLED=true
+AGGRESSIVE_EXTENDED_HOURS_ENABLED=true
+TRADING_ENABLED=true
+AUTO_TRADE_ENABLED=true
+LIVE_TRADING_ENABLED=false
+EOF
+```
+
+Example diversified news configuration:
+
+```bash
+cat <<'EOF' >> .env
+NEWS_FEATURES_ENABLED=true
+NEWS_RSS_ENABLED=true
+NEWS_SOURCE_IDS=default_rss,benzinga,sec
+BENZINGA_RSS_ENABLED=true
+BENZINGA_RSS_URLS=["https://www.benzinga.com/feeds/news"]
+SEC_RSS_ENABLED=true
+SEC_RSS_URLS=["https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&output=atom&owner=include&count=40"]
+SEC_USER_AGENT=MoneyBot/1.0 (paper-safe research; contact=ops@example.com)
+NEWS_LLM_ENABLED=false
+EOF
+```
+
+To enable the OpenAI-assisted path, set `NEWS_LLM_ENABLED=true` and `OPENAI_API_KEY=<real key>`. To stay fully heuristic and offline-safe, keep `NEWS_LLM_ENABLED=false`. In both cases, the news pipeline remains feature-only and the fetch script continues safely on per-source or LLM failures.
+
+Example rate-limit configuration:
+
+```bash
+cat <<'EOF' >> .env
+RATE_LIMIT_ENABLED=true
+RATE_LIMIT_DEFAULT=60/minute
+RATE_LIMIT_STORAGE_URI=memory://
+RATE_LIMIT_HEADERS_ENABLED=true
+RATE_LIMIT_SCANNER=6/minute
+RATE_LIMIT_ADMIN=5/minute
+RATE_LIMIT_MARKET=30/minute
+RATE_LIMIT_SIGNALS=20/minute
+RATE_LIMIT_HEALTH_EXEMPT=true
+EOF
+```
+
+Fetch multi-source news features locally:
+
+```bash
+source .venv/bin/activate
+python scripts/fetch_news_features.py
+tail -n 20 logs/news_features.jsonl
+```
+
+Verify aggressive profile, enabled news sources, LLM status, and rate limiting:
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/auto/status
+curl http://127.0.0.1:8000/config \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
+```
+
+Useful fields to look for:
+
+- `/health`: `trading_profile`, `enabled_news_sources`, `news_llm_status`, `rate_limit_enabled`
+- `/auto/status`: `trading_profile`, `trading_profile_summary`, `candidate_strategy_routing`
+- `/config`: effective aggressive overrides, source URLs, and route-specific rate-limit values
+
+Test rate limiting locally:
+
+```bash
+for i in 1 2 3; do
+  curl -i "http://127.0.0.1:8000/scanner/opportunities?limit=1"
+done
+curl -i http://127.0.0.1:8000/health
+```
+
+The scanner endpoint should return `429` after the configured threshold, while `/health` should stay easy to poll when `RATE_LIMIT_HEALTH_EXEMPT=true`.
+
 ## 7. EC2/systemd paper deployment
 
 Recommended shape:

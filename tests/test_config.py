@@ -121,6 +121,76 @@ def test_active_strategy_defaults_to_equity_momentum_breakout() -> None:
     assert settings.strategy_name == "equity_momentum_breakout"
 
 
+def test_trading_profile_defaults_to_conservative() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+        )
+
+    assert settings.trading_profile == "conservative"
+    assert settings.effective_trading_profile == "conservative"
+    assert settings.effective_short_selling_enabled is False
+
+
+def test_aggressive_profile_resolves_explicit_overrides() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            trading_profile="aggressive",
+            aggressive_shorts_enabled=True,
+            aggressive_extended_hours_enabled=True,
+            aggressive_max_positions=6,
+            aggressive_risk_per_trade_pct=0.015,
+            aggressive_max_symbol_allocation_pct=0.13,
+            aggressive_scan_interval_seconds_by_asset_class={"equity": 45, "crypto": 20},
+            aggressive_final_evaluation_limit_by_asset_class={"equity": 30, "crypto": 26},
+        )
+
+    assert settings.effective_trading_profile == "aggressive"
+    assert settings.effective_short_selling_enabled is True
+    assert settings.effective_allow_extended_hours is True
+    assert settings.effective_max_positions_total == 6
+    assert settings.effective_risk_per_trade_pct == 0.015
+    assert settings.effective_max_symbol_allocation_pct == 0.13
+    assert settings.scan_interval_for_asset_class(AssetClass.EQUITY) == 45
+    assert settings.final_evaluation_limit_for_asset_class(AssetClass.EQUITY) == 30
+    assert "ema_crossover" in settings.candidate_strategies_for_asset_class(AssetClass.EQUITY)
+
+
+def test_aggressive_mode_does_not_silently_activate() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            aggressive_shorts_enabled=True,
+            aggressive_extended_hours_enabled=True,
+        )
+
+    assert settings.trading_profile == "conservative"
+    assert settings.effective_trading_profile == "conservative"
+    assert settings.effective_short_selling_enabled is False
+    assert settings.effective_allow_extended_hours is False
+
+
+def test_aggressive_profile_keeps_short_strategy_gated_without_short_opt_in() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            trading_profile="aggressive",
+        )
+
+    assert settings.effective_trading_profile == "aggressive"
+    assert settings.effective_short_selling_enabled is False
+    assert "ema_crossover" not in settings.candidate_strategies_for_asset_class(AssetClass.EQUITY)
+
+
 def test_discord_notifications_require_webhook_when_enabled() -> None:
     with patch.dict(os.environ, {}, clear=True):
         with pytest.raises(ValueError, match="DISCORD_WEBHOOK_URL"):

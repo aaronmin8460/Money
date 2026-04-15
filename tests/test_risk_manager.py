@@ -169,6 +169,33 @@ def test_buy_is_rejected_when_daily_loss_limit_is_exceeded() -> None:
     assert decision.rule == "daily_loss_pct_limit"
 
 
+def test_aggressive_profile_still_respects_daily_loss_guardrail() -> None:
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=True,
+        trading_profile="aggressive",
+        aggressive_mode_enabled=True,
+        aggressive_shorts_enabled=True,
+        aggressive_extended_hours_enabled=True,
+        max_daily_loss=100_000.0,
+        max_daily_loss_pct=0.02,
+    )
+    portfolio = Portfolio(cash=97_000.0)
+    baseline_time = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    portfolio.reset_daily_baseline(
+        equity=100_000.0,
+        as_of=baseline_time,
+    )
+    manager = RiskManager(portfolio, settings=settings)
+
+    decision = manager.evaluate_order("AAPL", "BUY", 1.0, 100.0)
+
+    assert decision.approved is False
+    assert decision.rule == "daily_loss_pct_limit"
+    assert decision.details["trading_profile"] == "aggressive"
+
+
 def test_sell_is_allowed_when_daily_loss_limit_is_exceeded_but_exposure_is_reduced() -> None:
     settings = Settings(
         _env_file=None,

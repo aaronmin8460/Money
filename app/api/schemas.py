@@ -44,6 +44,7 @@ class BrokerStatus(BaseModel):
     safe_dry_run: bool
     broker_label: str
     live_trading_enabled: bool | None = None
+    trading_profile: str | None = None
 
 
 class AccountSummary(BaseModel):
