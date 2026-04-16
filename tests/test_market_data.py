@@ -410,6 +410,159 @@ def test_composite_provider_falls_back_when_primary_fails() -> None:
     assert composite.diagnostics()["recent_fallback_count"] == 1
 
 
+def test_composite_provider_prefers_cached_live_crypto_quotes() -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+    live_quote = QuoteSnapshot(
+        symbol="BTC/USD",
+        asset_class=AssetClass.CRYPTO,
+        bid_price=64000.0,
+        bid_size=0.5,
+        ask_price=64010.0,
+        ask_size=0.4,
+        timestamp=datetime(2026, 4, 16, 10, 0, tzinfo=timezone.utc),
+    )
+
+    class StubCryptoProvider:
+        provider_name = "coingecko"
+
+        def get_latest_quote(self, symbol, asset_class=None):
+            return QuoteSnapshot(symbol="BTC/USD", asset_class=AssetClass.CRYPTO, timestamp=live_quote.timestamp)
+
+        def get_session_status(self, asset_class=None):
+            return MagicMock(session_state=MagicMock(value="always_open"))
+
+        def get_latest_trade(self, symbol, asset_class=None):
+            return TradeSnapshot(
+                symbol="BTC/USD",
+                asset_class=AssetClass.CRYPTO,
+                price=63990.0,
+                size=123.0,
+                timestamp=live_quote.timestamp,
+            )
+
+        def get_normalized_snapshot(self, symbol, asset_class=None):
+            return NormalizedMarketSnapshot(
+                symbol="BTC/USD",
+                asset_class=AssetClass.CRYPTO,
+                last_trade_price=63990.0,
+                evaluation_price=63990.0,
+                quote_available=False,
+                quote_stale=False,
+                price_source_used="last_trade",
+                trade_timestamp=live_quote.timestamp,
+                source_timestamp=live_quote.timestamp,
+                session_state="always_open",
+                exchange="COINGECKO",
+                source="coingecko",
+            )
+
+        def batch_snapshot(self, symbols, asset_class=None):
+            return {
+                "BTC/USD": {
+                    "symbol": "BTC/USD",
+                    "asset_class": AssetClass.CRYPTO.value,
+                    "quote": QuoteSnapshot(
+                        symbol="BTC/USD",
+                        asset_class=AssetClass.CRYPTO,
+                        timestamp=live_quote.timestamp,
+                    ).to_dict(),
+                    "trade": self.get_latest_trade("BTC/USD", asset_class).to_dict(),
+                    "normalized": self.get_normalized_snapshot("BTC/USD", asset_class).to_dict(),
+                    "source": "coingecko",
+                }
+            }
+
+    class FakeQuoteFeed:
+        def __init__(self):
+            self.subscriptions: list[list[str]] = []
+
+        def subscribe(self, symbols):
+            self.subscriptions.append(list(symbols))
+            return list(symbols)
+
+        def get_latest_quote(self, symbol, *, max_age_seconds=None):
+            assert max_age_seconds == settings.quote_stale_after_seconds
+            if symbol == "BTC/USD":
+                return live_quote
+            return None
+
+        def diagnostics(self):
+            return {"enabled": True}
+
+        def close(self):
+            return None
+
+    quote_feed = FakeQuoteFeed()
+    composite = CompositeMarketDataProvider(
+        settings,
+        providers={"coingecko": StubCryptoProvider()},
+        route_by_asset_class={AssetClass.CRYPTO: "coingecko"},
+        fallback_provider_names=[],
+        crypto_quote_feed=quote_feed,
+    )
+
+    quote = composite.get_latest_quote("BTC/USD", AssetClass.CRYPTO)
+    normalized = composite.get_normalized_snapshot("BTC/USD", AssetClass.CRYPTO)
+    batch = composite.batch_snapshot(["BTC/USD"], AssetClass.CRYPTO)
+
+    assert quote.bid_price == 64000.0
+    assert quote.ask_price == 64010.0
+    assert normalized.quote_available is True
+    assert normalized.bid_price == 64000.0
+    assert normalized.ask_price == 64010.0
+    assert normalized.last_trade_price == 63990.0
+    assert normalized.source == "coingecko+alpaca_ws"
+    assert batch["BTC/USD"]["quote"]["bid_price"] == 64000.0
+    assert batch["BTC/USD"]["normalized"]["quote_available"] is True
+    assert quote_feed.subscriptions
+    assert all("BTC/USD" in symbols for symbols in quote_feed.subscriptions)
+
+
+def test_composite_provider_preserves_crypto_fallback_without_live_quote() -> None:
+    settings = Settings(_env_file=None, broker_mode="mock", trading_enabled=False)
+
+    class StubCryptoProvider:
+        provider_name = "coingecko"
+
+        def get_latest_quote(self, symbol, asset_class=None):
+            return QuoteSnapshot(
+                symbol="BTC/USD",
+                asset_class=AssetClass.CRYPTO,
+                bid_price=60000.0,
+                ask_price=60020.0,
+                timestamp=datetime(2026, 4, 16, 10, 0, tzinfo=timezone.utc),
+            )
+
+        def get_session_status(self, asset_class=None):
+            return MagicMock(session_state=MagicMock(value="always_open"))
+
+    class EmptyQuoteFeed:
+        def subscribe(self, symbols):
+            return list(symbols)
+
+        def get_latest_quote(self, symbol, *, max_age_seconds=None):
+            return None
+
+        def diagnostics(self):
+            return {"enabled": True}
+
+        def close(self):
+            return None
+
+    composite = CompositeMarketDataProvider(
+        settings,
+        providers={"coingecko": StubCryptoProvider()},
+        route_by_asset_class={AssetClass.CRYPTO: "coingecko"},
+        fallback_provider_names=[],
+        crypto_quote_feed=EmptyQuoteFeed(),
+    )
+
+    quote = composite.get_latest_quote("BTC/USD", AssetClass.CRYPTO)
+
+    assert quote.bid_price == 60000.0
+    assert quote.ask_price == 60020.0
+
+
 def test_alpaca_429_retry_after_backoff_is_respected() -> None:
     sleeps: list[float] = []
     settings = Settings(

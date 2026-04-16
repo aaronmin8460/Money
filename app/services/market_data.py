@@ -26,6 +26,7 @@ from app.domain.models import (
     TradeSnapshot,
 )
 from app.monitoring.logger import get_logger
+from app.services.ws_feed import AlpacaCryptoQuoteFeed
 from app.utils.datetime_parser import parse_iso_datetime
 
 logger = get_logger("market_data")
@@ -315,6 +316,21 @@ def _build_normalized_snapshot(
         exchange=exchange,
         source=source,
     )
+
+
+def _normalized_snapshot_from_payload(payload: Any) -> NormalizedMarketSnapshot | None:
+    if isinstance(payload, NormalizedMarketSnapshot):
+        return payload
+    if not isinstance(payload, dict):
+        return None
+    normalized_payload = payload.get("normalized") or payload.get("normalized_snapshot")
+    if isinstance(normalized_payload, NormalizedMarketSnapshot):
+        return normalized_payload
+    if isinstance(normalized_payload, dict):
+        return NormalizedMarketSnapshot.from_dict(normalized_payload)
+    if "evaluation_price" in payload or "last_trade_price" in payload:
+        return NormalizedMarketSnapshot.from_dict(payload)
+    return None
 
 
 def _safe_float(value: Any, default: float | None = None) -> float | None:
@@ -2093,11 +2109,13 @@ class CompositeMarketDataProvider:
         providers: dict[str, MarketDataService] | None = None,
         route_by_asset_class: dict[AssetClass, str] | None = None,
         fallback_provider_names: list[str] | None = None,
+        crypto_quote_feed: AlpacaCryptoQuoteFeed | None = None,
     ):
         self.settings = settings or get_settings()
         self.providers: dict[str, MarketDataService] = providers or self._build_default_providers()
         self.route_by_asset_class = route_by_asset_class or self._build_routes()
         self.fallback_provider_names = fallback_provider_names if fallback_provider_names is not None else list(self.settings.market_data_fallback_providers)
+        self.crypto_quote_feed = crypto_quote_feed if crypto_quote_feed is not None else self._build_crypto_quote_feed()
         self._recent_fallback_count = 0
         logger.info(
             "Market data providers selected",
@@ -2107,6 +2125,18 @@ class CompositeMarketDataProvider:
                 "fallbacks": self.fallback_provider_names,
             },
         )
+
+    def _build_crypto_quote_feed(self) -> AlpacaCryptoQuoteFeed | None:
+        if not self.settings.has_alpaca_credentials:
+            return None
+        try:
+            return AlpacaCryptoQuoteFeed(self.settings)
+        except Exception as exc:
+            logger.warning(
+                "Crypto websocket feed unavailable",
+                extra={"provider": self.provider_name, "fallback_provider": "alpaca_ws", "error": str(exc)},
+            )
+            return None
 
     def _build_default_providers(self) -> dict[str, MarketDataService]:
         providers: dict[str, MarketDataService] = {
@@ -2146,6 +2176,81 @@ class CompositeMarketDataProvider:
         if provider is None:
             raise RuntimeError(f"Market data provider '{provider_name}' is not configured.")
         return provider
+
+    def _subscribe_crypto_live_quotes(self, symbols: list[str]) -> None:
+        if self.crypto_quote_feed is None:
+            return
+        try:
+            self.crypto_quote_feed.subscribe(symbols)
+        except Exception as exc:
+            logger.warning(
+                "Crypto websocket subscription failed",
+                extra={"provider": self.provider_name, "fallback_provider": "alpaca_ws", "error": str(exc)},
+            )
+
+    def _live_crypto_quote(self, symbol: str, *, subscribe: bool = True) -> QuoteSnapshot | None:
+        if self.crypto_quote_feed is None:
+            return None
+        resolved_symbol = canonicalize_symbol(symbol, AssetClass.CRYPTO)
+        if subscribe:
+            self._subscribe_crypto_live_quotes([resolved_symbol])
+        try:
+            return self.crypto_quote_feed.get_latest_quote(
+                resolved_symbol,
+                max_age_seconds=self.settings.quote_stale_after_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Crypto websocket quote lookup failed",
+                extra={"provider": self.provider_name, "fallback_provider": "alpaca_ws", "symbol": resolved_symbol, "error": str(exc)},
+            )
+            return None
+
+    def _overlay_live_crypto_quote(
+        self,
+        symbol: str,
+        snapshot: NormalizedMarketSnapshot,
+        live_quote: QuoteSnapshot,
+    ) -> NormalizedMarketSnapshot:
+        resolved_symbol = canonicalize_symbol(symbol, AssetClass.CRYPTO)
+        source = snapshot.source or self._provider_name_for_asset_class(AssetClass.CRYPTO)
+        if "alpaca_ws" not in source:
+            source = f"{source}+alpaca_ws"
+        return _build_normalized_snapshot(
+            symbol=resolved_symbol,
+            asset_class=AssetClass.CRYPTO,
+            session=self.get_session_status(AssetClass.CRYPTO),
+            trade=TradeSnapshot(
+                symbol=resolved_symbol,
+                asset_class=AssetClass.CRYPTO,
+                price=snapshot.last_trade_price,
+                timestamp=snapshot.trade_timestamp,
+            ),
+            quote=live_quote,
+            quote_stale_after_seconds=self.settings.quote_stale_after_seconds,
+            source=source,
+            fallback_price=snapshot.evaluation_price,
+            exchange=snapshot.exchange or "CRYPTO",
+        )
+
+    def _overlay_live_crypto_quote_on_payload(
+        self,
+        symbol: str,
+        payload: dict[str, Any],
+        live_quote: QuoteSnapshot,
+    ) -> dict[str, Any]:
+        normalized = _normalized_snapshot_from_payload(payload)
+        if normalized is None:
+            return payload
+        overlaid = self._overlay_live_crypto_quote(symbol, normalized, live_quote)
+        result = dict(payload)
+        result["symbol"] = overlaid.symbol
+        result["asset_class"] = overlaid.asset_class.value
+        result["quote"] = live_quote.to_dict()
+        result["normalized"] = overlaid.to_dict()
+        source = str(result.get("source") or normalized.source or "")
+        result["source"] = source if "alpaca_ws" in source else (f"{source}+alpaca_ws" if source else overlaid.source)
+        return result
 
     def _fallback_candidates(self, primary_name: str) -> list[tuple[str, MarketDataService]]:
         candidates: list[tuple[str, MarketDataService]] = []
@@ -2208,20 +2313,45 @@ class CompositeMarketDataProvider:
         return self._call("get_bars", asset_class, symbol, asset_class, timeframe, limit, start=start, end=end)
 
     def get_latest_quote(self, symbol: str, asset_class: AssetClass | str) -> QuoteSnapshot:
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        if resolved_asset_class == AssetClass.CRYPTO:
+            live_quote = self._live_crypto_quote(symbol)
+            if live_quote is not None:
+                return live_quote
         return self._call("get_latest_quote", asset_class, symbol, asset_class)
 
     def get_latest_trade(self, symbol: str, asset_class: AssetClass | str) -> TradeSnapshot:
         return self._call("get_latest_trade", asset_class, symbol, asset_class)
 
     def get_snapshot(self, symbol: str, asset_class: AssetClass | str) -> dict[str, Any]:
-        return self._call("get_snapshot", asset_class, symbol, asset_class)
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        if resolved_asset_class != AssetClass.CRYPTO:
+            return self._call("get_snapshot", asset_class, symbol, asset_class)
+        snapshot = self._call("get_snapshot", resolved_asset_class, symbol, resolved_asset_class)
+        live_quote = self._live_crypto_quote(symbol)
+        if live_quote is None or not isinstance(snapshot, dict):
+            return snapshot
+        return self._overlay_live_crypto_quote_on_payload(symbol, snapshot, live_quote)
 
     def get_normalized_snapshot(
         self,
         symbol: str,
         asset_class: AssetClass | str,
     ) -> NormalizedMarketSnapshot:
-        return self._call("get_normalized_snapshot", asset_class, symbol, asset_class)
+        resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.UNKNOWN:
+            resolved_asset_class = infer_asset_class(symbol)
+        snapshot = self._call("get_normalized_snapshot", resolved_asset_class, symbol, resolved_asset_class)
+        if resolved_asset_class != AssetClass.CRYPTO:
+            return snapshot
+        live_quote = self._live_crypto_quote(symbol)
+        if live_quote is None:
+            return snapshot
+        return self._overlay_live_crypto_quote(symbol, snapshot, live_quote)
 
     def batch_snapshot(
         self,
@@ -2229,6 +2359,8 @@ class CompositeMarketDataProvider:
         asset_class: AssetClass | str,
     ) -> dict[str, dict[str, Any]]:
         resolved_asset_class = normalize_asset_class(asset_class)
+        if resolved_asset_class == AssetClass.CRYPTO:
+            self._subscribe_crypto_live_quotes(symbols)
         primary_name = self._provider_name_for_asset_class(resolved_asset_class)
         primary = self._provider_for_asset_class(resolved_asset_class)
         try:
@@ -2244,7 +2376,7 @@ class CompositeMarketDataProvider:
             for symbol in symbols
             if canonicalize_symbol(symbol, resolved_asset_class) not in results
         ]
-        if not missing_symbols and primary_error is None:
+        if not missing_symbols and primary_error is None and resolved_asset_class != AssetClass.CRYPTO:
             return results
 
         for fallback_name, fallback in self._fallback_candidates(primary_name):
@@ -2276,6 +2408,20 @@ class CompositeMarketDataProvider:
                 )
         if primary_error is not None and not results:
             raise primary_error
+        if resolved_asset_class == AssetClass.CRYPTO and results:
+            overlaid_results: dict[str, dict[str, Any]] = {}
+            for symbol, payload in results.items():
+                canonical_symbol = canonicalize_symbol(symbol, resolved_asset_class)
+                live_quote = self._live_crypto_quote(canonical_symbol, subscribe=False)
+                if live_quote is not None and isinstance(payload, dict):
+                    overlaid_results[canonical_symbol] = self._overlay_live_crypto_quote_on_payload(
+                        canonical_symbol,
+                        payload,
+                        live_quote,
+                    )
+                else:
+                    overlaid_results[canonical_symbol] = payload
+            return overlaid_results
         return results
 
     def get_session_status(self, asset_class: AssetClass | str) -> MarketSessionStatus:
@@ -2325,9 +2471,12 @@ class CompositeMarketDataProvider:
             "providers": provider_diagnostics,
             "recent_429_count": recent_429_count,
             "recent_fallback_count": self._recent_fallback_count,
+            "crypto_quote_feed": self.crypto_quote_feed.diagnostics() if self.crypto_quote_feed is not None else {"enabled": False},
         }
 
     def close(self) -> None:
+        if self.crypto_quote_feed is not None:
+            self.crypto_quote_feed.close()
         for provider in self.providers.values():
             close = getattr(provider, "close", None)
             if callable(close):
