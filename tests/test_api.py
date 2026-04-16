@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import tempfile
 import uuid
 from fastapi.testclient import TestClient
@@ -82,7 +83,7 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
 
         monkeypatch.setattr(runtime.strategy, "generate_signals", fake_generate_signals)
 
-        run_once_response = client.post("/run-once", json={"symbol": "AAPL"})
+        run_once_response = client.post("/run-once", headers=admin_auth_headers(), json={"symbol": "AAPL"})
         assert run_once_response.status_code == 200
         assert run_once_response.json()["action"] == "submitted"
 
@@ -123,11 +124,26 @@ def test_run_once_persists_paper_state_across_routes(monkeypatch) -> None:
     assert auto_status["tranche_state"][0]["filled_tranche_count"] == 1
 
 
+def test_state_changing_trading_routes_require_admin_auth() -> None:
+    settings_module._settings = build_settings()
+
+    with TestClient(app) as client:
+        run_once_response = client.post("/run-once", json={"symbol": "AAPL"})
+        start_response = client.post("/auto/start")
+        stop_response = client.post("/auto/stop")
+        run_now_response = client.post("/auto/run-now")
+
+    assert run_once_response.status_code in {401, 403}
+    assert start_response.status_code in {401, 403}
+    assert stop_response.status_code in {401, 403}
+    assert run_now_response.status_code in {401, 403}
+
+
 def test_run_once_requires_explicit_symbol() -> None:
     settings_module._settings = build_settings(trading_enabled=True)
 
     with TestClient(app) as client:
-        response = client.post("/run-once", json={})
+        response = client.post("/run-once", headers=admin_auth_headers(), json={})
 
     assert response.status_code == 400
     assert "symbol is required" in response.json()["detail"].lower()
@@ -137,8 +153,8 @@ def test_auto_trade_enabled_starts_on_startup() -> None:
     settings_module._settings = build_settings(auto_trade_enabled=True, scan_interval_seconds=5)
     with TestClient(app) as client:
         status_response = client.get("/auto/status")
-        start_response = client.post("/auto/start")
-        stop_response = client.post("/auto/stop")
+        start_response = client.post("/auto/start", headers=admin_auth_headers())
+        stop_response = client.post("/auto/stop", headers=admin_auth_headers())
 
     assert status_response.status_code == 200
     assert status_response.json()["running"] is True
@@ -386,6 +402,76 @@ def test_diagnostics_endpoints_return_expected_fields() -> None:
     assert isinstance(tranche_data["tranche_state"], list)
 
 
+def test_ml_feature_diagnostics_endpoint_returns_cached_artifact(tmp_path) -> None:
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+    features = [{"feature": f"feature_{index}", "importance": float(30 - index)} for index in range(25)]
+    (model_dir / "shap_values.json").write_text(
+        json.dumps(
+            {
+                "status": "available",
+                "generated_at": "2026-04-15T00:00:00Z",
+                "source": "shap_mean_abs",
+                "models": {
+                    "entry": {
+                        "status": "available",
+                        "purpose": "entry",
+                        "model_type": "logistic_regression",
+                        "feature_version": "v1",
+                        "generated_at": "2026-04-15T00:00:00Z",
+                        "source": "shap_mean_abs",
+                        "train_rows": 120,
+                        "sample_rows": 50,
+                        "top_features": features,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings_module._settings = build_settings(
+        model_dir=str(model_dir),
+        ml_registry_path=str(model_dir / "registry.json"),
+        ml_entry_current_model_path=str(model_dir / "current_model.joblib"),
+        ml_entry_candidate_model_path=str(model_dir / "candidate_model.joblib"),
+        ml_exit_current_model_path=str(model_dir / "current_exit_model.joblib"),
+        ml_exit_candidate_model_path=str(model_dir / "candidate_exit_model.joblib"),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/diagnostics/ml/features", headers=admin_auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "available"
+    assert payload["source"] == "shap_mean_abs"
+    assert len(payload["top_features"]) == 20
+    assert payload["top_features"][0] == {"feature": "feature_0", "importance": 30.0}
+    assert payload["models"]["entry"]["model_type"] == "logistic_regression"
+
+
+def test_ml_feature_diagnostics_endpoint_handles_missing_artifact(tmp_path) -> None:
+    model_dir = tmp_path / "models"
+    settings_module._settings = build_settings(
+        model_dir=str(model_dir),
+        ml_registry_path=str(model_dir / "registry.json"),
+        ml_entry_current_model_path=str(model_dir / "current_model.joblib"),
+        ml_entry_candidate_model_path=str(model_dir / "candidate_model.joblib"),
+        ml_exit_current_model_path=str(model_dir / "current_exit_model.joblib"),
+        ml_exit_candidate_model_path=str(model_dir / "candidate_exit_model.joblib"),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/diagnostics/ml/features", headers=admin_auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "unavailable"
+    assert "artifact not found" in payload["reason"].lower()
+    assert payload["models"] == {}
+    assert payload["top_features"] == []
+
+
 def test_crypto_only_diagnostics_report_crypto_runtime_focus() -> None:
     settings_module._settings = build_settings(
         crypto_only_mode=True,
@@ -478,7 +564,7 @@ def test_runtime_halt_blocks_new_entries_but_allows_exits_end_to_end(monkeypatch
             ]
 
         monkeypatch.setattr(runtime.strategy, "generate_signals", buy_signal)
-        blocked_response = client.post("/run-once", json={"symbol": "AAPL"})
+        blocked_response = client.post("/run-once", headers=headers, json={"symbol": "AAPL"})
         blocked_payload = blocked_response.json()
         assert blocked_response.status_code == 200
         assert blocked_payload["action"] == "rejected"
@@ -515,7 +601,7 @@ def test_runtime_halt_blocks_new_entries_but_allows_exits_end_to_end(monkeypatch
             ]
 
         monkeypatch.setattr(runtime.strategy, "generate_signals", sell_signal)
-        exit_response = client.post("/run-once", json={"symbol": "AAPL"})
+        exit_response = client.post("/run-once", headers=headers, json={"symbol": "AAPL"})
         exit_payload = exit_response.json()
 
     assert exit_response.status_code == 200

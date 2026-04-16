@@ -13,6 +13,8 @@ python-dotenv
 pytest
 pytz
 scikit-learn
+shap
+lightgbm
 joblib
 feedparser
 openai

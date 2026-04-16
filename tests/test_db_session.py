@@ -7,7 +7,10 @@ from app.db import session as db_session_module
 def test_sqlite_engine_options_apply_sqlite_only_flags() -> None:
     options = db_session_module.build_engine_options("sqlite:///./trading.db")
 
-    assert options["connect_args"] == {"check_same_thread": False}
+    assert options["connect_args"] == {
+        "check_same_thread": False,
+        "timeout": 15,
+    }
     assert "pool_pre_ping" not in options
 
 
@@ -39,6 +42,21 @@ def test_check_database_connection_succeeds_for_sqlite_file(tmp_path) -> None:
     database_url = f"sqlite:///{tmp_path / 'readiness.db'}"
 
     assert db_session_module.check_database_connection(database_url=database_url) is True
+
+
+def test_sqlite_engine_initializes_wal_mode(tmp_path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'wal.db'}"
+    engine = db_session_module.create_db_engine(database_url)
+
+    try:
+        with engine.connect() as connection:
+            journal_mode = connection.exec_driver_sql("PRAGMA journal_mode").scalar_one()
+            synchronous = connection.exec_driver_sql("PRAGMA synchronous").scalar_one()
+    finally:
+        engine.dispose()
+
+    assert journal_mode == "wal"
+    assert synchronous == 1
 
 
 def test_check_database_connection_fails_for_missing_sqlite_directory(tmp_path) -> None:

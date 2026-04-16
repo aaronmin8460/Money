@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Request, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 
+from app.api.admin_auth import require_admin_auth
 from app.api.rate_limit import rate_limit_admin, rate_limit_default, rate_limit_signals
 from app.api.schemas import (
     AccountSummary,
@@ -106,7 +107,7 @@ def risk(request: Request, response: Response) -> dict[str, Any]:
     return runtime.risk_manager.get_runtime_snapshot()
 
 
-@router.post("/run-once", response_model=RunOnceResult)
+@router.post("/run-once", response_model=RunOnceResult, dependencies=[Depends(require_admin_auth)])
 @rate_limit_admin()
 def run_once(request: Request, response: Response, payload: RunOnceRequest = Body(default=RunOnceRequest())) -> dict[str, Any]:
     runtime = get_runtime()
@@ -163,7 +164,7 @@ def auto_status(request: Request, response: Response) -> dict[str, Any]:
     return trader.get_status()
 
 
-@router.post("/auto/start")
+@router.post("/auto/start", dependencies=[Depends(require_admin_auth)])
 @rate_limit_admin()
 def auto_start(request: Request, response: Response) -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
@@ -172,7 +173,7 @@ def auto_start(request: Request, response: Response) -> dict[str, str]:
     return {"message": "Auto-trader is already running"}
 
 
-@router.post("/auto/stop")
+@router.post("/auto/stop", dependencies=[Depends(require_admin_auth)])
 @rate_limit_admin()
 def auto_stop(request: Request, response: Response) -> dict[str, str]:
     trader = get_runtime().get_auto_trader()
@@ -181,7 +182,7 @@ def auto_stop(request: Request, response: Response) -> dict[str, str]:
     return {"message": "Auto-trader is not running"}
 
 
-@router.post("/auto/run-now")
+@router.post("/auto/run-now", dependencies=[Depends(require_admin_auth)])
 @rate_limit_admin()
 def auto_run_now(request: Request, response: Response) -> dict[str, Any]:
     trader = get_runtime().get_auto_trader()

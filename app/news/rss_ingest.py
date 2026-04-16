@@ -159,7 +159,10 @@ def _parse_published(value: Any) -> datetime | None:
         try:
             parsed = parsedate_to_datetime(str(value))
         except (TypeError, ValueError, IndexError):
-            return None
+            try:
+                parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
@@ -362,6 +365,8 @@ def fetch_rss_headlines(
 
 def build_configured_news_sources(settings: Settings | None = None) -> list[NewsSourceDefinition]:
     resolved = settings or get_settings()
+    if not resolved.news_rss_enabled:
+        return []
     enabled_ids = set(resolved.news_source_ids)
 
     def _source_enabled(source_id: str, default_group: bool = False) -> bool:
@@ -397,7 +402,7 @@ def build_configured_news_sources(settings: Settings | None = None) -> list[News
                 urls=list(resolved.benzinga_rss_urls),
             )
         )
-    if resolved.sec_rss_enabled and _source_enabled("sec"):
+    if resolved.sec_rss_enabled and resolved.sec_rss_urls and _source_enabled("sec"):
         sources.append(
             NewsSourceDefinition(
                 source_id="sec",

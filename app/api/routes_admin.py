@@ -11,11 +11,13 @@ from app.api.schemas import ResetLocalStateRequest, RuntimeSafetyActionRequest, 
 from app.config.settings import get_settings
 from app.db.session import check_database_connection
 from app.domain.models import AssetClass
+from app.ml.diagnostics import load_feature_importance_diagnostics
 from app.monitoring.discord_notifier import get_discord_notifier
 from app.monitoring.logger import get_logger
 from app.risk.risk_manager import RiskDecision
 from app.services.broker import OrderRequest
 from app.services.local_state_reset import LocalStateResetOptions, reset_local_state
+from app.services.performance import calculate_performance_summary
 from app.services.runtime import get_runtime, probe_runtime
 from app.strategies.base import Signal, TradeSignal
 
@@ -446,6 +448,19 @@ def diagnostics_portfolio(request: Request, response: Response) -> dict[str, Any
         "broker_positions": broker_positions,
         "tranche_state": runtime.tranche_state.snapshot(),
     }
+
+
+@protected_router.get("/diagnostics/performance")
+@rate_limit_admin()
+def diagnostics_performance(request: Request, response: Response) -> dict[str, Any]:
+    return calculate_performance_summary()
+
+
+@protected_router.get("/diagnostics/ml/features")
+@rate_limit_admin()
+def diagnostics_ml_features(request: Request, response: Response) -> dict[str, Any]:
+    runtime = get_runtime()
+    return load_feature_importance_diagnostics(runtime.settings)
 
 
 @protected_router.get("/diagnostics/tranches")

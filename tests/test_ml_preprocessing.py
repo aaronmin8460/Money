@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import math
+import sys
+import types
 from pathlib import Path
+
+from sklearn.base import BaseEstimator, ClassifierMixin
 
 from app.config.settings import Settings
 from app.domain.models import AssetClass
 from app.ml.evaluation import predict_scores, promotion_thresholds_pass, walk_forward_split
 from app.ml.features import build_signal_feature_row
 from app.ml.inference import SignalScorer
+from app.ml.model_selection import ProbabilityAveragingEnsemble
 from app.ml.registry import load_registry, update_candidate
 from app.ml.training import load_model_bundle, save_model_bundle, train_model
 from app.monitoring.outcome_logger import derive_bootstrap_label
@@ -82,6 +88,71 @@ def _training_rows() -> list[dict[str, object]]:
     ] * 30
 
 
+class _ConstantProbabilityEstimator(ClassifierMixin, BaseEstimator):
+    def __init__(self, probability: float = 0.5):
+        self.probability = probability
+
+    def fit(self, frame: object, labels: list[int]) -> "_ConstantProbabilityEstimator":
+        self.classes_ = [0, 1]
+        return self
+
+    def predict_proba(self, frame: object) -> list[list[float]]:
+        shape = getattr(frame, "shape", None)
+        row_count = int(shape[0]) if shape is not None else len(frame)
+        return [[1.0 - self.probability, self.probability] for _ in range(row_count)]
+
+
+class _FakeXGBClassifier(_ConstantProbabilityEstimator):
+    def __init__(
+        self,
+        n_estimators: int = 50,
+        max_depth: int = 3,
+        learning_rate: float = 0.1,
+        subsample: float = 0.9,
+        colsample_bytree: float = 0.9,
+        eval_metric: str | None = None,
+        random_state: int | None = None,
+    ):
+        super().__init__(probability=0.8)
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.eval_metric = eval_metric
+        self.random_state = random_state
+
+
+class _FakeLightGBMClassifier(_ConstantProbabilityEstimator):
+    def __init__(
+        self,
+        n_estimators: int = 50,
+        max_depth: int = 3,
+        learning_rate: float = 0.1,
+        subsample: float = 0.9,
+        colsample_bytree: float = 0.9,
+        random_state: int | None = None,
+        verbosity: int = -1,
+    ):
+        super().__init__(probability=0.2)
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.learning_rate = learning_rate
+        self.subsample = subsample
+        self.colsample_bytree = colsample_bytree
+        self.random_state = random_state
+        self.verbosity = verbosity
+
+
+def _install_fake_boosted_model_modules(monkeypatch) -> None:
+    xgboost_module = types.ModuleType("xgboost")
+    xgboost_module.XGBClassifier = _FakeXGBClassifier
+    lightgbm_module = types.ModuleType("lightgbm")
+    lightgbm_module.LGBMClassifier = _FakeLightGBMClassifier
+    monkeypatch.setitem(sys.modules, "xgboost", xgboost_module)
+    monkeypatch.setitem(sys.modules, "lightgbm", lightgbm_module)
+
+
 def test_training_handles_none_and_nan_optional_numeric_features() -> None:
     rows = _training_rows()
     rows[0]["atr"] = None
@@ -93,6 +164,46 @@ def test_training_handles_none_and_nan_optional_numeric_features() -> None:
 
     assert result["trained"] is True
     assert result["bundle"] is not None
+
+
+def test_training_selects_lightgbm_when_available(monkeypatch) -> None:
+    _install_fake_boosted_model_modules(monkeypatch)
+
+    result = train_model(_training_rows(), model_type="lightgbm", min_train_rows=10)
+
+    assert result["trained"] is True
+    assert result["bundle"]["model_type"] == "lightgbm"
+    assert isinstance(result["bundle"]["model"].named_steps["model"], _FakeLightGBMClassifier)
+
+
+def test_training_selects_ensemble_and_records_components(monkeypatch) -> None:
+    _install_fake_boosted_model_modules(monkeypatch)
+
+    result = train_model(_training_rows(), model_type="ensemble", min_train_rows=10)
+
+    assert result["trained"] is True
+    assert result["bundle"]["model_type"] == "ensemble"
+    assert result["bundle"]["component_model_types"] == ["logistic_regression", "xgboost", "lightgbm"]
+    ensemble = result["bundle"]["model"].named_steps["model"]
+    assert isinstance(ensemble, ProbabilityAveragingEnsemble)
+    assert ensemble.component_model_types == ["logistic_regression", "xgboost", "lightgbm"]
+
+
+def test_probability_averaging_ensemble_averages_component_probabilities() -> None:
+    ensemble = ProbabilityAveragingEnsemble(
+        [
+            ("logistic_regression", _ConstantProbabilityEstimator(0.2)),
+            ("xgboost", _ConstantProbabilityEstimator(0.5)),
+            ("lightgbm", _ConstantProbabilityEstimator(0.8)),
+        ]
+    )
+    ensemble.fit([[0.0], [1.0]], [0, 1])
+
+    scores = ensemble.predict_proba([[0.0], [1.0]])
+
+    assert len(scores) == 2
+    assert math.isclose(float(scores[0][1]), 0.5)
+    assert math.isclose(float(scores[1][1]), 0.5)
 
 
 def test_inference_handles_none_and_nan_optional_numeric_features() -> None:
@@ -381,6 +492,36 @@ def test_model_bundle_save_and_load_preserves_missing_value_safe_scoring(tmp_pat
 
     assert len(scores) == 1
     assert math.isfinite(scores[0])
+
+
+def test_training_save_writes_compact_shap_feature_artifact(monkeypatch, tmp_path: Path) -> None:
+    class FakeLinearExplainer:
+        def __init__(self, estimator: object, background: object) -> None:
+            self.estimator = estimator
+            self.background = background
+
+        def shap_values(self, sample: object) -> list[list[float]]:
+            shape = getattr(sample, "shape")
+            row_count = int(shape[0])
+            column_count = int(shape[1])
+            return [[float(index + 1) for index in range(column_count)] for _ in range(row_count)]
+
+    fake_shap_module = types.ModuleType("shap")
+    fake_shap_module.LinearExplainer = FakeLinearExplainer
+    monkeypatch.setitem(sys.modules, "shap", fake_shap_module)
+
+    result = train_model(_training_rows(), model_type="logistic_regression", min_train_rows=10)
+    assert result["trained"] is True
+    assert result["bundle"]["feature_importance"]["status"] == "available"
+
+    bundle_path = tmp_path / "candidate_model.joblib"
+    save_model_bundle(result["bundle"], bundle_path)
+
+    artifact_payload = json.loads((tmp_path / "shap_values.json").read_text(encoding="utf-8"))
+    entry_payload = artifact_payload["models"]["entry"]
+    assert artifact_payload["status"] == "available"
+    assert entry_payload["source"] == "shap_mean_abs"
+    assert 0 < len(entry_payload["top_features"]) <= 20
 
 
 def test_entry_and_exit_model_loading_paths_are_independent(tmp_path: Path) -> None:

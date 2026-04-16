@@ -59,7 +59,7 @@ Required for most local and paper deployments:
 - `BROKER_MODE`
 - `DATABASE_URL`
 - `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` when `BROKER_MODE=paper`
-- `API_ADMIN_TOKEN` for any environment where protected admin or diagnostics routes should be reachable
+- `API_ADMIN_TOKEN` for any environment where protected write, admin, or diagnostics routes should be reachable
 - `MARKET_DATA_PROVIDER_DEFAULT=composite` for broker-independent market data; see `docs/market_data_providers.md` for routing and cache/rate-limit settings
 
 Required only when the related feature is enabled:
@@ -75,6 +75,12 @@ Database guidance:
 - If you keep SQLite in a containerized deployment, point it at persistent storage such as `sqlite:///./data/trading.db`.
 - Schema changes are managed through Alembic. Use `alembic upgrade head` before startup and `alembic revision --autogenerate -m "..."` for follow-up revisions.
 
+Deprecation notes for overlapping settings:
+
+- Prefer `MAX_POSITION_NOTIONAL`; keep `MAX_NOTIONAL_PER_POSITION` equal until the alias is removed. If they differ, the lower value is used.
+- Keep `MAX_POSITIONS`, `MAX_POSITIONS_TOTAL`, and `MAX_CONCURRENT_POSITIONS` equal. Compatibility rules can lower the effective cap when they differ.
+- Keep `MAX_RISK_PER_TRADE` and `RISK_PER_TRADE_PCT` equal. `RISK_PER_TRADE_PCT` currently wins when it is set away from the default.
+
 ## 6. Local quickstart
 
 ```bash
@@ -89,8 +95,10 @@ Update `.env` with your local values:
 - keep the paper-safe defaults for the first boot
 - add Alpaca paper credentials only in `.env`
 - keep the free market-data defaults unless you intentionally want Alpaca market data
-- set `API_ADMIN_TOKEN` if you want access to `/config`, `/diagnostics/*`, or `/admin/*`
+- set `API_ADMIN_TOKEN` if you want access to protected routes such as `/run-once`, `/auto/run-now`, `/config`, `/diagnostics/*`, or `/admin/*`
 - leave Discord disabled until you intentionally want alerts
+
+Safe first boot keeps `TRADING_ENABLED=false`, `AUTO_TRADE_ENABLED=false`, `LIVE_TRADING_ENABLED=false`, `DISCORD_NOTIFICATIONS_ENABLED=false`, `NEWS_FEATURES_ENABLED=false`, `ML_ENABLED=false`, and `ML_RETRAIN_ENABLED=false`.
 
 Initialize or update the schema after `DATABASE_URL` is set:
 
@@ -106,13 +114,19 @@ source .venv/bin/activate
 python scripts/run_paper_api.py --host 127.0.0.1 --port 8000
 ```
 
-First verification commands:
+First public verification commands:
 
 ```bash
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/health/ready
 curl http://127.0.0.1:8000/auto/status
+```
+
+Protected write check after `API_ADMIN_TOKEN` is set:
+
+```bash
 curl -X POST http://127.0.0.1:8000/run-once \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"symbol":"AAPL","asset_class":"equity"}'
 ```
@@ -425,13 +439,16 @@ Compose files remain in the repository for non-EC2 workflows, but the Phase 4 pa
 
 ## 8. Admin API security expectations
 
-- `/health` remains public for health checks and container probes.
-- `/health/ready` is the public readiness probe and verifies runtime configuration plus database connectivity without placing trades.
-- `/config`, `/diagnostics/*`, `/admin/reset-local-state`, and `/admin/notifications/test` require admin authentication.
-- `/admin/runtime-safety/halt` and `/admin/runtime-safety/resume` are protected admin controls for intentional halt and recovery actions.
+- Protected routes require `API_ADMIN_TOKEN` to be set and a matching request token.
 - Authentication accepts either:
   - `Authorization: Bearer <token>`
   - `X-Admin-Token: <token>`
+- Missing request tokens return `401`; a blank `API_ADMIN_TOKEN` or wrong token returns `403`.
+- Public health probes: `GET /health` and `GET /health/ready`.
+- Public read/status routes: `GET /auto/status`, `GET /broker/*`, `GET /positions`, `GET /orders`, `GET /trades`, `GET /risk`, `GET /strategy/*`, `GET /market/*`, `GET /scanner/*`, `GET /assets`, `GET /assets/search`, `GET /assets/stats`, `GET /assets/{symbol}`, `GET /signals`, and `GET /signals/top`.
+- Current public utility POST routes: `POST /backtest`, `POST /assets/refresh`, and `POST /signals/run`. Do not expose the API broadly if those should be operator-only in your deployment.
+- Protected write/control routes: `POST /run-once`, `POST /auto/start`, `POST /auto/stop`, `POST /auto/run-now`, `POST /admin/reset-local-state`, `POST /admin/runtime-safety/halt`, `POST /admin/runtime-safety/resume`, and `POST /admin/notifications/test`.
+- Protected read routes: `GET /config` and `GET /diagnostics/*`.
 - `API_ADMIN_TOKEN` should be treated as required in any shared, remote, staging, or production environment.
 - `/admin/notifications/test` remains development-only even when the request is authenticated.
 
@@ -494,8 +511,10 @@ curl http://127.0.0.1:8000/diagnostics/reconciliation \
   -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 curl http://127.0.0.1:8000/config \
   -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
-curl -X POST http://127.0.0.1:8000/auto/run-now
+curl -X POST http://127.0.0.1:8000/auto/run-now \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}"
 curl -X POST http://127.0.0.1:8000/run-once \
+  -H "Authorization: Bearer ${API_ADMIN_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"symbol":"AAPL","asset_class":"equity"}'
 ```

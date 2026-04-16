@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Annotated, Any, List
 
 from pydantic import AnyHttpUrl, Field, ValidationInfo, field_validator, model_validator
@@ -15,6 +16,10 @@ from app.config.trading_profile import (
 )
 from app.domain.models import AssetClass
 
+
+logger = logging.getLogger("app.config.settings")
+
+ML_MODEL_TYPES = ("logistic_regression", "xgboost", "lightgbm", "ensemble")
 
 DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
     AssetClass.EQUITY.value: "15Min",
@@ -705,6 +710,8 @@ class Settings(BaseSettings):
 
     @property
     def enabled_news_sources(self) -> list[str]:
+        if not self.news_rss_enabled:
+            return []
         active_sources: list[str] = []
         if self.reuters_rss_urls:
             active_sources.append("reuters")
@@ -712,7 +719,7 @@ class Settings(BaseSettings):
             active_sources.append("marketwatch")
         if self.benzinga_rss_enabled and self.benzinga_rss_urls:
             active_sources.append("benzinga")
-        if self.sec_rss_enabled:
+        if self.sec_rss_enabled and self.sec_rss_urls:
             active_sources.append("sec")
         if self.news_source_ids:
             active_set = set(self.news_source_ids)
@@ -1041,8 +1048,8 @@ class Settings(BaseSettings):
             raise ValueError("SCALE_IN_MODE must be one of: confirmation, time, momentum.")
         self.log_level = self.log_level.strip().upper()
         self.ml_model_type = self.ml_model_type.strip().lower()
-        if self.ml_model_type not in {"logistic_regression", "xgboost"}:
-            raise ValueError("ML_MODEL_TYPE must be one of: logistic_regression, xgboost.")
+        if self.ml_model_type not in ML_MODEL_TYPES:
+            raise ValueError(f"ML_MODEL_TYPE must be one of: {', '.join(ML_MODEL_TYPES)}.")
         if not 0 <= self.ml_min_score_threshold <= 1:
             raise ValueError("ML_MIN_SCORE_THRESHOLD must be between 0 and 1.")
         if not 0 <= self.ml_exit_min_score <= 1:
@@ -1061,6 +1068,20 @@ class Settings(BaseSettings):
             raise ValueError("ML_PROMOTION_MIN_PROFIT_FACTOR must be >= 0.")
         if not 0 <= self.ml_promotion_max_drawdown <= 1:
             raise ValueError("ML_PROMOTION_MAX_DRAWDOWN must be between 0 and 1.")
+        if not self.ml_enabled:
+            overridden_model_flags = []
+            if self.entry_model_enabled:
+                overridden_model_flags.append("ENTRY_MODEL_ENABLED")
+            if self.exit_model_enabled:
+                overridden_model_flags.append("EXIT_MODEL_ENABLED")
+            if overridden_model_flags:
+                logger.warning(
+                    "ML_ENABLED=false; overriding %s to false because ML is disabled. "
+                    "Set ML_ENABLED=true before enabling model-specific entry or exit gates.",
+                    ", ".join(overridden_model_flags),
+                )
+            self.entry_model_enabled = False
+            self.exit_model_enabled = False
         if self.news_max_headlines_per_ticker < 1:
             raise ValueError("NEWS_MAX_HEADLINES_PER_TICKER must be >= 1.")
         if self.news_lookback_hours < 1:
@@ -1075,6 +1096,13 @@ class Settings(BaseSettings):
             raise ValueError("NEWS_DEDUPE_WINDOW_MINUTES must be >= 0.")
         if self.sec_company_tickers_cache_ttl_hours < 0:
             raise ValueError("SEC_COMPANY_TICKERS_CACHE_TTL_HOURS must be >= 0.")
+        if not self.news_rss_enabled:
+            if self.news_llm_enabled:
+                logger.warning(
+                    "NEWS_RSS_ENABLED=false; overriding NEWS_LLM_ENABLED=false because "
+                    "RSS/news ingestion is disabled. Enable NEWS_RSS_ENABLED before NEWS_LLM_ENABLED.",
+                )
+            self.news_llm_enabled = False
         if self.min_bars_between_tranches < 0:
             raise ValueError("MIN_BARS_BETWEEN_TRANCHES must be >= 0.")
         if self.minutes_between_tranches < 0:
@@ -1126,8 +1154,30 @@ class Settings(BaseSettings):
             )
         if self.max_notional_per_position != self.max_position_notional:
             resolved_notional_cap = min(self.max_notional_per_position, self.max_position_notional)
+            logger.warning(
+                "Deprecated overlapping notional caps are inconsistent: "
+                "MAX_POSITION_NOTIONAL=%s, MAX_NOTIONAL_PER_POSITION=%s. "
+                "Normalizing both to %s, the lower cap, to preserve safety. "
+                "Prefer MAX_POSITION_NOTIONAL and keep MAX_NOTIONAL_PER_POSITION aligned until the alias is removed.",
+                self.max_position_notional,
+                self.max_notional_per_position,
+                resolved_notional_cap,
+            )
             self.max_notional_per_position = resolved_notional_cap
             self.max_position_notional = resolved_notional_cap
+        if len({self.max_positions, self.max_positions_total, self.max_concurrent_positions}) > 1:
+            resolved_positions_cap = min(self.max_concurrent_positions, self.max_positions_total)
+            logger.warning(
+                "Deprecated overlapping max-position settings are inconsistent: "
+                "MAX_POSITIONS=%s, MAX_POSITIONS_TOTAL=%s, MAX_CONCURRENT_POSITIONS=%s. "
+                "Normalizing all three to %s using current compatibility rules "
+                "(MAX_POSITIONS_TOTAL overrides MAX_POSITIONS; MAX_CONCURRENT_POSITIONS can lower the effective cap). "
+                "Keep these values aligned until legacy aliases are removed.",
+                self.max_positions,
+                self.max_positions_total,
+                self.max_concurrent_positions,
+                resolved_positions_cap,
+            )
         if self.max_positions_total != self.max_positions:
             self.max_positions = self.max_positions_total
         if self.max_concurrent_positions != self.max_positions_total:

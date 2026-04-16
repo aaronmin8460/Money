@@ -10,7 +10,13 @@ import scripts.fetch_news_features as fetch_news_features_script
 from app.config.settings import Settings
 from app.news.feature_store import NewsFeatureStore
 from app.news.llm_analysis import analyze_headlines
-from app.news.rss_ingest import NewsFetchResult, NewsHeadline, NewsSourceDefinition, fetch_configured_headlines
+from app.news.rss_ingest import (
+    NewsFetchResult,
+    NewsHeadline,
+    NewsSourceDefinition,
+    build_configured_news_sources,
+    fetch_configured_headlines,
+)
 from app.news.ticker_mapper import SECCompanyTickerResolver, map_headline_to_symbols
 
 
@@ -54,6 +60,86 @@ def _rss_fixture(*, title: str, description: str, link: str, published_at: str, 
   </channel>
 </rss>
 """
+
+
+def _atom_fixture(*, title: str, summary: str, link: str, updated_at: str, feed_title: str, author: str | None = None) -> str:
+    author_block = f"<author><name>{author}</name></author>" if author else ""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>{feed_title}</title>
+  <entry>
+    <title>{title}</title>
+    <summary>{summary}</summary>
+    <link href="{link}" />
+    <id>{link}</id>
+    <updated>{updated_at}</updated>
+    {author_block}
+  </entry>
+</feed>
+"""
+
+
+def test_build_configured_news_sources_includes_enabled_benzinga_and_sec(tmp_path) -> None:
+    settings = _build_settings(
+        tmp_path,
+        reuters_rss_urls=[],
+        marketwatch_rss_urls=[],
+        benzinga_rss_enabled=True,
+        benzinga_rss_urls=["https://fixtures.local/benzinga.xml"],
+        sec_rss_enabled=True,
+        sec_rss_urls=["https://fixtures.local/sec.atom"],
+        sec_user_agent="MoneyBot/1.0 ops@example.com",
+    )
+
+    sources = build_configured_news_sources(settings)
+
+    assert settings.enabled_news_sources == ["benzinga", "sec"]
+    assert [source.source_id for source in sources] == ["benzinga", "sec"]
+    assert [source.source_type for source in sources] == ["benzinga", "sec"]
+    assert sources[1].user_agent == "MoneyBot/1.0 ops@example.com"
+
+
+def test_build_configured_news_sources_respects_news_rss_and_source_flags(tmp_path) -> None:
+    rss_disabled = _build_settings(
+        tmp_path,
+        news_rss_enabled=False,
+        reuters_rss_urls=[],
+        marketwatch_rss_urls=[],
+        benzinga_rss_enabled=True,
+        benzinga_rss_urls=["https://fixtures.local/benzinga.xml"],
+        sec_rss_enabled=True,
+        sec_rss_urls=["https://fixtures.local/sec.atom"],
+    )
+    source_disabled = _build_settings(
+        tmp_path,
+        reuters_rss_urls=[],
+        marketwatch_rss_urls=[],
+        benzinga_rss_enabled=False,
+        benzinga_rss_urls=["https://fixtures.local/benzinga.xml"],
+        sec_rss_enabled=True,
+        sec_rss_urls=[],
+    )
+
+    assert rss_disabled.enabled_news_sources == []
+    assert build_configured_news_sources(rss_disabled) == []
+    assert source_disabled.enabled_news_sources == []
+    assert build_configured_news_sources(source_disabled) == []
+
+
+def test_news_source_ids_select_benzinga_and_sec_only(tmp_path) -> None:
+    settings = _build_settings(
+        tmp_path,
+        news_source_ids=["benzinga", "sec"],
+        reuters_rss_urls=["https://fixtures.local/reuters.xml"],
+        marketwatch_rss_urls=["https://fixtures.local/marketwatch.xml"],
+        benzinga_rss_enabled=True,
+        benzinga_rss_urls=["https://fixtures.local/benzinga.xml"],
+        sec_rss_enabled=True,
+        sec_rss_urls=["https://fixtures.local/sec.atom"],
+    )
+
+    assert settings.enabled_news_sources == ["benzinga", "sec"]
+    assert [source.source_id for source in build_configured_news_sources(settings)] == ["benzinga", "sec"]
 
 
 def test_benzinga_rss_fixture_parses_with_source_attribution(tmp_path) -> None:
@@ -201,6 +287,53 @@ def test_sec_rss_fixture_parses_structured_metadata(tmp_path) -> None:
     assert item.raw_metadata["company_name"] == "Example Corp"
     assert item.raw_metadata["cik"] == "1234567"
     assert item.raw_metadata["accession"] == "0001234567-26-000001"
+    assert item.raw_metadata["filing_date"] is not None
+
+
+def test_sec_atom_fetch_uses_configured_user_agent_and_metadata(tmp_path) -> None:
+    updated_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat().replace("+00:00", "Z")
+    sec_url = "https://fixtures.local/sec.atom"
+    user_agents: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        user_agents.append(request.headers.get("User-Agent"))
+        return httpx.Response(
+            200,
+            text=_atom_fixture(
+                title="10-Q - Example Corp",
+                summary="Quarterly report filing from Example Corp.",
+                link=(
+                    "https://www.sec.gov/Archives/edgar/data/1234567/"
+                    "0001234567-26-000010/example-10q.htm?accession_number=0001234567-26-000010"
+                ),
+                updated_at=updated_at,
+                feed_title="SEC EDGAR Filings",
+                author="Example Corp",
+            ),
+            headers={"Content-Type": "application/atom+xml"},
+        )
+
+    settings = _build_settings(
+        tmp_path,
+        news_source_ids=["sec"],
+        reuters_rss_urls=[],
+        marketwatch_rss_urls=[],
+        sec_rss_enabled=True,
+        sec_rss_urls=[sec_url],
+        sec_user_agent="MoneyBot/1.0 ops@example.com",
+        news_fetch_retry_count=0,
+    )
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        result = fetch_configured_headlines(settings=settings, client=client)
+
+    assert user_agents == ["MoneyBot/1.0 ops@example.com"]
+    assert result.total_fetched == 1
+    assert result.source_health["sec"]["success_count"] == 1
+    item = result.deduped_items[0]
+    assert item.source_id == "sec"
+    assert item.source_type == "sec"
+    assert item.raw_metadata["form_type"] == "10-Q"
+    assert item.raw_metadata["company_name"] == "Example Corp"
     assert item.raw_metadata["filing_date"] is not None
 
 

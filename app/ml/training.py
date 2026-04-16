@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Any
 
 from app.ml.evaluation import calibrate_threshold, evaluate_rows, walk_forward_split
+from app.ml.diagnostics import build_shap_feature_importance, save_feature_importance_artifact
 from app.ml.features import CATEGORICAL_FEATURES, NUMERIC_FEATURES, feature_dict
+from app.ml.model_selection import build_model_estimator
 from app.ml.preprocessing import prepare_feature_frame
 from app.ml.schema import FEATURE_VERSION
 
@@ -21,9 +23,14 @@ def save_model_bundle(bundle: dict[str, Any], path: str | Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if joblib is not None:
         joblib.dump(bundle, target)
-        return
-    with target.open("wb") as handle:
-        pickle.dump(bundle, handle)
+    else:
+        with target.open("wb") as handle:
+            pickle.dump(bundle, handle)
+    try:
+        save_feature_importance_artifact(bundle, target)
+    except Exception:
+        # Diagnostics artifacts should not block model persistence.
+        pass
 
 
 def load_model_bundle(path: str | Path) -> dict[str, Any]:
@@ -105,26 +112,7 @@ def train_model(
             "bundle": None,
         }
 
-    selected_type = model_type
-    estimator: Any
-    if model_type == "xgboost":
-        try:
-            from xgboost import XGBClassifier
-
-            estimator = XGBClassifier(
-                n_estimators=50,
-                max_depth=3,
-                learning_rate=0.1,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                eval_metric="logloss",
-                random_state=42,
-            )
-        except Exception:
-            selected_type = "logistic_regression"
-            estimator = LogisticRegression(max_iter=500, class_weight="balanced")
-    else:
-        estimator = LogisticRegression(max_iter=500, class_weight="balanced")
+    estimator, selected_type, component_model_types = build_model_estimator(model_type, LogisticRegression)
 
     train_rows, validation_rows = _split_rows(labeled_rows, walk_forward_enabled=walk_forward_enabled)
     train_frame = prepare_feature_frame(train_rows).frame
@@ -188,6 +176,17 @@ def train_model(
         "threshold": threshold,
         "metrics": metrics,
     }
+    if component_model_types:
+        bundle["component_model_types"] = component_model_types
+    bundle["feature_importance"] = build_shap_feature_importance(
+        model=pipeline,
+        rows=train_rows,
+        model_type=selected_type,
+        purpose=purpose,
+        feature_version=FEATURE_VERSION,
+        categorical_features=list(CATEGORICAL_FEATURES),
+        numeric_features=list(NUMERIC_FEATURES),
+    )
     return {
         "trained": True,
         "reason": None,

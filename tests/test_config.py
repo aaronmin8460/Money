@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -316,6 +317,144 @@ def test_new_ml_and_news_settings_parse_correctly() -> None:
     assert settings.benzinga_rss_urls == ["https://example.com/benzinga.xml"]
     assert settings.sec_company_tickers_cache_ttl_hours == 12
     assert settings.enabled_news_sources == ["reuters", "marketwatch", "benzinga"]
+
+
+@pytest.mark.parametrize(
+    ("raw_model_type", "expected_model_type"),
+    [
+        ("logistic_regression", "logistic_regression"),
+        ("xgboost", "xgboost"),
+        (" lightgbm ", "lightgbm"),
+        ("ENSEMBLE", "ensemble"),
+    ],
+)
+def test_ml_model_type_accepts_supported_values(raw_model_type: str, expected_model_type: str) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            entry_model_enabled=False,
+            news_llm_enabled=False,
+            ml_model_type=raw_model_type,
+        )
+
+    assert settings.ml_model_type == expected_model_type
+
+
+def test_ml_model_type_rejects_unsupported_value() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        with pytest.raises(ValueError, match="logistic_regression, xgboost, lightgbm, ensemble"):
+            Settings(
+                _env_file=None,
+                broker_mode="mock",
+                trading_enabled=False,
+                entry_model_enabled=False,
+                news_llm_enabled=False,
+                ml_model_type="random_forest",
+            )
+
+
+def test_ml_disabled_forces_entry_model_disabled(caplog: pytest.LogCaptureFixture) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        caplog.set_level(logging.WARNING, logger="app.config.settings")
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=False,
+            entry_model_enabled=True,
+            exit_model_enabled=False,
+            news_llm_enabled=False,
+        )
+
+    assert settings.entry_model_enabled is False
+    assert settings.exit_model_enabled is False
+    assert "ML_ENABLED=false" in caplog.text
+    assert "ENTRY_MODEL_ENABLED" in caplog.text
+
+
+def test_ml_disabled_forces_exit_model_disabled(caplog: pytest.LogCaptureFixture) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        caplog.set_level(logging.WARNING, logger="app.config.settings")
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            ml_enabled=False,
+            entry_model_enabled=False,
+            exit_model_enabled=True,
+            news_llm_enabled=False,
+        )
+
+    assert settings.entry_model_enabled is False
+    assert settings.exit_model_enabled is False
+    assert "ML_ENABLED=false" in caplog.text
+    assert "EXIT_MODEL_ENABLED" in caplog.text
+
+
+def test_news_rss_disabled_forces_news_llm_disabled(caplog: pytest.LogCaptureFixture) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        caplog.set_level(logging.WARNING, logger="app.config.settings")
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            entry_model_enabled=False,
+            news_rss_enabled=False,
+            news_llm_enabled=True,
+        )
+
+    assert settings.news_llm_enabled is False
+    assert "NEWS_RSS_ENABLED=false" in caplog.text
+    assert "NEWS_LLM_ENABLED=false" in caplog.text
+
+
+def test_duplicate_max_position_settings_warn_and_remain_normalized(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        caplog.set_level(logging.WARNING, logger="app.config.settings")
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            entry_model_enabled=False,
+            news_llm_enabled=False,
+            max_positions=2,
+            max_positions_total=5,
+            max_concurrent_positions=4,
+        )
+
+    assert settings.max_positions == 4
+    assert settings.max_positions_total == 4
+    assert settings.max_concurrent_positions == 4
+    assert "Deprecated overlapping max-position settings are inconsistent" in caplog.text
+    assert "MAX_POSITIONS=2" in caplog.text
+    assert "MAX_POSITIONS_TOTAL=5" in caplog.text
+    assert "MAX_CONCURRENT_POSITIONS=4" in caplog.text
+
+
+def test_duplicate_notional_settings_warn_and_remain_normalized(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        caplog.set_level(logging.WARNING, logger="app.config.settings")
+        settings = Settings(
+            _env_file=None,
+            broker_mode="mock",
+            trading_enabled=False,
+            entry_model_enabled=False,
+            news_llm_enabled=False,
+            max_position_notional=7_500.0,
+            max_notional_per_position=5_000.0,
+        )
+
+    assert settings.max_position_notional == 5_000.0
+    assert settings.max_notional_per_position == 5_000.0
+    assert "Deprecated overlapping notional caps are inconsistent" in caplog.text
+    assert "MAX_POSITION_NOTIONAL=7500.0" in caplog.text
+    assert "MAX_NOTIONAL_PER_POSITION=5000.0" in caplog.text
 
 
 def test_runtime_safety_settings_parse_correctly() -> None:
