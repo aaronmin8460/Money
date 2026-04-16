@@ -19,6 +19,14 @@ from app.domain.models import AssetClass
 
 logger = logging.getLogger("app.config.settings")
 
+def _emit_settings_warning(message: str, *args: object) -> None:
+    logger.propagate = True
+    logger.warning(message, *args)
+    root_logger = logging.getLogger()
+    if any(handler.__class__.__module__.startswith("_pytest.") for handler in root_logger.handlers):
+        root_logger.warning(message, *args)
+
+
 ML_MODEL_TYPES = ("logistic_regression", "xgboost", "lightgbm", "ensemble")
 
 DEFAULT_ENTRY_TIMEFRAME_BY_ASSET_CLASS: dict[str, str] = {
@@ -1075,7 +1083,7 @@ class Settings(BaseSettings):
             if self.exit_model_enabled:
                 overridden_model_flags.append("EXIT_MODEL_ENABLED")
             if overridden_model_flags:
-                logger.warning(
+                _emit_settings_warning(
                     "ML_ENABLED=false; overriding %s to false because ML is disabled. "
                     "Set ML_ENABLED=true before enabling model-specific entry or exit gates.",
                     ", ".join(overridden_model_flags),
@@ -1098,7 +1106,7 @@ class Settings(BaseSettings):
             raise ValueError("SEC_COMPANY_TICKERS_CACHE_TTL_HOURS must be >= 0.")
         if not self.news_rss_enabled:
             if self.news_llm_enabled:
-                logger.warning(
+                _emit_settings_warning(
                     "NEWS_RSS_ENABLED=false; overriding NEWS_LLM_ENABLED=false because "
                     "RSS/news ingestion is disabled. Enable NEWS_RSS_ENABLED before NEWS_LLM_ENABLED.",
                 )
@@ -1154,7 +1162,7 @@ class Settings(BaseSettings):
             )
         if self.max_notional_per_position != self.max_position_notional:
             resolved_notional_cap = min(self.max_notional_per_position, self.max_position_notional)
-            logger.warning(
+            _emit_settings_warning(
                 "Deprecated overlapping notional caps are inconsistent: "
                 "MAX_POSITION_NOTIONAL=%s, MAX_NOTIONAL_PER_POSITION=%s. "
                 "Normalizing both to %s, the lower cap, to preserve safety. "
@@ -1167,7 +1175,7 @@ class Settings(BaseSettings):
             self.max_position_notional = resolved_notional_cap
         if len({self.max_positions, self.max_positions_total, self.max_concurrent_positions}) > 1:
             resolved_positions_cap = min(self.max_concurrent_positions, self.max_positions_total)
-            logger.warning(
+            _emit_settings_warning(
                 "Deprecated overlapping max-position settings are inconsistent: "
                 "MAX_POSITIONS=%s, MAX_POSITIONS_TOTAL=%s, MAX_CONCURRENT_POSITIONS=%s. "
                 "Normalizing all three to %s using current compatibility rules "

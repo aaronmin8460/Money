@@ -68,6 +68,16 @@ def main() -> None:
             settings.ml_entry_candidate_model_path if purpose == "entry" else settings.ml_exit_candidate_model_path
         )
         save_model_bundle(result["bundle"], model_path)
+        selection = result["bundle"].get("model_selection") or {}
+        requested_model_type = str(result["bundle"].get("requested_model_type") or result["bundle"]["model_type"])
+        resolved_model_type = str(selection.get("resolved_model_type") or result["bundle"]["model_type"])
+        notes = f"{purpose} candidate model trained from structured outcome logs."
+        if selection.get("used_fallback"):
+            fallback_reason = str(selection.get("fallback_reason") or "").strip()
+            notes += (
+                f" Requested model_type={requested_model_type} resolved to {resolved_model_type}."
+                + (f" Fallback reason: {fallback_reason}" if fallback_reason else "")
+            )
         update_candidate(
             settings.ml_registry_path,
             model_path=model_path,
@@ -81,16 +91,27 @@ def main() -> None:
                 "expectancy": result["metrics"].get("expectancy"),
                 "max_drawdown": result["metrics"].get("max_drawdown"),
             },
-            notes=f"{purpose} candidate model trained from structured outcome logs.",
+            notes=notes,
             model_purpose=purpose,
+            requested_model_type=requested_model_type,
+            base_estimator_class=str(result["bundle"].get("base_estimator_class") or ""),
+            model_selection=selection,
         )
         print(
             "train_skipped=false "
             f"purpose={purpose} "
             f"candidate_model={model_path} "
+            f"requested_model_type={requested_model_type} "
+            f"resolved_model_type={resolved_model_type} "
+            f"fallback_used={bool(selection.get('used_fallback'))} "
             f"train_rows={result['train_rows']} "
             f"validation_rows={result['validation_rows']} "
             f"metrics={result['metrics']}"
+            + (
+                f" fallback_reason={selection.get('fallback_reason')!r}"
+                if selection.get("fallback_reason")
+                else ""
+            )
         )
     if not trained_any:
         print("train_skipped=true reason=no_models_trained")

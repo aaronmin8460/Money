@@ -33,6 +33,9 @@ def _default_registry() -> dict[str, Any]:
             },
         },
         "model_type": None,
+        "requested_model_type": None,
+        "base_estimator_class": None,
+        "model_selection": {},
         "feature_version": FEATURE_VERSION,
         "train_rows": 0,
         "validation_rows": 0,
@@ -105,6 +108,9 @@ def update_candidate(
     trading_metrics: dict[str, Any] | None = None,
     notes: str = "",
     model_purpose: str = "entry",
+    requested_model_type: str | None = None,
+    base_estimator_class: str | None = None,
+    model_selection: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     registry = load_registry(path)
     candidate_payload = {
@@ -118,11 +124,20 @@ def update_candidate(
         "trading_metrics": trading_metrics or {},
         "notes": notes,
     }
+    if requested_model_type is not None:
+        candidate_payload["requested_model_type"] = requested_model_type
+    if base_estimator_class is not None:
+        candidate_payload["base_estimator_class"] = base_estimator_class
+    if model_selection is not None:
+        candidate_payload["model_selection"] = model_selection
     purpose = model_purpose.strip().lower()
     registry["models"][purpose]["candidate_model"] = candidate_payload
     if purpose == "entry":
         registry["candidate_model"] = candidate_payload
         registry["model_type"] = model_type
+        registry["requested_model_type"] = requested_model_type or model_type
+        registry["base_estimator_class"] = base_estimator_class
+        registry["model_selection"] = model_selection or {}
         registry["feature_version"] = feature_version
         registry["train_rows"] = train_rows
         registry["validation_rows"] = validation_rows
@@ -166,6 +181,10 @@ def promote_candidate(
         registry["previous_current_model"] = registry.get("current_model")
         registry["current_model"] = promoted_payload
         registry["candidate_model"] = None
+        registry["model_type"] = promoted_payload.get("model_type")
+        registry["requested_model_type"] = promoted_payload.get("requested_model_type") or promoted_payload.get("model_type")
+        registry["base_estimator_class"] = promoted_payload.get("base_estimator_class")
+        registry["model_selection"] = promoted_payload.get("model_selection") or {}
     registry["promoted"] = True
     registry["notes"] = notes or registry.get("notes") or ""
     return save_registry(path, registry)

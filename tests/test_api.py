@@ -315,6 +315,31 @@ def test_x_admin_token_header_is_accepted() -> None:
     assert response.status_code == 200
 
 
+def test_config_exposes_entry_and_exit_model_paths(tmp_path) -> None:
+    model_dir = tmp_path / "models"
+    settings_module._settings = build_settings(
+        model_dir=str(model_dir),
+        ml_current_model_path=str(model_dir / "current_model.joblib"),
+        ml_candidate_model_path=str(model_dir / "candidate_model.joblib"),
+        ml_entry_current_model_path=str(model_dir / "entry_current_model.joblib"),
+        ml_entry_candidate_model_path=str(model_dir / "entry_candidate_model.joblib"),
+        ml_exit_current_model_path=str(model_dir / "exit_current_model.joblib"),
+        ml_exit_candidate_model_path=str(model_dir / "exit_candidate_model.joblib"),
+        ml_registry_path=str(model_dir / "registry.json"),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/config", headers=admin_auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ml_entry_current_model_path"] == str(model_dir / "entry_current_model.joblib")
+    assert payload["ml_entry_candidate_model_path"] == str(model_dir / "entry_candidate_model.joblib")
+    assert payload["ml_exit_current_model_path"] == str(model_dir / "exit_current_model.joblib")
+    assert payload["ml_exit_candidate_model_path"] == str(model_dir / "exit_candidate_model.joblib")
+    assert payload["ml_registry_path"] == str(model_dir / "registry.json")
+
+
 def test_diagnostics_endpoints_return_expected_fields() -> None:
     settings_module._settings = build_settings(trading_enabled=True)
     headers = admin_auth_headers()

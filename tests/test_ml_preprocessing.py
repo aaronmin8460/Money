@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import math
 import sys
@@ -12,6 +13,7 @@ from app.config.settings import Settings
 from app.domain.models import AssetClass
 from app.ml.evaluation import predict_scores, promotion_thresholds_pass, walk_forward_split
 from app.ml.features import build_signal_feature_row
+from app.ml import model_selection as model_selection_module
 from app.ml.inference import SignalScorer
 from app.ml.model_selection import ProbabilityAveragingEnsemble
 from app.ml.registry import load_registry, update_candidate
@@ -173,6 +175,10 @@ def test_training_selects_lightgbm_when_available(monkeypatch) -> None:
 
     assert result["trained"] is True
     assert result["bundle"]["model_type"] == "lightgbm"
+    assert result["bundle"]["requested_model_type"] == "lightgbm"
+    assert result["bundle"]["base_estimator_class"] == "_FakeLightGBMClassifier"
+    assert result["bundle"]["model_selection"]["resolved_model_type"] == "lightgbm"
+    assert result["bundle"]["model_selection"]["used_fallback"] is False
     assert isinstance(result["bundle"]["model"].named_steps["model"], _FakeLightGBMClassifier)
 
 
@@ -187,6 +193,8 @@ def test_training_selects_ensemble_and_records_components(monkeypatch) -> None:
     ensemble = result["bundle"]["model"].named_steps["model"]
     assert isinstance(ensemble, ProbabilityAveragingEnsemble)
     assert ensemble.component_model_types == ["logistic_regression", "xgboost", "lightgbm"]
+    assert result["bundle"]["model_selection"]["resolved_model_type"] == "ensemble"
+    assert result["bundle"]["model_selection"]["used_fallback"] is False
 
 
 def test_probability_averaging_ensemble_averages_component_probabilities() -> None:
@@ -494,6 +502,91 @@ def test_model_bundle_save_and_load_preserves_missing_value_safe_scoring(tmp_pat
     assert math.isfinite(scores[0])
 
 
+def test_lightgbm_bundle_save_and_load_preserves_model_type(monkeypatch, tmp_path: Path) -> None:
+    _install_fake_boosted_model_modules(monkeypatch)
+
+    result = train_model(_training_rows(), model_type="lightgbm", min_train_rows=10)
+    assert result["trained"] is True
+
+    bundle_path = tmp_path / "candidate_model.joblib"
+    save_model_bundle(result["bundle"], bundle_path)
+    loaded_bundle = load_model_bundle(bundle_path)
+
+    assert loaded_bundle["model_type"] == "lightgbm"
+    assert loaded_bundle["requested_model_type"] == "lightgbm"
+    assert loaded_bundle["base_estimator_class"] == "_FakeLightGBMClassifier"
+    assert loaded_bundle["model_selection"]["resolved_model_type"] == "lightgbm"
+
+    scores = predict_scores(loaded_bundle, _training_rows()[:2])
+
+    assert len(scores) == 2
+    assert all(0.0 <= score <= 1.0 for score in scores)
+
+
+def test_logistic_regression_bundle_metadata_stays_logistic(tmp_path: Path) -> None:
+    result = train_model(_training_rows(), model_type="logistic_regression", min_train_rows=10)
+    assert result["trained"] is True
+
+    bundle_path = tmp_path / "candidate_model.joblib"
+    save_model_bundle(result["bundle"], bundle_path)
+    loaded_bundle = load_model_bundle(bundle_path)
+
+    assert loaded_bundle["model_type"] == "logistic_regression"
+    assert loaded_bundle["requested_model_type"] == "logistic_regression"
+    assert loaded_bundle["base_estimator_class"] == "LogisticRegression"
+    assert loaded_bundle["model_selection"]["used_fallback"] is False
+
+
+def test_lightgbm_fallback_is_explicit_in_bundle_registry_and_logs(
+    monkeypatch,
+    caplog,
+    tmp_path: Path,
+) -> None:
+    def fail_lightgbm_import() -> object:
+        raise OSError("libomp missing")
+
+    monkeypatch.setattr(model_selection_module, "_build_lightgbm_estimator", fail_lightgbm_import)
+    caplog.set_level("WARNING", logger="ml.training")
+
+    result = train_model(_training_rows(), model_type="lightgbm", min_train_rows=10)
+
+    assert result["trained"] is True
+    bundle = result["bundle"]
+    assert bundle["model_type"] == "logistic_regression"
+    assert bundle["requested_model_type"] == "lightgbm"
+    assert bundle["base_estimator_class"] == "LogisticRegression"
+    assert bundle["model_selection"]["used_fallback"] is True
+    assert bundle["model_selection"]["resolved_model_type"] == "logistic_regression"
+    assert "libomp missing" in bundle["model_selection"]["fallback_reason"]
+    assert "falling back to the resolved estimator" in caplog.text
+
+    bundle_path = tmp_path / "candidate_model.joblib"
+    save_model_bundle(bundle, bundle_path)
+    loaded_bundle = load_model_bundle(bundle_path)
+
+    update_candidate(
+        tmp_path / "registry.json",
+        model_path=str(bundle_path),
+        model_type=loaded_bundle["model_type"],
+        requested_model_type=loaded_bundle["requested_model_type"],
+        base_estimator_class=loaded_bundle["base_estimator_class"],
+        model_selection=loaded_bundle["model_selection"],
+        feature_version=loaded_bundle["feature_version"],
+        train_rows=result["train_rows"],
+        validation_rows=result["validation_rows"],
+        metrics=result["metrics"],
+        trading_metrics={},
+        notes="fallback regression test",
+    )
+    registry = load_registry(tmp_path / "registry.json")
+    candidate = registry["models"]["entry"]["candidate_model"]
+
+    assert candidate["model_type"] == "logistic_regression"
+    assert candidate["requested_model_type"] == "lightgbm"
+    assert candidate["model_selection"]["used_fallback"] is True
+    assert "libomp missing" in candidate["model_selection"]["fallback_reason"]
+
+
 def test_training_save_writes_compact_shap_feature_artifact(monkeypatch, tmp_path: Path) -> None:
     class FakeLinearExplainer:
         def __init__(self, estimator: object, background: object) -> None:
@@ -549,6 +642,47 @@ def test_entry_and_exit_model_loading_paths_are_independent(tmp_path: Path) -> N
 
     assert scorer._load_bundle("entry")["purpose"] == "entry"
     assert scorer._load_bundle("exit")["purpose"] == "exit"
+
+
+def test_train_script_records_lightgbm_candidate_metadata(monkeypatch, tmp_path: Path) -> None:
+    _install_fake_boosted_model_modules(monkeypatch)
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    monkeypatch.syspath_prepend(str(scripts_dir))
+    sys.modules.pop("_bootstrap", None)
+    sys.modules.pop("train_model", None)
+    train_model_script = importlib.import_module("train_model")
+    dataset_path = tmp_path / "training_data.jsonl"
+    dataset_path.write_text(
+        "\n".join(json.dumps(row) for row in _training_rows()),
+        encoding="utf-8",
+    )
+    settings = Settings(
+        _env_file=None,
+        broker_mode="mock",
+        trading_enabled=False,
+        ml_model_type="lightgbm",
+        ml_min_train_rows=10,
+        model_dir=str(tmp_path),
+        ml_registry_path=str(tmp_path / "registry.json"),
+        ml_entry_candidate_model_path=str(tmp_path / "candidate_model.joblib"),
+        ml_exit_candidate_model_path=str(tmp_path / "candidate_exit_model.joblib"),
+    )
+    monkeypatch.setattr(train_model_script, "get_settings", lambda: settings)
+    monkeypatch.setattr(sys, "argv", ["train_model.py", "--dataset", str(dataset_path), "--purpose", "entry"])
+
+    train_model_script.main()
+
+    bundle = load_model_bundle(settings.ml_entry_candidate_model_path)
+    registry = load_registry(settings.ml_registry_path)
+    candidate = registry["models"]["entry"]["candidate_model"]
+
+    assert bundle["model_type"] == "lightgbm"
+    assert bundle["requested_model_type"] == "lightgbm"
+    assert bundle["base_estimator_class"] == "_FakeLightGBMClassifier"
+    assert candidate["model_type"] == "lightgbm"
+    assert candidate["requested_model_type"] == "lightgbm"
+    assert candidate["model_selection"]["resolved_model_type"] == "lightgbm"
+    assert candidate["model_selection"]["used_fallback"] is False
 
 
 def test_walk_forward_split_does_not_leak_future_rows() -> None:

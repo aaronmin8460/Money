@@ -1,0 +1,17 @@
+{
+  "artifact_version": 1,
+  "generated_at": "2026-04-16T16:05:35.015931Z",
+  "models": {
+    "entry": {
+      "generated_at": "2026-04-16T16:05:34.991560Z",
+      "model_type": "lightgbm",
+      "purpose": "entry",
+      "reason": "SHAP is unavailable: ImportError",
+      "source": "shap_mean_abs",
+      "status": "unavailable",
+      "top_features": []
+    }
+  },
+  "source": "shap_mean_abs",
+  "status": "unavailable"
+}
